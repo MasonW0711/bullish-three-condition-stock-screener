@@ -30,6 +30,7 @@ def create_excel_bytes(all_data: pd.DataFrame, latest_result: pd.DataFrame, para
                 "volume_filter_mode",
                 "min_volume_ratio_5",
                 "min_volume_ratio_20",
+                "min_daily_volume_lots",
                 "min_score",
             ],
             "Value": [
@@ -45,6 +46,7 @@ def create_excel_bytes(all_data: pd.DataFrame, latest_result: pd.DataFrame, para
                 params["volume_filter_mode"],
                 params["min_volume_ratio_5"],
                 params["min_volume_ratio_20"],
+                params.get("min_daily_volume_lots", 0),
                 params["min_score"],
             ],
         }

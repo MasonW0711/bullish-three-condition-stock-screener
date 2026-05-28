@@ -51,6 +51,7 @@ def _build_params(
     volume_filter_mode: str,
     min_volume_ratio_5: float,
     min_volume_ratio_20: float,
+    min_daily_volume_lots: int,
     min_score: int,
     only_latest_day: bool,
     show_recent_signals: bool,
@@ -68,6 +69,7 @@ def _build_params(
         "volume_filter_mode": volume_filter_mode,
         "min_volume_ratio_5": float(min_volume_ratio_5),
         "min_volume_ratio_20": float(min_volume_ratio_20),
+        "min_daily_volume_lots": int(min_daily_volume_lots),
         "min_score": int(min_score),
         "only_latest_day": bool(only_latest_day),
         "show_recent_signals": bool(show_recent_signals),
@@ -135,6 +137,30 @@ def _run_screening(params: dict, progress_callback=None) -> dict:
             "universe_df": universe_df,
         }
 
+    # Pre-filter: keep only stocks with sufficient average daily volume.
+    # yfinance returns Taiwan stock volume in shares; 1 lot (張) = 1000 shares.
+    min_lots = int(params.get("min_daily_volume_lots", 0))
+    if min_lots > 0:
+        min_shares = min_lots * 1000
+        recent_avg = daily_data.groupby("StockCode")["Volume"].apply(
+            lambda x: x.tail(20).mean() if len(x) >= 20 else x.mean()
+        )
+        active_stocks = set(recent_avg[recent_avg >= min_shares].index)
+        daily_data = daily_data[daily_data["StockCode"].isin(active_stocks)].copy()
+        success_list = [s for s in success_list if s in active_stocks]
+
+    if daily_data.empty:
+        empty_df = pd.DataFrame(columns=RESULT_COLUMNS)
+        return {
+            "all_data": empty_df,
+            "latest_result": empty_df,
+            "display_df": empty_df,
+            "success_list": success_list,
+            "failed_list": failed_list,
+            "recent_signal_codes": [],
+            "universe_df": universe_df,
+        }
+
     timeframe_data = resample_ohlcv(daily_data, timeframe_code)
     processed = run_signal_pipeline(timeframe_data, params)
 
@@ -149,6 +175,18 @@ def _run_screening(params: dict, progress_callback=None) -> dict:
             "recent_signal_codes": [],
             "universe_df": universe_df,
         }
+
+    # Join Chinese stock name from the universe lookup table.
+    if not universe_df.empty and "StockName" in universe_df.columns:
+        name_map = (
+            universe_df[["StockCode", "StockName"]]
+            .drop_duplicates("StockCode")
+            .set_index("StockCode")
+        )
+        processed = processed.join(name_map, on="StockCode", how="left")
+        processed["StockName"] = processed["StockName"].fillna(processed["StockCode"])
+    else:
+        processed["StockName"] = processed["StockCode"]
 
     latest_result = (
         processed.sort_values(["StockCode", "Date"]).groupby("StockCode", group_keys=False).tail(1)
@@ -272,6 +310,13 @@ def main():
             step=0.1,
             format="%.2f",
         )
+        min_daily_volume_lots = st.number_input(
+            "最小日均成交量（張）",
+            value=DEFAULT_PARAMETERS["min_daily_volume_lots"],
+            min_value=0,
+            step=100,
+            help="設為 0 表示不篩選。台股 1 張 = 1000 股，yfinance 資料以股數計算，系統自動換算。",
+        )
 
         st.subheader("篩選參數")
         min_score = st.number_input(
@@ -309,6 +354,7 @@ def main():
         volume_filter_mode=volume_filter_mode,
         min_volume_ratio_5=min_volume_ratio_5,
         min_volume_ratio_20=min_volume_ratio_20,
+        min_daily_volume_lots=min_daily_volume_lots,
         min_score=min_score,
         only_latest_day=only_latest_day,
         show_recent_signals=show_recent_signals,

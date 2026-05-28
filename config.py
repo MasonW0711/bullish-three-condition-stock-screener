@@ -54,6 +54,7 @@ DEFAULT_PARAMETERS = {
     "volume_filter_mode": NO_VOLUME_FILTER,
     "min_volume_ratio_5": 1.0,
     "min_volume_ratio_20": 1.0,
+    "min_daily_volume_lots": 2000,
     "min_score": 2,
     "only_latest_day": True,
     "show_recent_signals": False,
@@ -73,6 +74,7 @@ RESULT_COLUMNS = [
     "Date",
     "Timeframe",
     "StockCode",
+    "StockName",
     "Open",
     "High",
     "Low",
@@ -90,6 +92,7 @@ RESULT_COLUMNS = [
     "red_base",
     "black_base",
     "black_failed_base",
+    "latest_big_black_base",
     "cond_A_red_attack_window",
     "cond_B_break_black_window",
     "cond_C_retest_base_window",
@@ -113,7 +116,7 @@ EXPORT_SHEET_NAMES = [
 
 CHART_BASE_LINE_STYLES = {
     "red_base": {"color": "#ef4444", "name": "紅攻基準"},
-    "black_base": {"color": "#2563eb", "name": "黑攻基準"},
+    "latest_big_black_base": {"color": "#2563eb", "name": "最新黑攻基準"},
     "black_failed_base": {"color": "#16a34a", "name": "黑攻失敗基準"},
 }
 
@@ -121,6 +124,7 @@ DISPLAY_COLUMN_LABELS = {
     "Date": "日期",
     "Timeframe": "週期",
     "StockCode": "股票代號",
+    "StockName": "股票名稱",
     "Open": "開盤",
     "High": "最高",
     "Low": "最低",
@@ -138,6 +142,7 @@ DISPLAY_COLUMN_LABELS = {
     "red_base": "紅攻基準",
     "black_base": "黑攻基準",
     "black_failed_base": "黑攻失敗基準",
+    "latest_big_black_base": "最新黑攻基準",
     "cond_A_red_attack_window": "條件 A 視窗",
     "cond_B_break_black_window": "條件 B 視窗",
     "cond_C_retest_base_window": "條件 C 視窗",

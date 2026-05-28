@@ -186,9 +186,10 @@ def add_long_conditions(
     output["retest_red_base_daily"] = output["red_base"].notna() & (
         output["Low"] <= output["red_base"] * tolerance_multiplier
     ) & (output["Close"] >= output["red_base"] * break_multiplier)
-    output["retest_black_base_daily"] = output["black_base"].notna() & (
-        output["Low"] <= output["black_base"] * tolerance_multiplier
-    ) & (output["Close"] >= output["black_base"] * break_multiplier)
+    # cond_B uses latest_big_black_base; cond_C must retest the SAME base for consistency.
+    output["retest_black_base_daily"] = output["latest_big_black_base"].notna() & (
+        output["Low"] <= output["latest_big_black_base"] * tolerance_multiplier
+    ) & (output["Close"] >= output["latest_big_black_base"] * break_multiplier)
     output["retest_black_failed_base_daily"] = output["black_failed_base"].notna() & (
         output["Low"] <= output["black_failed_base"] * tolerance_multiplier
     ) & (output["Close"] >= output["black_failed_base"] * break_multiplier)
