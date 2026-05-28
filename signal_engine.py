@@ -273,12 +273,12 @@ def attach_investor_flow_flags(
             for col in flag_columns:
                 stock_output[col] = False
         else:
-            stock_output = stock_df.sort_values("Date").copy()
+            stock_output = stock_df.sort_values("Date").reset_index(drop=True)
             last_flow_date = flow_df["Date"].max()
             mapped_flags = (
                 flow_df.set_index("Date")[flag_columns]
                 .sort_index()
-                .reindex(stock_output["Date"], method="ffill")
+                .reindex(stock_output["Date"]).ffill()
                 .reset_index(drop=True)
             )
             mapped_flags.columns = flag_columns
