@@ -1,8 +1,8 @@
-streamlit
-pandas
-numpy
-yfinance
-plotly
-openpyxl
-requests
-lxml
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.40
+plotly>=5.18.0
+openpyxl>=3.1.0
+requests>=2.31.0
+lxml>=4.9.0

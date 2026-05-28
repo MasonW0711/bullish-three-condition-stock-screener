@@ -203,7 +203,7 @@ def normalize_yfinance_data(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
 
     normalized["StockCode"] = stock_code
     normalized = normalized.dropna(subset=["Date"]).drop_duplicates(subset=["Date"])
-    normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"], how="all")
+    normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"], how="any")
     normalized = normalized[REQUIRED_OHLCV_COLUMNS].sort_values("Date").reset_index(drop=True)
     return normalized
 
@@ -323,10 +323,10 @@ def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
 
     frame = pd.DataFrame(rows)
     if frame.shape[1] < 11:
-        raise ValueError(f"TWSE 法人買賣超欄位不足：預期至少 11 欄，實際 {frame.shape[1]} 欄。")
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
     code_series = frame.iloc[:, 0].astype(str).str.strip()
     if not code_series.str.fullmatch(r"\d{4}").any():
-        raise ValueError("TWSE 法人買賣超資料格式異常：找不到 4 位數股票代號欄位。")
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
     result = pd.DataFrame(
         {
             "Date": trade_date.normalize(),
@@ -356,10 +356,10 @@ def _fetch_tpex_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
 
     frame = pd.DataFrame(tables[0]["data"])
     if frame.shape[1] < 14:
-        raise ValueError(f"TPEX 法人買賣超欄位不足：預期至少 14 欄，實際 {frame.shape[1]} 欄。")
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
     code_series = frame.iloc[:, 0].astype(str).str.strip()
     if not code_series.str.fullmatch(r"\d{4}").any():
-        raise ValueError("TPEX 法人買賣超資料格式異常：找不到 4 位數股票代號欄位。")
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
     # OTC schema:
     # 0 code, 1 name, 2-4 foreign excl dealer, 5-7 foreign dealer,
     # 8-10 foreign incl dealer, 11-13 trust.
