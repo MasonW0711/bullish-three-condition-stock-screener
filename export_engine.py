@@ -32,6 +32,11 @@ def create_excel_bytes(
                 "min_volume",
                 "lookback_bars",
                 "min_conditions",
+                "pullback_pct",
+                "foreign_buy_3d",
+                "trust_buy_3d",
+                "foreign_sell_3d",
+                "trust_sell_3d",
             ],
             "Value": [
                 params["start_date"],
@@ -40,6 +45,11 @@ def create_excel_bytes(
                 params["min_volume"],
                 params["lookback_bars"],
                 params.get("min_conditions", 2),
+                params.get("pullback_pct", 2.0),
+                params.get("foreign_buy_3d", False),
+                params.get("trust_buy_3d", False),
+                params.get("foreign_sell_3d", False),
+                params.get("trust_sell_3d", False),
             ],
         }
     )

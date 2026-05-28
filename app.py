@@ -9,9 +9,15 @@ import streamlit as st
 
 import config as app_config
 from chart_engine import create_stock_chart
-from data_loader import download_stock_data, load_taiwan_stock_universe, parse_stock_list, resample_ohlcv
+from data_loader import (
+    download_investor_flow_data,
+    download_stock_data,
+    load_taiwan_stock_universe,
+    parse_stock_list,
+    resample_ohlcv,
+)
 from export_engine import create_excel_bytes
-from signal_engine import run_signal_pipeline
+from signal_engine import attach_investor_flow_flags, run_signal_pipeline
 
 APP_TITLE = getattr(app_config, "APP_TITLE", "大紅攻 / 大黑攻 訊號選股系統")
 APP_PURPOSE = getattr(
@@ -46,6 +52,10 @@ def _build_params(
     min_volume: int,
     min_conditions: int = 2,
     pullback_pct: float = 2.0,
+    foreign_buy_3d: bool = False,
+    trust_buy_3d: bool = False,
+    foreign_sell_3d: bool = False,
+    trust_sell_3d: bool = False,
 ) -> dict:
     return {
         "start_date": start_date,
@@ -55,6 +65,10 @@ def _build_params(
         "min_volume": int(min_volume),
         "min_conditions": int(min_conditions),
         "pullback_pct": float(pullback_pct),
+        "foreign_buy_3d": bool(foreign_buy_3d),
+        "trust_buy_3d": bool(trust_buy_3d),
+        "foreign_sell_3d": bool(foreign_sell_3d),
+        "trust_sell_3d": bool(trust_sell_3d),
     }
 
 
@@ -167,6 +181,12 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     if processed.empty:
         return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
 
+    investor_flow_df = download_investor_flow_data(
+        stock_codes=success_list,
+        end_date=params["end_date"],
+    )
+    processed = attach_investor_flow_flags(processed, investor_flow_df)
+
     # Join Chinese stock name from the universe lookup table.
     if not universe_df.empty and "StockName" in universe_df.columns:
         name_map = (
@@ -183,6 +203,11 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     latest_summary = _compute_latest_summary(matching_signals)
     three_methods_bullish, three_methods_bearish = _compute_three_methods_matches(
         processed, params.get("min_conditions", 2)
+    )
+    three_methods_bullish, three_methods_bearish = _apply_investor_filters(
+        three_methods_bullish,
+        three_methods_bearish,
+        params,
     )
 
     return {
@@ -222,6 +247,7 @@ def _compute_three_methods_matches(
         "bull_cond_1_in_window", "bull_cond_2_in_window", "bull_cond_3_in_window",
         "bear_cond_1_in_window", "bear_cond_2_in_window", "bear_cond_3_in_window",
         "red_base", "black_base", "final_methods_direction",
+        "foreign_buy_3d", "trust_buy_3d", "foreign_sell_3d", "trust_sell_3d",
     ):
         if cond_col not in latest.columns:
             latest = latest.copy()
@@ -249,6 +275,39 @@ def _compute_three_methods_matches(
         ["final_methods_count", "bearish_methods_count"], ascending=[False, False]
     ).reset_index(drop=True) if not bearish.empty else pd.DataFrame()
 
+    return bullish, bearish
+
+
+def _apply_investor_filters(
+    bullish_df: pd.DataFrame,
+    bearish_df: pd.DataFrame,
+    params: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply optional institutional-flow filters to bullish/bearish result tables."""
+    bullish = bullish_df.copy()
+    bearish = bearish_df.copy()
+
+    bull_required = [
+        col
+        for col, enabled in (
+            ("foreign_buy_3d", params.get("foreign_buy_3d", False)),
+            ("trust_buy_3d", params.get("trust_buy_3d", False)),
+        )
+        if enabled
+    ]
+    bear_required = [
+        col
+        for col, enabled in (
+            ("foreign_sell_3d", params.get("foreign_sell_3d", False)),
+            ("trust_sell_3d", params.get("trust_sell_3d", False)),
+        )
+        if enabled
+    ]
+
+    if not bullish.empty and bull_required:
+        bullish = bullish[bullish[bull_required].fillna(False).all(axis=1)].reset_index(drop=True)
+    if not bearish.empty and bear_required:
+        bearish = bearish[bearish[bear_required].fillna(False).all(axis=1)].reset_index(drop=True)
     return bullish, bearish
 
 
@@ -356,6 +415,23 @@ def main():
             format="%.1f%%",
             help="回測條件（條件三）的有效觸及範圍：Low（多頭）或 High（空頭）須在基準價 ±pct% 以內，且收盤不可收破基準價。",
         )
+        st.caption("法人連續 3 日條件（可個別勾選）")
+        foreign_buy_3d = st.checkbox(
+            "多頭：外資連續買超 3 日",
+            value=bool(DEFAULT_PARAMETERS.get("foreign_buy_3d", False)),
+        )
+        trust_buy_3d = st.checkbox(
+            "多頭：投信連續買超 3 日",
+            value=bool(DEFAULT_PARAMETERS.get("trust_buy_3d", False)),
+        )
+        foreign_sell_3d = st.checkbox(
+            "空頭：外資連續賣超 3 日",
+            value=bool(DEFAULT_PARAMETERS.get("foreign_sell_3d", False)),
+        )
+        trust_sell_3d = st.checkbox(
+            "空頭：投信連續賣超 3 日",
+            value=bool(DEFAULT_PARAMETERS.get("trust_sell_3d", False)),
+        )
 
         run_screening = st.button("開始篩選", type="primary", use_container_width=True)
 
@@ -372,6 +448,10 @@ def main():
         min_volume=min_volume,
         min_conditions=min_conditions,
         pullback_pct=pullback_pct,
+        foreign_buy_3d=foreign_buy_3d,
+        trust_buy_3d=trust_buy_3d,
+        foreign_sell_3d=foreign_sell_3d,
+        trust_sell_3d=trust_sell_3d,
     )
 
     # ── Run screening ────────────────────────────────────────────────────────
@@ -545,12 +625,23 @@ def main():
         disabled=all_data.empty,
     )
 
+    active_investor_filters = [
+        label
+        for enabled, label in (
+            (saved_params.get("foreign_buy_3d"), "外資連買3日"),
+            (saved_params.get("trust_buy_3d"), "投信連買3日"),
+            (saved_params.get("foreign_sell_3d"), "外資連賣3日"),
+            (saved_params.get("trust_sell_3d"), "投信連賣3日"),
+        )
+        if enabled
+    ]
     st.caption(
         f"目前分析週期：{saved_params['analysis_timeframe']}　"
         f"回看 {saved_params['lookback_bars']} 根 K 棒　"
         f"最小成交量 {saved_params['min_volume']} 張　"
         f"三方法最少條件數 {saved_params.get('min_conditions', 2)}　"
-        f"回測有效範圍 ±{saved_params.get('pullback_pct', 2.0):.1f}%"
+        f"回測有效範圍 ±{saved_params.get('pullback_pct', 2.0):.1f}%　"
+        f"法人條件：{'、'.join(active_investor_filters) if active_investor_filters else '無'}"
     )
 
 

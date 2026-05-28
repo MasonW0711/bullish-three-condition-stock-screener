@@ -8,15 +8,19 @@ from typing import Iterable
 
 import pandas as pd
 import requests
+import urllib3
 import yfinance as yf
 
 from config import (
+    INVESTOR_LOOKBACK_DAYS,
     REQUIRED_OHLCV_COLUMNS,
     TAIWAN_COMMON_STOCK_CFICODE,
     TWSE_LISTED_ISIN_URL,
     TWSE_OTC_ISIN_URL,
     YFINANCE_BATCH_SIZE,
 )
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
@@ -263,6 +267,125 @@ def download_stock_data(
     all_data = pd.concat(all_frames, ignore_index=True)
     all_data = all_data.sort_values(["StockCode", "Date"]).reset_index(drop=True)
     return all_data, success_list, failed_list
+
+
+def _to_int(value) -> int:
+    text = str(value).strip().replace(",", "")
+    if text in {"", "nan", "None", "--"}:
+        return 0
+    return int(float(text))
+
+
+def _get_with_ssl_fallback(url: str) -> requests.Response:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, timeout=30, headers=headers)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.SSLError:
+        response = requests.get(url, timeout=30, headers=headers, verify=False)
+        response.raise_for_status()
+        return response
+
+
+def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
+    url = (
+        "https://www.twse.com.tw/rwd/zh/fund/T86"
+        f"?date={trade_date.strftime('%Y%m%d')}&selectType=ALLBUT0999&response=json"
+    )
+    try:
+        response = _get_with_ssl_fallback(url)
+        payload = response.json()
+    except Exception:
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    if payload.get("stat") != "OK":
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    rows = payload.get("data") or []
+    if not rows:
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    frame = pd.DataFrame(rows)
+    result = pd.DataFrame(
+        {
+            "Date": trade_date.normalize(),
+            "BaseCode": frame.iloc[:, 0].astype(str).str.strip(),
+            "foreign_net": frame.iloc[:, 4].map(_to_int),
+            "trust_net": frame.iloc[:, 10].map(_to_int),
+        }
+    )
+    return result[result["BaseCode"].str.fullmatch(r"\d{4}", na=False)].reset_index(drop=True)
+
+
+def _fetch_tpex_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
+    roc_date = f"{trade_date.year - 1911:03d}/{trade_date.month:02d}/{trade_date.day:02d}"
+    url = (
+        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
+        f"?l=zh-tw&d={roc_date}&o=json"
+    )
+    try:
+        response = _get_with_ssl_fallback(url)
+        payload = response.json()
+    except Exception:
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    tables = payload.get("tables") or []
+    if not tables or not tables[0].get("data"):
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    frame = pd.DataFrame(tables[0]["data"])
+    # OTC schema:
+    # 0 code, 1 name, 2-4 foreign excl dealer, 5-7 foreign dealer,
+    # 8-10 foreign incl dealer, 11-13 trust.
+    result = pd.DataFrame(
+        {
+            "Date": trade_date.normalize(),
+            "BaseCode": frame.iloc[:, 0].astype(str).str.strip(),
+            "foreign_net": frame.iloc[:, 4].map(_to_int),
+            "trust_net": frame.iloc[:, 13].map(_to_int),
+        }
+    )
+    return result[result["BaseCode"].str.fullmatch(r"\d{4}", na=False)].reset_index(drop=True)
+
+
+def download_investor_flow_data(
+    stock_codes: list[str],
+    end_date,
+    lookback_days: int = INVESTOR_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """Download recent daily institutional net buy/sell data for Taiwan stocks.
+
+    The returned data is daily, regardless of the selected K-bar timeframe.
+    It is later mapped to the latest selected K-bar by bar end date.
+    """
+    base_codes = {
+        str(code).split(".")[0].strip()
+        for code in stock_codes
+        if str(code).split(".")[0].strip()
+    }
+    if not base_codes:
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    end_ts = pd.Timestamp(end_date).normalize()
+    start_ts = end_ts - pd.Timedelta(days=max(int(lookback_days), 5))
+
+    frames: list[pd.DataFrame] = []
+    for trade_date in pd.date_range(start_ts, end_ts, freq="D"):
+        twse_df = _fetch_twse_investor_flow(trade_date)
+        if not twse_df.empty:
+            frames.append(twse_df)
+        tpex_df = _fetch_tpex_investor_flow(trade_date)
+        if not tpex_df.empty:
+            frames.append(tpex_df)
+
+    if not frames:
+        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+
+    output = pd.concat(frames, ignore_index=True)
+    output = output[output["BaseCode"].isin(base_codes)].copy()
+    output = output.drop_duplicates(subset=["Date", "BaseCode"]).sort_values(["BaseCode", "Date"])
+    return output.reset_index(drop=True)
 
 
 def _resample_single_stock(stock_df: pd.DataFrame, rule: str) -> pd.DataFrame:

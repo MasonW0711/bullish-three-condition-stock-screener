@@ -215,6 +215,72 @@ def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int, pullback_
     return output
 
 
+def attach_investor_flow_flags(
+    df: pd.DataFrame,
+    investor_flow_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach recent 3-day institutional buy/sell flags to bars by stock and date.
+
+    Institutional flow is calculated from daily public data and mapped to each bar
+    using the latest available daily record on or before that bar's Date.
+    """
+    output = df.copy()
+    output["Date"] = pd.to_datetime(output["Date"], errors="coerce")
+    output = output.dropna(subset=["Date"]).copy()
+    output["BaseCode"] = output["StockCode"].astype(str).str.split(".").str[0]
+
+    flag_columns = [
+        "foreign_buy_3d",
+        "trust_buy_3d",
+        "foreign_sell_3d",
+        "trust_sell_3d",
+    ]
+    if investor_flow_df is None or investor_flow_df.empty:
+        for col in flag_columns:
+            output[col] = False
+        return output
+
+    investor = investor_flow_df.copy()
+    investor["Date"] = pd.to_datetime(investor["Date"], errors="coerce")
+    investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
+
+    investor["foreign_buy_3d"] = investor.groupby("BaseCode")["foreign_net"].transform(
+        lambda x: x.gt(0).rolling(3, min_periods=3).sum().eq(3)
+    )
+    investor["foreign_sell_3d"] = investor.groupby("BaseCode")["foreign_net"].transform(
+        lambda x: x.lt(0).rolling(3, min_periods=3).sum().eq(3)
+    )
+    investor["trust_buy_3d"] = investor.groupby("BaseCode")["trust_net"].transform(
+        lambda x: x.gt(0).rolling(3, min_periods=3).sum().eq(3)
+    )
+    investor["trust_sell_3d"] = investor.groupby("BaseCode")["trust_net"].transform(
+        lambda x: x.lt(0).rolling(3, min_periods=3).sum().eq(3)
+    )
+
+    merged_groups: list[pd.DataFrame] = []
+    base_cols = ["Date", "BaseCode", *flag_columns]
+    for base_code, stock_df in output.sort_values(["BaseCode", "Date"]).groupby("BaseCode", sort=False):
+        flow_df = investor[investor["BaseCode"] == base_code][base_cols]
+        if flow_df.empty:
+            stock_output = stock_df.copy()
+            for col in flag_columns:
+                stock_output[col] = False
+        else:
+            stock_output = pd.merge_asof(
+                stock_df.sort_values("Date"),
+                flow_df.sort_values("Date"),
+                on="Date",
+                by="BaseCode",
+                direction="backward",
+            )
+        merged_groups.append(stock_output)
+
+    merged = pd.concat(merged_groups, ignore_index=True)
+    for col in flag_columns:
+        merged[col] = merged[col].fillna(False).astype(bool)
+    return merged.sort_values(["StockCode", "Date"]).reset_index(drop=True)
+
+
 def run_signal_pipeline(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     """Run the full signal pipeline:
 

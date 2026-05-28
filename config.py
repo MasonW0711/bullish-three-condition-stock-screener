@@ -24,6 +24,7 @@ TWSE_LISTED_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
 TWSE_OTC_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
 TAIWAN_COMMON_STOCK_CFICODE = "ESVUFR"
 YFINANCE_BATCH_SIZE = 75
+INVESTOR_LOOKBACK_DAYS = 20
 
 TIMEFRAME_OPTIONS = {
     "日 K": "D",
@@ -45,6 +46,10 @@ DEFAULT_PARAMETERS = {
     # pullback_pct: ±% range around the reference price that a valid pullback (cond_3) must touch.
     # Close must also not close beyond the reference, or the pullback is considered failed.
     "pullback_pct": 2.0,
+    "foreign_buy_3d": False,
+    "trust_buy_3d": False,
+    "foreign_sell_3d": False,
+    "trust_sell_3d": False,
 }
 
 REQUIRED_OHLCV_COLUMNS = [
@@ -92,6 +97,10 @@ THREE_METHODS_COLUMNS = [
     "Volume",
     "red_base",
     "black_base",
+    "foreign_buy_3d",
+    "trust_buy_3d",
+    "foreign_sell_3d",
+    "trust_sell_3d",
     "bull_cond_1_in_window",
     "bull_cond_2_in_window",
     "bull_cond_3_in_window",
@@ -117,6 +126,10 @@ DISPLAY_COLUMN_LABELS = {
     "prev_close": "前一根收盤",
     "red_base": "多攻基準",
     "black_base": "空攻基準",
+    "foreign_buy_3d": "外資連買3日",
+    "trust_buy_3d": "投信連買3日",
+    "foreign_sell_3d": "外資連賣3日",
+    "trust_sell_3d": "投信連賣3日",
     "red_attack_success": "大紅攻成功",
     "red_attack_failed": "大紅攻失敗",
     "black_attack_success": "大黑攻成功",
