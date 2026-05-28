@@ -72,7 +72,18 @@ def _fetch_isin_universe(url: str, suffix: str, market_label: str) -> pd.DataFra
     )
     response.raise_for_status()
 
-    tables = pd.read_html(StringIO(response.text))
+    # Try parsers in order: lxml (fastest), html5lib, then html.parser (stdlib).
+    # This ensures the app works on Streamlit Cloud regardless of which optional
+    # HTML-parsing packages are installed.
+    html_content = StringIO(response.text)
+    tables = None
+    for parser in ("lxml", "html5lib", "html.parser"):
+        try:
+            html_content.seek(0)
+            tables = pd.read_html(html_content, flavor=parser)
+            break
+        except Exception:
+            continue
     if not tables:
         raise ValueError("公開股票清單來源未返回任何表格。")
 
