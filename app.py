@@ -7,22 +7,26 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+import config as app_config
 from chart_engine import create_stock_chart
-from config import (
-    APP_TITLE,
-    APP_PURPOSE,
-    DEFAULT_PARAMETERS,
-    DEFAULT_TEXT_STOCK_LIST,
-    DISPLAY_COLUMN_LABELS,
-    NO_VOLUME_FILTER,
-    RESULT_COLUMNS,
-    TIMEFRAME_LABELS,
-    TIMEFRAME_OPTIONS,
-    VOLUME_FILTER_OPTIONS,
-)
 from data_loader import download_stock_data, load_stock_list_from_upload, parse_stock_list, resample_ohlcv
 from export_engine import create_excel_bytes
 from signal_engine import run_signal_pipeline
+
+APP_TITLE = getattr(app_config, "APP_TITLE", "多頭三條件選股系統")
+APP_PURPOSE = getattr(
+    app_config,
+    "APP_PURPOSE",
+    "本工具使用台灣證券交易所（TWSE）或其他網路公開資訊進行台股篩選，供您作為評估是否買進的參考，並不構成投資建議。",
+)
+DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
+DEFAULT_TEXT_STOCK_LIST = app_config.DEFAULT_TEXT_STOCK_LIST
+DISPLAY_COLUMN_LABELS = getattr(app_config, "DISPLAY_COLUMN_LABELS", {})
+NO_VOLUME_FILTER = app_config.NO_VOLUME_FILTER
+RESULT_COLUMNS = app_config.RESULT_COLUMNS
+TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
+TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
+VOLUME_FILTER_OPTIONS = app_config.VOLUME_FILTER_OPTIONS
 
 
 def _build_params(
