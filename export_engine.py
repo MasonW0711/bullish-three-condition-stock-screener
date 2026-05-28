@@ -17,10 +17,12 @@ def create_excel_bytes(
     all_data: pd.DataFrame,
     matching_signals: pd.DataFrame,
     latest_summary: pd.DataFrame,
+    three_methods_bullish: pd.DataFrame,
+    three_methods_bearish: pd.DataFrame,
     failed_list: list[str],
     params: dict,
 ) -> bytes:
-    """Create an in-memory Excel workbook with five sheets."""
+    """Create an in-memory Excel workbook with seven sheets."""
     parameter_sheet = pd.DataFrame(
         {
             "Parameter": [
@@ -29,6 +31,7 @@ def create_excel_bytes(
                 "analysis_timeframe",
                 "min_volume",
                 "lookback_bars",
+                "min_conditions",
             ],
             "Value": [
                 params["start_date"],
@@ -36,6 +39,7 @@ def create_excel_bytes(
                 params["analysis_timeframe"],
                 params["min_volume"],
                 params["lookback_bars"],
+                params.get("min_conditions", 2),
             ],
         }
     )
@@ -46,6 +50,8 @@ def create_excel_bytes(
         "All_Data": _sheet_frame(all_data),
         "Matching_Signals": _sheet_frame(matching_signals),
         "Latest_Summary": _sheet_frame(latest_summary),
+        "ThreeMethods_Bullish": _sheet_frame(three_methods_bullish),
+        "ThreeMethods_Bearish": _sheet_frame(three_methods_bearish),
         "Failed_Downloads": failed_sheet,
         "Parameter_Settings": parameter_sheet,
     }

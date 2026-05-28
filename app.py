@@ -28,6 +28,7 @@ DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
 DEFAULT_TEXT_STOCK_LIST = getattr(app_config, "DEFAULT_TEXT_STOCK_LIST", "2330.TW\n2317.TW\n2382.TW")
 DISPLAY_COLUMN_LABELS = getattr(app_config, "DISPLAY_COLUMN_LABELS", {})
 RESULT_COLUMNS = app_config.RESULT_COLUMNS
+THREE_METHODS_COLUMNS = getattr(app_config, "THREE_METHODS_COLUMNS", [])
 TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
 TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
 
@@ -43,6 +44,7 @@ def _build_params(
     analysis_timeframe: str,
     lookback_bars: int,
     min_volume: int,
+    min_conditions: int = 2,
 ) -> dict:
     return {
         "start_date": start_date,
@@ -50,6 +52,7 @@ def _build_params(
         "analysis_timeframe": analysis_timeframe,
         "lookback_bars": int(lookback_bars),
         "min_volume": int(min_volume),
+        "min_conditions": int(min_conditions),
     }
 
 
@@ -176,15 +179,74 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
 
     matching_signals = _compute_lookback_matches(processed, params["lookback_bars"], min_volume_shares)
     latest_summary = _compute_latest_summary(matching_signals)
+    three_methods_bullish, three_methods_bearish = _compute_three_methods_matches(
+        processed, params.get("min_conditions", 2)
+    )
 
     return {
         "all_data": processed,
         "matching_signals": matching_signals,
         "latest_summary": latest_summary,
+        "three_methods_bullish": three_methods_bullish,
+        "three_methods_bearish": three_methods_bearish,
         "success_list": success_list,
         "failed_list": failed_list,
         "universe_df": universe_df,
     }
+
+
+def _compute_three_methods_matches(
+    processed_df: pd.DataFrame,
+    min_conditions: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return one-row-per-stock summaries for bullish and bearish Three Methods.
+
+    For each stock, take the most recent bar and check if:
+    - bullish_methods_count >= min_conditions
+    - bearish_methods_count >= min_conditions
+    """
+    if processed_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Get the most recent row per stock.
+    latest = (
+        processed_df
+        .sort_values(["StockCode", "Date"])
+        .groupby("StockCode", group_keys=False)
+        .tail(1)
+    )
+
+    # Columns that may or may not be present, fill with 0/False if missing.
+    for cnt_col in ("bullish_methods_count", "bearish_methods_count"):
+        if cnt_col not in latest.columns:
+            latest = latest.copy()
+            latest[cnt_col] = 0
+    for cond_col in (
+        "bull_cond_1_in_window", "bull_cond_2_in_window", "bull_cond_3_in_window",
+        "bear_cond_1_in_window", "bear_cond_2_in_window", "bear_cond_3_in_window",
+        "red_base", "black_base",
+    ):
+        if cond_col not in latest.columns:
+            latest = latest.copy()
+            latest[cond_col] = pd.NA
+
+    def _select_cols(df: pd.DataFrame) -> pd.DataFrame:
+        """Return only the THREE_METHODS_COLUMNS that exist in df."""
+        available = [c for c in THREE_METHODS_COLUMNS if c in df.columns]
+        return df[available].reset_index(drop=True)
+
+    bullish = latest[latest["bullish_methods_count"] >= min_conditions].copy()
+    bearish = latest[latest["bearish_methods_count"] >= min_conditions].copy()
+
+    bullish = _select_cols(bullish).sort_values(
+        "bullish_methods_count", ascending=False
+    ).reset_index(drop=True) if not bullish.empty else pd.DataFrame()
+
+    bearish = _select_cols(bearish).sort_values(
+        "bearish_methods_count", ascending=False
+    ).reset_index(drop=True) if not bearish.empty else pd.DataFrame()
+
+    return bullish, bearish
 
 
 def _empty_result(universe_df: pd.DataFrame, success_list=None, failed_list=None) -> dict:
@@ -193,6 +255,8 @@ def _empty_result(universe_df: pd.DataFrame, success_list=None, failed_list=None
         "all_data": empty,
         "matching_signals": empty,
         "latest_summary": empty,
+        "three_methods_bullish": empty,
+        "three_methods_bearish": empty,
         "success_list": success_list or [],
         "failed_list": failed_list or [],
         "universe_df": universe_df,
@@ -274,6 +338,12 @@ def main():
             step=1,
             help="只顯示最近 N 根 K 棒內出現攻擊訊號的資料列。",
         )
+        min_conditions = st.selectbox(
+            "三方法最少達成條件數",
+            options=[1, 2, 3],
+            index=DEFAULT_PARAMETERS.get("min_conditions", 2) - 1,
+            help="多頭或空頭三方法，至少需滿足幾個條件才算成立（預設 2）",
+        )
 
         run_screening = st.button("開始篩選", type="primary", use_container_width=True)
 
@@ -288,6 +358,7 @@ def main():
         analysis_timeframe=analysis_timeframe,
         lookback_bars=lookback_bars,
         min_volume=min_volume,
+        min_conditions=min_conditions,
     )
 
     # ── Run screening ────────────────────────────────────────────────────────
@@ -332,6 +403,8 @@ def main():
     all_data: pd.DataFrame = results["all_data"]
     matching_signals: pd.DataFrame = results["matching_signals"]
     latest_summary: pd.DataFrame = results["latest_summary"]
+    three_methods_bullish: pd.DataFrame = results.get("three_methods_bullish", pd.DataFrame())
+    three_methods_bearish: pd.DataFrame = results.get("three_methods_bearish", pd.DataFrame())
     success_list: list[str] = results["success_list"]
     failed_list: list[str] = results["failed_list"]
     universe_df: pd.DataFrame = results["universe_df"]
@@ -374,6 +447,24 @@ def main():
     mc4.metric("大紅攻失敗 K 棒數", red_failed)
     mc5.metric("大黑攻成功 K 棒數", black_success)
     mc6.metric("大黑攻失敗 K 棒數", black_failed)
+
+    # ── Three Methods result tables ───────────────────────────────────────────
+    min_cond_label = saved_params.get("min_conditions", 2)
+    with st.expander(f"🟢 多頭三方法篩選（達成 ≥ {min_cond_label} 個條件）", expanded=True):
+        if three_methods_bullish.empty:
+            st.info("目前沒有符合多頭三方法條件的股票。")
+        else:
+            display_bull = three_methods_bullish.rename(columns=DISPLAY_COLUMN_LABELS)
+            st.dataframe(display_bull, use_container_width=True)
+            st.caption(f"共 {len(three_methods_bullish)} 檔股票符合多頭三方法條件（≥ {min_cond_label} 個）。")
+
+    with st.expander(f"🔴 空頭三方法篩選（達成 ≥ {min_cond_label} 個條件）", expanded=True):
+        if three_methods_bearish.empty:
+            st.info("目前沒有符合空頭三方法條件的股票。")
+        else:
+            display_bear = three_methods_bearish.rename(columns=DISPLAY_COLUMN_LABELS)
+            st.dataframe(display_bear, use_container_width=True)
+            st.caption(f"共 {len(three_methods_bearish)} 檔股票符合空頭三方法條件（≥ {min_cond_label} 個）。")
 
     # ── Matching signals table ────────────────────────────────────────────────
     st.subheader("訊號匹配結果（回看視窗內、有訊號、量達標）")
@@ -427,6 +518,8 @@ def main():
         all_data=all_data,
         matching_signals=matching_signals,
         latest_summary=latest_summary,
+        three_methods_bullish=three_methods_bullish,
+        three_methods_bearish=three_methods_bearish,
         failed_list=failed_list,
         params=saved_params,
     )
@@ -442,7 +535,8 @@ def main():
     st.caption(
         f"目前分析週期：{saved_params['analysis_timeframe']}　"
         f"回看 {saved_params['lookback_bars']} 根 K 棒　"
-        f"最小成交量 {saved_params['min_volume']} 張"
+        f"最小成交量 {saved_params['min_volume']} 張　"
+        f"三方法最少條件數 {saved_params.get('min_conditions', 2)}"
     )
 
 

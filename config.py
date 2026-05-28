@@ -40,6 +40,8 @@ DEFAULT_PARAMETERS = {
     "lookback_bars": 10,
     # min_volume is in lots (張); 1 lot = 1000 shares. Applied as Volume >= min_volume * 1000.
     "min_volume": 2000,
+    # min_conditions: how many of the 3 Three Methods conditions must be satisfied (1 / 2 / 3).
+    "min_conditions": 2,
 }
 
 REQUIRED_OHLCV_COLUMNS = [
@@ -64,6 +66,8 @@ RESULT_COLUMNS = [
     "Close",
     "Volume",
     "prev_close",
+    "red_base",
+    "black_base",
     "red_attack_success",
     "red_attack_failed",
     "black_attack_success",
@@ -72,6 +76,25 @@ RESULT_COLUMNS = [
     "attack_result",
     "attack_direction",
     "signal_summary",
+]
+
+# Columns shown in the Three Methods result tables.
+THREE_METHODS_COLUMNS = [
+    "StockCode",
+    "StockName",
+    "Date",
+    "Close",
+    "Volume",
+    "red_base",
+    "black_base",
+    "bull_cond_1_in_window",
+    "bull_cond_2_in_window",
+    "bull_cond_3_in_window",
+    "bullish_methods_count",
+    "bear_cond_1_in_window",
+    "bear_cond_2_in_window",
+    "bear_cond_3_in_window",
+    "bearish_methods_count",
 ]
 
 DISPLAY_COLUMN_LABELS = {
@@ -85,6 +108,8 @@ DISPLAY_COLUMN_LABELS = {
     "Close": "收盤",
     "Volume": "成交量",
     "prev_close": "前一根收盤",
+    "red_base": "多攻基準",
+    "black_base": "空攻基準",
     "red_attack_success": "大紅攻成功",
     "red_attack_failed": "大紅攻失敗",
     "black_attack_success": "大黑攻成功",
@@ -93,4 +118,12 @@ DISPLAY_COLUMN_LABELS = {
     "attack_result": "攻擊結果",
     "attack_direction": "攻擊方向",
     "signal_summary": "訊號摘要",
+    "bull_cond_1_in_window": "多頭條件1(大紅攻)",
+    "bull_cond_2_in_window": "多頭條件2(突破空攻)",
+    "bull_cond_3_in_window": "多頭條件3(回測)",
+    "bullish_methods_count": "多頭達成條件數",
+    "bear_cond_1_in_window": "空頭條件1(大黑攻)",
+    "bear_cond_2_in_window": "空頭條件2(跌破多攻)",
+    "bear_cond_3_in_window": "空頭條件3(反彈回測)",
+    "bearish_methods_count": "空頭達成條件數",
 }

@@ -87,6 +87,30 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
         col=1,
     )
 
+    # --- Base lines: red_base and black_base as dashed reference lines ---
+    _BASE_LINE_STYLES = [
+        ("red_base",   "#dc2626", "多攻基準（紅攻 prev_close）"),
+        ("black_base", "#1d4ed8", "空攻基準（黑攻 prev_close）"),
+    ]
+    for base_col, base_color, base_label in _BASE_LINE_STYLES:
+        if base_col not in chart_df.columns:
+            continue
+        base_series = chart_df[base_col]
+        if base_series.isna().all():
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df["Date"],
+                y=base_series,
+                mode="lines",
+                line={"color": base_color, "width": 1.5, "dash": "dash"},
+                name=base_label,
+                connectgaps=False,
+            ),
+            row=1,
+            col=1,
+        )
+
     # --- Attack signal markers ---
     price_range = chart_df["High"].max() - chart_df["Low"].min()
     offset_pct = 0.015  # marker offset as fraction of price range
