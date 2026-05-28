@@ -42,6 +42,9 @@ DEFAULT_PARAMETERS = {
     "min_volume": 2000,
     # min_conditions: how many of the 3 Three Methods conditions must be satisfied (1 / 2 / 3).
     "min_conditions": 2,
+    # pullback_pct: ±% range around the reference price that a valid pullback (cond_3) must touch.
+    # Close must also not close beyond the reference, or the pullback is considered failed.
+    "pullback_pct": 2.0,
 }
 
 REQUIRED_OHLCV_COLUMNS = [

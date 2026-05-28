@@ -45,6 +45,7 @@ def _build_params(
     lookback_bars: int,
     min_volume: int,
     min_conditions: int = 2,
+    pullback_pct: float = 2.0,
 ) -> dict:
     return {
         "start_date": start_date,
@@ -53,6 +54,7 @@ def _build_params(
         "lookback_bars": int(lookback_bars),
         "min_volume": int(min_volume),
         "min_conditions": int(min_conditions),
+        "pullback_pct": float(pullback_pct),
     }
 
 
@@ -344,6 +346,15 @@ def main():
             index=DEFAULT_PARAMETERS.get("min_conditions", 2) - 1,
             help="多頭或空頭三方法，至少需滿足幾個條件才算成立（預設 2）",
         )
+        pullback_pct = st.slider(
+            "回測有效範圍 ±% (pullback_pct)",
+            min_value=0.0,
+            max_value=10.0,
+            value=float(DEFAULT_PARAMETERS.get("pullback_pct", 2.0)),
+            step=0.5,
+            format="%.1f%%",
+            help="回測條件（條件三）的有效觸及範圍：Low（多頭）或 High（空頭）須在基準價 ±pct% 以內，且收盤不可收破基準價。",
+        )
 
         run_screening = st.button("開始篩選", type="primary", use_container_width=True)
 
@@ -359,6 +370,7 @@ def main():
         lookback_bars=lookback_bars,
         min_volume=min_volume,
         min_conditions=min_conditions,
+        pullback_pct=pullback_pct,
     )
 
     # ── Run screening ────────────────────────────────────────────────────────
@@ -536,7 +548,8 @@ def main():
         f"目前分析週期：{saved_params['analysis_timeframe']}　"
         f"回看 {saved_params['lookback_bars']} 根 K 棒　"
         f"最小成交量 {saved_params['min_volume']} 張　"
-        f"三方法最少條件數 {saved_params.get('min_conditions', 2)}"
+        f"三方法最少條件數 {saved_params.get('min_conditions', 2)}　"
+        f"回測有效範圍 ±{saved_params.get('pullback_pct', 2.0):.1f}%"
     )
 
 

@@ -9,14 +9,17 @@ Three Methods:
 Bullish Three Methods conditions (checked within rolling lookback window):
   cond_1: red_attack_success appeared
   cond_2: Open broke above black_base
-  cond_3: Low pulled back to black_base OR red_base
+  cond_3: Low touched within ±pullback_pct of (black_base or red_base),
+          AND Close did not close below the reference (pullback not failed)
 
 Bearish Three Methods conditions:
   cond_1: black_attack_success appeared
   cond_2: Open broke below red_base
-  cond_3: High pulled back to black_base OR red_base
+  cond_3: High touched within ±pullback_pct of (black_base or red_base),
+          AND Close did not close above the reference (pullback not failed)
 
 At least min_conditions (default 2) must be satisfied for a qualifying signal.
+pullback_pct (default 2%) controls the valid zone around the reference price.
 """
 
 from __future__ import annotations
@@ -109,20 +112,27 @@ def add_base_lines(df: pd.DataFrame) -> pd.DataFrame:
     return output.drop(columns=["_red_sig", "_blk_sig"])
 
 
-def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int) -> pd.DataFrame:
+def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int, pullback_pct: float = 0.02) -> pd.DataFrame:
     """Compute Three Methods conditions for each bar using a rolling lookback window.
 
     Per-bar conditions:
       bull_cond_1 = red_attack_success
       bull_cond_2 = Open > black_base  (broke above bearish attack origin)
-      bull_cond_3 = Low  <= black_base OR Low  <= red_base  (pulled back to reference)
+      bull_cond_3 = Low within ±pullback_pct of (black_base or red_base)
+                    AND Close >= ref  (close did not close below reference)
 
       bear_cond_1 = black_attack_success
       bear_cond_2 = Open < red_base    (broke below bullish attack origin)
-      bear_cond_3 = High >= black_base OR High >= red_base  (bounced back to reference)
+      bear_cond_3 = High within ±pullback_pct of (black_base or red_base)
+                    AND Close <= ref  (close did not close above reference)
 
     Each *_in_window column is True if the condition was True in ANY of the last
     lookback_bars K-bars for that stock.  Score columns sum the three window flags.
+
+    Args:
+        pullback_pct: fraction (e.g. 0.02 = 2%). Low/High must be within this
+                      percentage of the reference price, AND the close must not
+                      close beyond the reference.
     """
     output = df.copy()
 
@@ -132,17 +142,35 @@ def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int) -> pd.Dat
     # Per-bar conditions.
     output["bull_cond_1"] = output["red_attack_success"].fillna(False)
     output["bull_cond_2"] = has_bb & (output["Open"] > output["black_base"])
-    output["bull_cond_3"] = (
-        (has_bb & (output["Low"] <= output["black_base"]))
-        | (has_rb & (output["Low"] <= output["red_base"]))
-    )
+
+    # Bullish pullback helper: Low within ±pct of ref AND Close does not close below ref.
+    def _bull_pb(ref_col: str) -> pd.Series:
+        has_ref = output[ref_col].notna()
+        ref = output[ref_col]
+        low_in_zone = (
+            (output["Low"] >= ref * (1 - pullback_pct))
+            & (output["Low"] <= ref * (1 + pullback_pct))
+        )
+        close_ok = output["Close"] >= ref
+        return has_ref & low_in_zone & close_ok
+
+    output["bull_cond_3"] = _bull_pb("black_base") | _bull_pb("red_base")
 
     output["bear_cond_1"] = output["black_attack_success"].fillna(False)
     output["bear_cond_2"] = has_rb & (output["Open"] < output["red_base"])
-    output["bear_cond_3"] = (
-        (has_bb & (output["High"] >= output["black_base"]))
-        | (has_rb & (output["High"] >= output["red_base"]))
-    )
+
+    # Bearish pullback helper: High within ±pct of ref AND Close does not close above ref.
+    def _bear_pb(ref_col: str) -> pd.Series:
+        has_ref = output[ref_col].notna()
+        ref = output[ref_col]
+        high_in_zone = (
+            (output["High"] >= ref * (1 - pullback_pct))
+            & (output["High"] <= ref * (1 + pullback_pct))
+        )
+        close_ok = output["Close"] <= ref
+        return has_ref & high_in_zone & close_ok
+
+    output["bear_cond_3"] = _bear_pb("black_base") | _bear_pb("red_base")
 
     # Rolling aggregation: was the condition True in ANY of the last N bars per stock?
     raw_conds = [
@@ -182,9 +210,10 @@ def run_signal_pipeline(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         return df.copy() if df is not None else pd.DataFrame()
 
     lookback_bars = int(params.get("lookback_bars", 10))
+    pullback_pct = float(params.get("pullback_pct", 2.0)) / 100.0  # convert % to fraction
 
     output = add_prev_close(df)
     output = add_attack_signals(output)
     output = add_base_lines(output)
-    output = add_three_methods_conditions(output, lookback_bars)
+    output = add_three_methods_conditions(output, lookback_bars, pullback_pct)
     return output.sort_values(["StockCode", "Date"]).reset_index(drop=True)
