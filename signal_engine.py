@@ -259,7 +259,6 @@ def attach_investor_flow_flags(
     )
 
     merged_groups: list[pd.DataFrame] = []
-    base_cols = ["Date", *flag_columns]
     for base_code, stock_df in output.sort_values(["BaseCode", "Date"]).groupby("BaseCode", sort=False):
         flow_df = (
             investor[investor["BaseCode"] == str(base_code).strip()][["Date", *flag_columns]]
@@ -272,12 +271,16 @@ def attach_investor_flow_flags(
             for col in flag_columns:
                 stock_output[col] = False
         else:
-            stock_output = pd.merge_asof(
-                stock_df.sort_values("Date"),
-                flow_df.sort_values("Date"),
-                on="Date",
-                direction="backward",
+            stock_output = stock_df.sort_values("Date").copy()
+            mapped_flags = (
+                flow_df.set_index("Date")[flag_columns]
+                .sort_index()
+                .reindex(stock_output["Date"], method="ffill")
+                .reset_index(drop=True)
             )
+            mapped_flags.columns = flag_columns
+            for col in flag_columns:
+                stock_output[col] = mapped_flags[col].to_numpy()
         merged_groups.append(stock_output)
 
     merged = pd.concat(merged_groups, ignore_index=True)
