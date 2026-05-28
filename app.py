@@ -341,6 +341,8 @@ def _prepare_display_frame(df: pd.DataFrame) -> pd.DataFrame:
     for col in RESULT_COLUMNS:
         if col not in display_df.columns:
             display_df[col] = pd.NA
+    if "Timeframe" in display_df.columns:
+        display_df["Timeframe"] = display_df["Timeframe"].map(TIMEFRAME_LABELS).fillna(display_df["Timeframe"])
     available = [c for c in RESULT_COLUMNS if c in display_df.columns]
     return display_df[available].rename(columns=DISPLAY_COLUMN_LABELS)
 
@@ -602,7 +604,12 @@ def main():
             "LatestPrevClose": "前一根收盤",
             "LatestVolume": "成交量",
         }
-        display_summary = latest_summary.rename(
+        display_summary = latest_summary.copy()
+        if "Timeframe" in display_summary.columns:
+            display_summary["Timeframe"] = display_summary["Timeframe"].map(TIMEFRAME_LABELS).fillna(
+                display_summary["Timeframe"]
+            )
+        display_summary = display_summary.rename(
             columns={k: v for k, v in summary_label_map.items() if k in latest_summary.columns}
         )
         st.dataframe(display_summary, use_container_width=True)

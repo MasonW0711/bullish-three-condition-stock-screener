@@ -67,6 +67,18 @@ def parse_stock_list(text: str) -> list[str]:
     return _dedupe_preserve_order(cleaned)
 
 
+def _select_isin_table(tables: list[pd.DataFrame]) -> pd.DataFrame:
+    """Select the actual TWSE ISIN stock table from read_html() results."""
+    for table in tables:
+        if table.shape[1] != 7:
+            continue
+        first_col = table.iloc[:, 0].astype(str).str.strip()
+        parsed = first_col.str.extract(r"^(?P<BaseCode>\d{4})[　\s]+(?P<StockName>.+)$")
+        if parsed["BaseCode"].notna().any():
+            return table.copy()
+    raise ValueError("公開股票清單表格格式異常：找不到 7 欄且含股票代號名稱的資料表。")
+
+
 def _fetch_isin_universe(url: str, suffix: str, market_label: str) -> pd.DataFrame:
     """Fetch and parse one Taiwan stock universe page from TWSE ISIN data."""
     response = requests.get(
@@ -94,9 +106,9 @@ def _fetch_isin_universe(url: str, suffix: str, market_label: str) -> pd.DataFra
     if not tables:
         raise ValueError("公開股票清單來源未返回任何表格。")
 
-    raw_df = tables[0].copy()
-    if raw_df.shape[1] < 6:
-        raise ValueError("公開股票清單欄位格式與預期不符。")
+    raw_df = _select_isin_table(tables)
+    if raw_df.shape[1] != 7:
+        raise ValueError(f"公開股票清單欄位格式與預期不符：預期 7 欄，實際 {raw_df.shape[1]} 欄。")
 
     raw_df.columns = ["RawCodeName", "ISIN", "ListDate", "Market", "Industry", "CFICode", "Remark"]
     parsed = raw_df["RawCodeName"].astype(str).str.extract(r"^(?P<BaseCode>\d{4})[　\s]+(?P<StockName>.+)$")
@@ -310,10 +322,15 @@ def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
         return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
 
     frame = pd.DataFrame(rows)
+    if frame.shape[1] < 11:
+        raise ValueError(f"TWSE 法人買賣超欄位不足：預期至少 11 欄，實際 {frame.shape[1]} 欄。")
+    code_series = frame.iloc[:, 0].astype(str).str.strip()
+    if not code_series.str.fullmatch(r"\d{4}").any():
+        raise ValueError("TWSE 法人買賣超資料格式異常：找不到 4 位數股票代號欄位。")
     result = pd.DataFrame(
         {
             "Date": trade_date.normalize(),
-            "BaseCode": frame.iloc[:, 0].astype(str).str.strip(),
+            "BaseCode": code_series,
             "foreign_net": frame.iloc[:, 4].map(_to_int),
             "trust_net": frame.iloc[:, 10].map(_to_int),
         }
@@ -338,13 +355,18 @@ def _fetch_tpex_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
         return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
 
     frame = pd.DataFrame(tables[0]["data"])
+    if frame.shape[1] < 14:
+        raise ValueError(f"TPEX 法人買賣超欄位不足：預期至少 14 欄，實際 {frame.shape[1]} 欄。")
+    code_series = frame.iloc[:, 0].astype(str).str.strip()
+    if not code_series.str.fullmatch(r"\d{4}").any():
+        raise ValueError("TPEX 法人買賣超資料格式異常：找不到 4 位數股票代號欄位。")
     # OTC schema:
     # 0 code, 1 name, 2-4 foreign excl dealer, 5-7 foreign dealer,
     # 8-10 foreign incl dealer, 11-13 trust.
     result = pd.DataFrame(
         {
             "Date": trade_date.normalize(),
-            "BaseCode": frame.iloc[:, 0].astype(str).str.strip(),
+            "BaseCode": code_series,
             "foreign_net": frame.iloc[:, 4].map(_to_int),
             "trust_net": frame.iloc[:, 13].map(_to_int),
         }

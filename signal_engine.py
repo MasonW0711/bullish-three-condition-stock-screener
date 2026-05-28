@@ -274,6 +274,7 @@ def attach_investor_flow_flags(
                 stock_output[col] = False
         else:
             stock_output = stock_df.sort_values("Date").copy()
+            last_flow_date = flow_df["Date"].max()
             mapped_flags = (
                 flow_df.set_index("Date")[flag_columns]
                 .sort_index()
@@ -281,6 +282,9 @@ def attach_investor_flow_flags(
                 .reset_index(drop=True)
             )
             mapped_flags.columns = flag_columns
+            future_mask = stock_output["Date"] > last_flow_date
+            if future_mask.any():
+                mapped_flags.loc[future_mask, flag_columns] = False
             for col in flag_columns:
                 stock_output[col] = mapped_flags[col].to_numpy()
         merged_groups.append(stock_output)
