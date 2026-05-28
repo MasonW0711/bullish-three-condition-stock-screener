@@ -242,6 +242,7 @@ def attach_investor_flow_flags(
 
     investor = investor_flow_df.copy()
     investor["Date"] = pd.to_datetime(investor["Date"], errors="coerce")
+    investor["BaseCode"] = investor["BaseCode"].astype(str).str.strip()
     investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
 
     investor["foreign_buy_3d"] = investor.groupby("BaseCode")["foreign_net"].transform(
@@ -258,9 +259,14 @@ def attach_investor_flow_flags(
     )
 
     merged_groups: list[pd.DataFrame] = []
-    base_cols = ["Date", "BaseCode", *flag_columns]
+    base_cols = ["Date", *flag_columns]
     for base_code, stock_df in output.sort_values(["BaseCode", "Date"]).groupby("BaseCode", sort=False):
-        flow_df = investor[investor["BaseCode"] == base_code][base_cols]
+        flow_df = (
+            investor[investor["BaseCode"] == str(base_code).strip()][["Date", *flag_columns]]
+            .drop_duplicates(subset=["Date"], keep="last")
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
         if flow_df.empty:
             stock_output = stock_df.copy()
             for col in flag_columns:
@@ -270,14 +276,13 @@ def attach_investor_flow_flags(
                 stock_df.sort_values("Date"),
                 flow_df.sort_values("Date"),
                 on="Date",
-                by="BaseCode",
                 direction="backward",
             )
         merged_groups.append(stock_output)
 
     merged = pd.concat(merged_groups, ignore_index=True)
     for col in flag_columns:
-        merged[col] = merged[col].fillna(False).astype(bool)
+        merged[col] = pd.array(merged[col], dtype="boolean").fillna(False).astype(bool)
     return merged.sort_values(["StockCode", "Date"]).reset_index(drop=True)
 
 
