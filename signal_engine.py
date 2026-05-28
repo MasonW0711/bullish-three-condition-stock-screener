@@ -218,8 +218,9 @@ def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int, pullback_
 def attach_investor_flow_flags(
     df: pd.DataFrame,
     investor_flow_df: pd.DataFrame,
+    consecutive_days: int = 3,
 ) -> pd.DataFrame:
-    """Attach recent 3-day institutional buy/sell flags to bars by stock and date.
+    """Attach recent N-day institutional buy/sell flags to bars by stock and date.
 
     Institutional flow is calculated from daily public data and mapped to each bar
     using the latest available daily record on or before that bar's Date.
@@ -228,12 +229,13 @@ def attach_investor_flow_flags(
     output["Date"] = pd.to_datetime(output["Date"], errors="coerce")
     output = output.dropna(subset=["Date"]).copy()
     output["BaseCode"] = output["StockCode"].astype(str).str.split(".").str[0]
+    consecutive_days = max(int(consecutive_days), 1)
 
     flag_columns = [
-        "foreign_buy_3d",
-        "trust_buy_3d",
-        "foreign_sell_3d",
-        "trust_sell_3d",
+        "foreign_buy_streak_ok",
+        "trust_buy_streak_ok",
+        "foreign_sell_streak_ok",
+        "trust_sell_streak_ok",
     ]
     if investor_flow_df is None or investor_flow_df.empty:
         for col in flag_columns:
@@ -245,17 +247,17 @@ def attach_investor_flow_flags(
     investor["BaseCode"] = investor["BaseCode"].astype(str).str.strip()
     investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
 
-    investor["foreign_buy_3d"] = investor.groupby("BaseCode")["foreign_net"].transform(
-        lambda x: x.gt(0).rolling(3, min_periods=3).sum().eq(3)
+    investor["foreign_buy_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
+        lambda x: x.gt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
     )
-    investor["foreign_sell_3d"] = investor.groupby("BaseCode")["foreign_net"].transform(
-        lambda x: x.lt(0).rolling(3, min_periods=3).sum().eq(3)
+    investor["foreign_sell_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
+        lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
     )
-    investor["trust_buy_3d"] = investor.groupby("BaseCode")["trust_net"].transform(
-        lambda x: x.gt(0).rolling(3, min_periods=3).sum().eq(3)
+    investor["trust_buy_streak_ok"] = investor.groupby("BaseCode")["trust_net"].transform(
+        lambda x: x.gt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
     )
-    investor["trust_sell_3d"] = investor.groupby("BaseCode")["trust_net"].transform(
-        lambda x: x.lt(0).rolling(3, min_periods=3).sum().eq(3)
+    investor["trust_sell_streak_ok"] = investor.groupby("BaseCode")["trust_net"].transform(
+        lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
     )
 
     merged_groups: list[pd.DataFrame] = []

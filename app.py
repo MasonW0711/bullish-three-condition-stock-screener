@@ -52,10 +52,11 @@ def _build_params(
     min_volume: int,
     min_conditions: int = 2,
     pullback_pct: float = 2.0,
-    foreign_buy_3d: bool = False,
-    trust_buy_3d: bool = False,
-    foreign_sell_3d: bool = False,
-    trust_sell_3d: bool = False,
+    investor_consecutive_days: int = 3,
+    foreign_buy_streak: bool = False,
+    trust_buy_streak: bool = False,
+    foreign_sell_streak: bool = False,
+    trust_sell_streak: bool = False,
 ) -> dict:
     return {
         "start_date": start_date,
@@ -65,10 +66,11 @@ def _build_params(
         "min_volume": int(min_volume),
         "min_conditions": int(min_conditions),
         "pullback_pct": float(pullback_pct),
-        "foreign_buy_3d": bool(foreign_buy_3d),
-        "trust_buy_3d": bool(trust_buy_3d),
-        "foreign_sell_3d": bool(foreign_sell_3d),
-        "trust_sell_3d": bool(trust_sell_3d),
+        "investor_consecutive_days": max(int(investor_consecutive_days), 1),
+        "foreign_buy_streak": bool(foreign_buy_streak),
+        "trust_buy_streak": bool(trust_buy_streak),
+        "foreign_sell_streak": bool(foreign_sell_streak),
+        "trust_sell_streak": bool(trust_sell_streak),
     }
 
 
@@ -184,8 +186,16 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     investor_flow_df = download_investor_flow_data(
         stock_codes=success_list,
         end_date=params["end_date"],
+        lookback_days=max(
+            int(getattr(app_config, "INVESTOR_LOOKBACK_DAYS", 20)),
+            int(params.get("investor_consecutive_days", 3)) + 10,
+        ),
     )
-    processed = attach_investor_flow_flags(processed, investor_flow_df)
+    processed = attach_investor_flow_flags(
+        processed,
+        investor_flow_df,
+        consecutive_days=params.get("investor_consecutive_days", 3),
+    )
 
     # Join Chinese stock name from the universe lookup table.
     if not universe_df.empty and "StockName" in universe_df.columns:
@@ -247,7 +257,7 @@ def _compute_three_methods_matches(
         "bull_cond_1_in_window", "bull_cond_2_in_window", "bull_cond_3_in_window",
         "bear_cond_1_in_window", "bear_cond_2_in_window", "bear_cond_3_in_window",
         "red_base", "black_base", "final_methods_direction",
-        "foreign_buy_3d", "trust_buy_3d", "foreign_sell_3d", "trust_sell_3d",
+        "foreign_buy_streak_ok", "trust_buy_streak_ok", "foreign_sell_streak_ok", "trust_sell_streak_ok",
     ):
         if cond_col not in latest.columns:
             latest = latest.copy()
@@ -290,16 +300,16 @@ def _apply_investor_filters(
     bull_required = [
         col
         for col, enabled in (
-            ("foreign_buy_3d", params.get("foreign_buy_3d", False)),
-            ("trust_buy_3d", params.get("trust_buy_3d", False)),
+            ("foreign_buy_streak_ok", params.get("foreign_buy_streak", False)),
+            ("trust_buy_streak_ok", params.get("trust_buy_streak", False)),
         )
         if enabled
     ]
     bear_required = [
         col
         for col, enabled in (
-            ("foreign_sell_3d", params.get("foreign_sell_3d", False)),
-            ("trust_sell_3d", params.get("trust_sell_3d", False)),
+            ("foreign_sell_streak_ok", params.get("foreign_sell_streak", False)),
+            ("trust_sell_streak_ok", params.get("trust_sell_streak", False)),
         )
         if enabled
     ]
@@ -415,22 +425,30 @@ def main():
             format="%.1f%%",
             help="回測條件（條件三）的有效觸及範圍：Low（多頭）或 High（空頭）須在基準價 ±pct% 以內，且收盤不可收破基準價。",
         )
-        st.caption("法人連續 3 日條件（可個別勾選）")
-        foreign_buy_3d = st.checkbox(
-            "多頭：外資連續買超 3 日",
-            value=bool(DEFAULT_PARAMETERS.get("foreign_buy_3d", False)),
+        investor_consecutive_days = st.number_input(
+            "法人連續買賣超天數",
+            min_value=1,
+            max_value=20,
+            value=int(DEFAULT_PARAMETERS.get("investor_consecutive_days", 3)),
+            step=1,
+            help="以最近 N 個交易日判斷外資 / 投信是否連續買超或連續賣超。",
         )
-        trust_buy_3d = st.checkbox(
-            "多頭：投信連續買超 3 日",
-            value=bool(DEFAULT_PARAMETERS.get("trust_buy_3d", False)),
+        st.caption(f"法人最近 {int(investor_consecutive_days)} 日條件（可個別勾選）")
+        foreign_buy_streak = st.checkbox(
+            f"多頭：外資最近 {int(investor_consecutive_days)} 日連續買超",
+            value=bool(DEFAULT_PARAMETERS.get("foreign_buy_streak", False)),
         )
-        foreign_sell_3d = st.checkbox(
-            "空頭：外資連續賣超 3 日",
-            value=bool(DEFAULT_PARAMETERS.get("foreign_sell_3d", False)),
+        trust_buy_streak = st.checkbox(
+            f"多頭：投信最近 {int(investor_consecutive_days)} 日連續買超",
+            value=bool(DEFAULT_PARAMETERS.get("trust_buy_streak", False)),
         )
-        trust_sell_3d = st.checkbox(
-            "空頭：投信連續賣超 3 日",
-            value=bool(DEFAULT_PARAMETERS.get("trust_sell_3d", False)),
+        foreign_sell_streak = st.checkbox(
+            f"空頭：外資最近 {int(investor_consecutive_days)} 日連續賣超",
+            value=bool(DEFAULT_PARAMETERS.get("foreign_sell_streak", False)),
+        )
+        trust_sell_streak = st.checkbox(
+            f"空頭：投信最近 {int(investor_consecutive_days)} 日連續賣超",
+            value=bool(DEFAULT_PARAMETERS.get("trust_sell_streak", False)),
         )
 
         run_screening = st.button("開始篩選", type="primary", use_container_width=True)
@@ -448,10 +466,11 @@ def main():
         min_volume=min_volume,
         min_conditions=min_conditions,
         pullback_pct=pullback_pct,
-        foreign_buy_3d=foreign_buy_3d,
-        trust_buy_3d=trust_buy_3d,
-        foreign_sell_3d=foreign_sell_3d,
-        trust_sell_3d=trust_sell_3d,
+        investor_consecutive_days=investor_consecutive_days,
+        foreign_buy_streak=foreign_buy_streak,
+        trust_buy_streak=trust_buy_streak,
+        foreign_sell_streak=foreign_sell_streak,
+        trust_sell_streak=trust_sell_streak,
     )
 
     # ── Run screening ────────────────────────────────────────────────────────
@@ -628,10 +647,10 @@ def main():
     active_investor_filters = [
         label
         for enabled, label in (
-            (saved_params.get("foreign_buy_3d"), "外資連買3日"),
-            (saved_params.get("trust_buy_3d"), "投信連買3日"),
-            (saved_params.get("foreign_sell_3d"), "外資連賣3日"),
-            (saved_params.get("trust_sell_3d"), "投信連賣3日"),
+            (saved_params.get("foreign_buy_streak"), f"外資近{saved_params.get('investor_consecutive_days', 3)}日連買"),
+            (saved_params.get("trust_buy_streak"), f"投信近{saved_params.get('investor_consecutive_days', 3)}日連買"),
+            (saved_params.get("foreign_sell_streak"), f"外資近{saved_params.get('investor_consecutive_days', 3)}日連賣"),
+            (saved_params.get("trust_sell_streak"), f"投信近{saved_params.get('investor_consecutive_days', 3)}日連賣"),
         )
         if enabled
     ]
@@ -641,6 +660,7 @@ def main():
         f"最小成交量 {saved_params['min_volume']} 張　"
         f"三方法最少條件數 {saved_params.get('min_conditions', 2)}　"
         f"回測有效範圍 ±{saved_params.get('pullback_pct', 2.0):.1f}%　"
+        f"法人連續天數 {saved_params.get('investor_consecutive_days', 3)} 日　"
         f"法人條件：{'、'.join(active_investor_filters) if active_investor_filters else '無'}"
     )
 
