@@ -9,7 +9,7 @@ import streamlit as st
 
 import config as app_config
 from chart_engine import create_stock_chart
-from data_loader import download_stock_data, load_stock_list_from_upload, parse_stock_list, resample_ohlcv
+from data_loader import download_stock_data, load_taiwan_stock_universe, resample_ohlcv
 from export_engine import create_excel_bytes
 from signal_engine import run_signal_pipeline
 
@@ -19,14 +19,23 @@ APP_PURPOSE = getattr(
     "APP_PURPOSE",
     "本工具使用台灣證券交易所（TWSE）或其他網路公開資訊進行台股篩選，供您作為評估是否買進的參考，並不構成投資建議。",
 )
+AUTO_UNIVERSE_DESCRIPTION = getattr(
+    app_config,
+    "AUTO_UNIVERSE_DESCRIPTION",
+    "系統會自動抓取台灣上市與上櫃普通股股票清單，無須手動上傳 CSV。",
+)
 DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
-DEFAULT_TEXT_STOCK_LIST = app_config.DEFAULT_TEXT_STOCK_LIST
 DISPLAY_COLUMN_LABELS = getattr(app_config, "DISPLAY_COLUMN_LABELS", {})
 NO_VOLUME_FILTER = app_config.NO_VOLUME_FILTER
 RESULT_COLUMNS = app_config.RESULT_COLUMNS
 TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
 TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
 VOLUME_FILTER_OPTIONS = app_config.VOLUME_FILTER_OPTIONS
+
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def _load_taiwan_stock_universe_cached() -> pd.DataFrame:
+    return load_taiwan_stock_universe()
 
 
 def _build_params(
@@ -65,16 +74,6 @@ def _build_params(
     }
 
 
-def _merge_stock_codes(text_input: str, uploaded_file) -> list[str]:
-    text_codes = parse_stock_list(text_input)
-    upload_codes = load_stock_list_from_upload(uploaded_file) if uploaded_file is not None else []
-    merged = []
-    for code in text_codes + upload_codes:
-        if code not in merged:
-            merged.append(code)
-    return merged
-
-
 def _prepare_display_frame(df: pd.DataFrame) -> pd.DataFrame:
     display_df = df.copy()
     for column in RESULT_COLUMNS:
@@ -100,13 +99,28 @@ def _recent_signal_stock_codes(processed_df: pd.DataFrame, lookback_days: int) -
     return recent_codes
 
 
-def _run_screening(stock_codes: list[str], params: dict) -> dict:
+def _run_screening(params: dict, progress_callback=None) -> dict:
     timeframe_code = TIMEFRAME_OPTIONS[params["analysis_timeframe"]]
+    universe_df = _load_taiwan_stock_universe_cached()
+    stock_codes = universe_df["StockCode"].dropna().astype(str).tolist()
+
+    if not stock_codes:
+        empty_df = pd.DataFrame(columns=RESULT_COLUMNS)
+        return {
+            "all_data": empty_df,
+            "latest_result": empty_df,
+            "display_df": empty_df,
+            "success_list": [],
+            "failed_list": [],
+            "recent_signal_codes": [],
+            "universe_df": universe_df,
+        }
 
     daily_data, success_list, failed_list = download_stock_data(
         stock_codes=stock_codes,
         start_date=params["start_date"],
         end_date=params["end_date"],
+        progress_callback=progress_callback,
     )
 
     if daily_data.empty:
@@ -118,6 +132,7 @@ def _run_screening(stock_codes: list[str], params: dict) -> dict:
             "success_list": success_list,
             "failed_list": failed_list,
             "recent_signal_codes": [],
+            "universe_df": universe_df,
         }
 
     timeframe_data = resample_ohlcv(daily_data, timeframe_code)
@@ -132,6 +147,7 @@ def _run_screening(stock_codes: list[str], params: dict) -> dict:
             "success_list": success_list,
             "failed_list": failed_list,
             "recent_signal_codes": [],
+            "universe_df": universe_df,
         }
 
     latest_result = (
@@ -151,6 +167,7 @@ def _run_screening(stock_codes: list[str], params: dict) -> dict:
         "success_list": success_list,
         "failed_list": failed_list,
         "recent_signal_codes": recent_signal_codes,
+        "universe_df": universe_df,
     }
 
 
@@ -184,14 +201,9 @@ def main():
 
     with st.sidebar:
         st.header("篩選設定")
-
-        st.subheader("股票清單輸入")
-        stock_text = st.text_area(
-            "每行輸入一個股票代號",
-            value=DEFAULT_TEXT_STOCK_LIST,
-            height=160,
-        )
-        uploaded_file = st.file_uploader("上傳 CSV", type=["csv"])
+        st.subheader("股票範圍")
+        st.info(AUTO_UNIVERSE_DESCRIPTION)
+        st.caption("資料來源：TWSE 公開 ISIN 清單（上市與上櫃普通股）")
 
         st.subheader("日期與週期參數")
         start_date = st.date_input("開始日期", value=DEFAULT_PARAMETERS["start_date"])
@@ -304,18 +316,33 @@ def main():
 
     if run_screening:
         try:
-            stock_codes = _merge_stock_codes(stock_text, uploaded_file)
+            universe_df = _load_taiwan_stock_universe_cached()
         except ValueError as error:
             st.error(str(error))
             return
-
-        if not stock_codes:
-            st.warning("請至少在文字輸入區或 CSV 上傳中提供一個股票代號。")
+        except Exception as error:
+            st.error(f"無法取得台股上市與上櫃股票清單：{error}")
             return
 
-        with st.spinner("正在下載資料並執行篩選流程..."):
-            st.session_state["screening_results"] = _run_screening(stock_codes, params)
+        if universe_df.empty:
+            st.warning("目前無法取得台股上市與上櫃普通股股票清單。")
+            return
+
+        progress_placeholder = st.sidebar.empty()
+        progress_bar = st.sidebar.progress(0.0)
+
+        def _progress_callback(progress_value: float, message: str) -> None:
+            progress_bar.progress(min(max(progress_value, 0.0), 1.0))
+            progress_placeholder.caption(message)
+
+        with st.spinner("正在自動抓取台股上市與上櫃股票資料並執行篩選流程..."):
+            st.session_state["screening_results"] = _run_screening(
+                params,
+                progress_callback=_progress_callback,
+            )
             st.session_state["screening_params"] = params
+        progress_bar.empty()
+        progress_placeholder.empty()
 
     results = st.session_state.get("screening_results")
     saved_params = st.session_state.get("screening_params", params)
@@ -329,13 +356,21 @@ def main():
     display_df = results["display_df"]
     success_list = results["success_list"]
     failed_list = results["failed_list"]
+    universe_df = results["universe_df"]
 
     st.subheader("下載狀態")
-    status_col1, status_col2 = st.columns(2)
-    status_col1.metric("成功下載檔數", len(success_list))
-    status_col2.metric("失敗檔數", len(failed_list))
+    listed_count = int((universe_df["MarketLabel"] == "上市").sum()) if not universe_df.empty else 0
+    otc_count = int((universe_df["MarketLabel"] == "上櫃").sum()) if not universe_df.empty else 0
+    status_col1, status_col2, status_col3, status_col4 = st.columns(4)
+    status_col1.metric("自動載入股票總數", int(len(universe_df)))
+    status_col2.metric("上市股票數", listed_count)
+    status_col3.metric("上櫃股票數", otc_count)
+    status_col4.metric("成功下載檔數", len(success_list))
+    st.metric("失敗檔數", len(failed_list))
     if failed_list:
-        st.warning("下載失敗股票：" + ", ".join(failed_list))
+        preview = ", ".join(failed_list[:50])
+        suffix = " ..." if len(failed_list) > 50 else ""
+        st.warning("下載失敗股票：" + preview + suffix)
     else:
         st.success("所有要求的股票代號都已成功下載。")
 

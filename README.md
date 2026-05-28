@@ -1,6 +1,6 @@
 # Bullish Three-Condition Stock Screener
 
-A complete Python + Streamlit stock screening app for **Taiwanese stock research and screening only**. It uses publicly available information from the Taiwan Stock Exchange (TWSE) or other online public sources, downloads daily OHLCV data, resamples it into Daily / Weekly / Monthly K-bars, calculates the **Big Red Attack / Big Black Attack / Bullish Three-Condition Method**, shows interactive charts, and exports results to Excel for reference when considering purchases.
+A complete Python + Streamlit stock screening app for **Taiwanese stock research and screening only**. It uses publicly available information from the Taiwan Stock Exchange (TWSE) or other online public sources, automatically collects the full Taiwan **listed and OTC common-stock universe**, downloads daily OHLCV data, resamples it into Daily / Weekly / Monthly K-bars, calculates the **Big Red Attack / Big Black Attack / Bullish Three-Condition Method**, shows interactive charts, and exports results to Excel for reference when considering purchases.
 
 > **Important:** This tool uses publicly available information for screening reference only. It is **not investment advice**.
 
@@ -20,8 +20,9 @@ sample_stock_list.csv
 
 ## Features
 
-- Upload a stock list by textarea or CSV
+- Automatically collect Taiwan listed and OTC common-stock symbols
 - Download daily OHLCV with `yfinance`
+- Batch Yahoo Finance downloads for better full-market screening speed
 - Resample daily data into:
   - **Daily K**
   - **Weekly K**
@@ -81,37 +82,26 @@ streamlit run app.py
 
 This project does not use local absolute paths, so it is suitable for Streamlit Cloud deployment.
 
-## Input stock format
+## Automatic Taiwan stock universe
 
-The app accepts stock symbols in two ways:
+The app no longer requires manual CSV upload for the primary workflow.
 
-1. **Textarea**  
-   One stock symbol per line
+When you click **Run Screening**, the system automatically:
 
-2. **CSV upload**  
-   The CSV must contain a column named:
+1. fetches the Taiwan **listed** stock universe
+2. fetches the Taiwan **OTC** stock universe
+3. filters for regular common-stock listings
+4. converts them into Yahoo Finance symbols:
+   - listed stocks -> `.TW`
+   - OTC stocks -> `.TWO`
+5. downloads daily OHLCV data in batches
 
-   ```text
-   StockCode
-   ```
+Public-source universe collection is based on the TWSE public ISIN pages for:
 
-Example:
+- **上市**
+- **上櫃**
 
-```csv
-StockCode
-2330.TW
-2317.TW
-2382.TW
-2474.TW
-6182.TWO
-```
-
-### Taiwan stock symbol handling
-
-- If you enter a full symbol such as `2330.TW` or `6182.TWO`, the app uses it directly.
-- If you enter a bare 4-digit Taiwan code such as `2330`, the app tries:
-  1. `2330.TW`
-  2. `2330.TWO`
+The sample CSV file remains in the repository for reference only.
 
 ## Timeframe behavior
 

@@ -9,6 +9,7 @@ APP_PURPOSE = (
     "本工具使用台灣證券交易所（TWSE）或其他網路公開資訊進行台股篩選，"
     "供您作為評估是否買進的參考，並不構成投資建議。"
 )
+AUTO_UNIVERSE_DESCRIPTION = "系統會自動抓取台灣上市與上櫃普通股股票清單，無須手動上傳 CSV。"
 
 DEFAULT_STOCK_LIST = [
     "2330.TW",
@@ -19,6 +20,10 @@ DEFAULT_STOCK_LIST = [
 ]
 
 DEFAULT_TEXT_STOCK_LIST = "\n".join(DEFAULT_STOCK_LIST)
+TWSE_LISTED_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+TWSE_OTC_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
+TAIWAN_COMMON_STOCK_CFICODE = "ESVUFR"
+YFINANCE_BATCH_SIZE = 75
 
 TIMEFRAME_OPTIONS = {
     "日 K": "D",
