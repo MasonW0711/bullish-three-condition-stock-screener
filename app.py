@@ -201,12 +201,7 @@ def _compute_three_methods_matches(
     processed_df: pd.DataFrame,
     min_conditions: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return one-row-per-stock summaries for bullish and bearish Three Methods.
-
-    For each stock, take the most recent bar and check if:
-    - bullish_methods_count >= min_conditions
-    - bearish_methods_count >= min_conditions
-    """
+    """Return one-row-per-stock Three Methods summaries with exclusive direction."""
     if processed_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -218,34 +213,40 @@ def _compute_three_methods_matches(
         .tail(1)
     )
 
-    # Columns that may or may not be present, fill with 0/False if missing.
-    for cnt_col in ("bullish_methods_count", "bearish_methods_count"):
+    # Columns that may or may not be present, fill with safe defaults if missing.
+    for cnt_col in ("bullish_methods_count", "bearish_methods_count", "final_methods_count"):
         if cnt_col not in latest.columns:
             latest = latest.copy()
             latest[cnt_col] = 0
     for cond_col in (
         "bull_cond_1_in_window", "bull_cond_2_in_window", "bull_cond_3_in_window",
         "bear_cond_1_in_window", "bear_cond_2_in_window", "bear_cond_3_in_window",
-        "red_base", "black_base",
+        "red_base", "black_base", "final_methods_direction",
     ):
         if cond_col not in latest.columns:
             latest = latest.copy()
-            latest[cond_col] = pd.NA
+            latest[cond_col] = "None" if cond_col == "final_methods_direction" else pd.NA
 
     def _select_cols(df: pd.DataFrame) -> pd.DataFrame:
         """Return only the THREE_METHODS_COLUMNS that exist in df."""
         available = [c for c in THREE_METHODS_COLUMNS if c in df.columns]
         return df[available].reset_index(drop=True)
 
-    bullish = latest[latest["bullish_methods_count"] >= min_conditions].copy()
-    bearish = latest[latest["bearish_methods_count"] >= min_conditions].copy()
+    bullish = latest[
+        (latest["final_methods_direction"] == "Bullish")
+        & (latest["final_methods_count"] >= min_conditions)
+    ].copy()
+    bearish = latest[
+        (latest["final_methods_direction"] == "Bearish")
+        & (latest["final_methods_count"] >= min_conditions)
+    ].copy()
 
     bullish = _select_cols(bullish).sort_values(
-        "bullish_methods_count", ascending=False
+        ["final_methods_count", "bullish_methods_count"], ascending=[False, False]
     ).reset_index(drop=True) if not bullish.empty else pd.DataFrame()
 
     bearish = _select_cols(bearish).sort_values(
-        "bearish_methods_count", ascending=False
+        ["final_methods_count", "bearish_methods_count"], ascending=[False, False]
     ).reset_index(drop=True) if not bearish.empty else pd.DataFrame()
 
     return bullish, bearish

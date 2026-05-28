@@ -20,6 +20,10 @@ Bearish Three Methods conditions:
 
 At least min_conditions (default 2) must be satisfied for a qualifying signal.
 pullback_pct (default 2%) controls the valid zone around the reference price.
+Final Three Methods direction is exclusive:
+  - Bullish if bullish_methods_count > bearish_methods_count
+  - Bearish if bearish_methods_count > bullish_methods_count
+  - None if equal
 """
 
 from __future__ import annotations
@@ -195,6 +199,19 @@ def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int, pullback_
         + output["bear_cond_2_in_window"].astype(int)
         + output["bear_cond_3_in_window"].astype(int)
     )
+
+    output["final_methods_direction"] = np.select(
+        [
+            output["bullish_methods_count"] > output["bearish_methods_count"],
+            output["bearish_methods_count"] > output["bullish_methods_count"],
+        ],
+        ["Bullish", "Bearish"],
+        default="None",
+    )
+    output["final_methods_count"] = output[
+        ["bullish_methods_count", "bearish_methods_count"]
+    ].max(axis=1)
+
     return output
 
 
