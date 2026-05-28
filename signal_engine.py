@@ -131,10 +131,22 @@ def add_base_lines(df: pd.DataFrame) -> pd.DataFrame:
     output["black_failed_base_raw"] = np.where(
         output["black_attack_failed"], output["prev_close"], np.nan
     )
+    output["latest_big_red_base_raw"] = np.where(
+        output["red_attack_success"] | output["black_attack_failed"],
+        output["prev_close"],
+        np.nan,
+    )
+    output["latest_big_black_base_raw"] = np.where(
+        output["black_attack_success"] | output["red_attack_failed"],
+        output["prev_close"],
+        np.nan,
+    )
 
     output["red_base"] = output.groupby("StockCode")["red_base_raw"].ffill()
     output["black_base"] = output.groupby("StockCode")["black_base_raw"].ffill()
     output["black_failed_base"] = output.groupby("StockCode")["black_failed_base_raw"].ffill()
+    output["latest_big_red_base"] = output.groupby("StockCode")["latest_big_red_base_raw"].ffill()
+    output["latest_big_black_base"] = output.groupby("StockCode")["latest_big_black_base_raw"].ffill()
     return output
 
 
@@ -150,13 +162,19 @@ def add_long_conditions(
     output = df.copy()
     lookback_days = max(int(lookback_days), 1)
 
-    output["cond_A_red_attack_daily"] = output["red_attack_success"].fillna(False)
+    # Treat the latest qualifying bullish event as the effective big red candle:
+    # either a red attack success or a black attack failed.
+    output["cond_A_red_attack_daily"] = (
+        output["red_attack_success"] | output["black_attack_failed"]
+    ).fillna(False)
     output["cond_A_red_attack_window"] = output.groupby("StockCode")[
         "cond_A_red_attack_daily"
     ].transform(lambda series: _rolling_any(series, lookback_days))
 
-    output["cond_B_break_black_daily"] = output["black_base"].notna() & (
-        output["Close"] > output["black_base"] * (1 + float(break_buffer_pct) / 100)
+    # Break-big-black is measured against the base left by the most recent
+    # qualifying bearish event: either a black attack success or a red attack failed.
+    output["cond_B_break_black_daily"] = output["latest_big_black_base"].notna() & (
+        output["Close"] > output["latest_big_black_base"] * (1 + float(break_buffer_pct) / 100)
     )
     output["cond_B_break_black_window"] = output.groupby("StockCode")[
         "cond_B_break_black_daily"

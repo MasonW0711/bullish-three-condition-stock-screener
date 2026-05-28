@@ -174,6 +174,17 @@ All `rolling`, `shift`, `ffill`, and resampling logic is grouped by `StockCode` 
 This strategy does **not** use ordinary red/green candle definitions.  
 It uses **previous close** as the key reference point.
 
+For the effective **big red candle / big black candle determination**, the app uses the **most recently occurring qualifying condition**:
+
+- Effective **big red candle** uses the latest qualifying bullish event:
+  - `red_attack_success`, or
+  - `black_attack_failed`
+- Effective **big black candle** uses the latest qualifying bearish event:
+  - `black_attack_success`, or
+  - `red_attack_failed`
+
+This means the app tracks the latest qualifying bullish/bearish base before evaluating the related screening condition.
+
 #### Big Red Attack Success
 
 - `Open > prev_close`
@@ -253,13 +264,16 @@ A stock becomes a long-side candidate when at least two of the following three c
 
 ### Condition A: Big Red appears
 
-- `cond_A_red_attack_daily = red_attack_success`
+- `cond_A_red_attack_daily = red_attack_success OR black_attack_failed`
 - `cond_A_red_attack_window = rolling max of cond_A_red_attack_daily within lookback_days`
 
 ### Condition B: Break Big Black
 
-- `cond_B_break_black_daily = Close > black_base * (1 + break_buffer_pct / 100)`
-- If `black_base` is `NaN`, the result is `False`
+- `cond_B_break_black_daily = Close > latest_big_black_base * (1 + break_buffer_pct / 100)`
+- `latest_big_black_base` is derived from the most recent qualifying bearish event:
+  - `black_attack_success`, or
+  - `red_attack_failed`
+- If `latest_big_black_base` is `NaN`, the result is `False`
 - `cond_B_break_black_window = rolling max of cond_B_break_black_daily within lookback_days`
 
 ### Condition C: Retest base

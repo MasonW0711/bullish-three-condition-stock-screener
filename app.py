@@ -167,7 +167,7 @@ def _summary_metrics(latest_result: pd.DataFrame) -> dict:
         "final_long_signal": int(latest_result["final_long_signal"].fillna(False).sum()),
         "score_3": int((latest_result["long_signal_score"] == 3).sum()),
         "score_2": int((latest_result["long_signal_score"] == 2).sum()),
-        "latest_red_attack_success": int(latest_result["red_attack_success"].fillna(False).sum()),
+        "latest_red_attack_success": int(latest_result["cond_A_red_attack_daily"].fillna(False).sum()),
         "latest_break_big_black": int(latest_result["cond_B_break_black_window"].fillna(False).sum()),
         "latest_retest_base": int(latest_result["cond_C_retest_base_window"].fillna(False).sum()),
     }
@@ -342,7 +342,7 @@ def main():
     metric_columns[1].metric("最終多頭訊號數", metrics["final_long_signal"])
     metric_columns[2].metric("3 分股票數", metrics["score_3"])
     metric_columns[3].metric("2 分股票數", metrics["score_2"])
-    metric_columns[4].metric("最新紅攻成功數", metrics["latest_red_attack_success"])
+    metric_columns[4].metric("最新大紅 K 數", metrics["latest_red_attack_success"])
     metric_columns[5].metric("最新突破黑攻基準數", metrics["latest_break_big_black"])
     metric_columns[6].metric("最新回測基準數", metrics["latest_retest_base"])
 
