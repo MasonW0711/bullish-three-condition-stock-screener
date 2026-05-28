@@ -58,7 +58,7 @@ def load_stock_list_from_upload(uploaded_file) -> list[str]:
 
     upload_df = pd.read_csv(uploaded_file)
     if "StockCode" not in upload_df.columns:
-        raise ValueError("Uploaded CSV must contain a 'StockCode' column.")
+        raise ValueError("上傳的 CSV 必須包含 'StockCode' 欄位。")
 
     codes = [
         _normalize_token(str(value))

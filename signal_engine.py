@@ -210,11 +210,11 @@ def add_volume_filter(
 
     if volume_filter_mode == NO_VOLUME_FILTER:
         output["volume_filter_pass"] = True
-    elif volume_filter_mode == "Require 5-day volume ratio":
+    elif volume_filter_mode == "要求 5 日量比":
         output["volume_filter_pass"] = ratio_5_ok
-    elif volume_filter_mode == "Require 20-day volume ratio":
+    elif volume_filter_mode == "要求 20 日量比":
         output["volume_filter_pass"] = ratio_20_ok
-    elif volume_filter_mode == "Require both 5-day and 20-day volume ratios":
+    elif volume_filter_mode == "同時要求 5 日與 20 日量比":
         output["volume_filter_pass"] = ratio_5_ok & ratio_20_ok
     else:
         raise ValueError(f"Unsupported volume filter mode: {volume_filter_mode}")

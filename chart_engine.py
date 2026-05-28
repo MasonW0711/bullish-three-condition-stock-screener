@@ -12,16 +12,16 @@ from config import CHART_BASE_LINE_STYLES
 def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
     """Create an interactive candlestick chart for a single stock."""
     if stock_df is None or stock_df.empty:
-        return None, "No data is available for the selected stock."
+        return None, "目前沒有可供顯示的資料。"
 
     required_columns = {"Date", "StockCode", "Open", "High", "Low", "Close", "Volume"}
     missing_columns = required_columns.difference(stock_df.columns)
     if missing_columns:
-        return None, f"Chart data is missing required columns: {sorted(missing_columns)}"
+        return None, f"圖表資料缺少必要欄位：{sorted(missing_columns)}"
 
     chart_df = stock_df.sort_values("Date").copy()
     if chart_df[["Open", "High", "Low", "Close"]].dropna(how="any").shape[0] < 2:
-        return None, "There is not enough history to draw a reliable chart for the selected stock."
+        return None, "歷史資料不足，無法為所選股票繪製可靠圖表。"
 
     stock_code = str(chart_df["StockCode"].iloc[-1])
     volume_colors = [
@@ -44,7 +44,7 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
             high=chart_df["High"],
             low=chart_df["Low"],
             close=chart_df["Close"],
-            name="Candlestick",
+            name="K 線",
         ),
         row=1,
         col=1,
@@ -71,13 +71,13 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
                 x=signal_rows["Date"],
                 y=signal_rows["Close"],
                 mode="markers",
-                name="final_long_signal",
+                name="最終多頭訊號",
                 marker={"color": "#f59e0b", "size": 10, "symbol": "triangle-up"},
                 text=[
-                    f"Score: {int(score)}"
+                    f"分數：{int(score)}"
                     for score in signal_rows["long_signal_score"].fillna(0).tolist()
                 ],
-                hovertemplate="%{x|%Y-%m-%d}<br>%{text}<br>Close: %{y:.2f}<extra></extra>",
+                hovertemplate="%{x|%Y-%m-%d}<br>%{text}<br>收盤：%{y:.2f}<extra></extra>",
             ),
             row=1,
             col=1,
@@ -87,7 +87,7 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
         go.Bar(
             x=chart_df["Date"],
             y=chart_df["Volume"],
-            name="Volume",
+            name="成交量",
             marker={"color": volume_colors},
         ),
         row=2,
@@ -95,13 +95,13 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
     )
 
     fig.update_layout(
-        title=f"{stock_code} Bullish Three-Condition Signal Chart ({timeframe_label})",
+        title=f"{stock_code} 多頭三條件訊號圖 ({timeframe_label})",
         xaxis_rangeslider_visible=False,
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         margin={"l": 20, "r": 20, "t": 70, "b": 20},
         height=720,
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="價格", row=1, col=1)
+    fig.update_yaxes(title_text="成交量", row=2, col=1)
 
     return fig, None

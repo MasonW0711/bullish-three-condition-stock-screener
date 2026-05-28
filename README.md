@@ -1,8 +1,8 @@
 # Bullish Three-Condition Stock Screener
 
-A complete Python + Streamlit stock screening app for **stock research and screening only**. It downloads daily OHLCV data, resamples it into Daily / Weekly / Monthly K-bars, calculates the **Big Red Attack / Big Black Attack / Bullish Three-Condition Method**, shows interactive charts, and exports results to Excel.
+A complete Python + Streamlit stock screening app for **Taiwanese stock research and screening only**. It uses publicly available information from the Taiwan Stock Exchange (TWSE) or other online public sources, downloads daily OHLCV data, resamples it into Daily / Weekly / Monthly K-bars, calculates the **Big Red Attack / Big Black Attack / Bullish Three-Condition Method**, shows interactive charts, and exports results to Excel for reference when considering purchases.
 
-> **Important:** This tool is for research and screening only. It is **not investment advice**.
+> **Important:** This tool uses publicly available information for screening reference only. It is **not investment advice**.
 
 ## Project structure
 

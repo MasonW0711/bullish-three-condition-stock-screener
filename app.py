@@ -10,8 +10,10 @@ import streamlit as st
 from chart_engine import create_stock_chart
 from config import (
     APP_TITLE,
+    APP_PURPOSE,
     DEFAULT_PARAMETERS,
     DEFAULT_TEXT_STOCK_LIST,
+    DISPLAY_COLUMN_LABELS,
     NO_VOLUME_FILTER,
     RESULT_COLUMNS,
     TIMEFRAME_LABELS,
@@ -74,11 +76,12 @@ def _prepare_display_frame(df: pd.DataFrame) -> pd.DataFrame:
     for column in RESULT_COLUMNS:
         if column not in display_df.columns:
             display_df[column] = pd.NA
-    return display_df[RESULT_COLUMNS].sort_values(
+    display_df = display_df[RESULT_COLUMNS].sort_values(
         by=["final_long_signal", "long_signal_score", "volume_ratio_5", "close_vs_prev_pct"],
         ascending=[False, False, False, False],
         na_position="last",
     )
+    return display_df.rename(columns=DISPLAY_COLUMN_LABELS)
 
 
 def _recent_signal_stock_codes(processed_df: pd.DataFrame, lookback_days: int) -> list[str]:
@@ -139,7 +142,7 @@ def _run_screening(stock_codes: list[str], params: dict) -> dict:
 
     return {
         "all_data": processed,
-        "latest_result": _prepare_display_frame(latest_result),
+        "latest_result": latest_result,
         "display_df": display_df,
         "success_list": success_list,
         "failed_list": failed_list,
@@ -173,108 +176,108 @@ def _summary_metrics(latest_result: pd.DataFrame) -> dict:
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("For stock research and screening only. This tool does not provide investment advice.")
+    st.caption(APP_PURPOSE)
 
     with st.sidebar:
-        st.header("Screening Settings")
+        st.header("篩選設定")
 
-        st.subheader("Stock List Input")
+        st.subheader("股票清單輸入")
         stock_text = st.text_area(
-            "One stock symbol per line",
+            "每行輸入一個股票代號",
             value=DEFAULT_TEXT_STOCK_LIST,
             height=160,
         )
-        uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+        uploaded_file = st.file_uploader("上傳 CSV", type=["csv"])
 
-        st.subheader("Date and Timeframe Parameters")
-        start_date = st.date_input("start_date", value=DEFAULT_PARAMETERS["start_date"])
-        end_date = st.date_input("end_date", value=DEFAULT_PARAMETERS["end_date"])
+        st.subheader("日期與週期參數")
+        start_date = st.date_input("開始日期", value=DEFAULT_PARAMETERS["start_date"])
+        end_date = st.date_input("結束日期", value=DEFAULT_PARAMETERS["end_date"])
         analysis_timeframe = st.selectbox(
-            "analysis_timeframe",
+            "分析週期",
             options=list(TIMEFRAME_OPTIONS.keys()),
             index=0,
         )
         lookback_days = st.number_input(
-            "lookback_days",
+            "回看 K 棒數",
             min_value=1,
             value=DEFAULT_PARAMETERS["lookback_days"],
             step=1,
         )
 
-        st.subheader("Attack Thresholds")
+        st.subheader("攻擊門檻")
         min_gap_pct = st.number_input(
-            "min_gap_pct",
+            "最小跳空幅度 (%)",
             value=DEFAULT_PARAMETERS["min_gap_pct"],
             step=0.1,
             format="%.2f",
         )
         min_close_vs_prev_pct = st.number_input(
-            "min_close_vs_prev_pct",
+            "最小收盤相對前收盤幅度 (%)",
             value=DEFAULT_PARAMETERS["min_close_vs_prev_pct"],
             step=0.1,
             format="%.2f",
         )
 
-        st.subheader("Breakout and Retest Parameters")
+        st.subheader("突破與回測參數")
         break_buffer_pct = st.number_input(
-            "break_buffer_pct",
+            "突破緩衝 (%)",
             value=DEFAULT_PARAMETERS["break_buffer_pct"],
             step=0.1,
             format="%.2f",
         )
         retest_tolerance_pct = st.number_input(
-            "retest_tolerance_pct",
+            "回測容許值 (%)",
             value=DEFAULT_PARAMETERS["retest_tolerance_pct"],
             step=0.1,
             format="%.2f",
         )
         retest_break_pct = st.number_input(
-            "retest_break_pct",
+            "回測跌破容許值 (%)",
             value=DEFAULT_PARAMETERS["retest_break_pct"],
             step=0.1,
             format="%.2f",
         )
 
-        st.subheader("Volume Conditions")
+        st.subheader("成交量條件")
         volume_filter_mode = st.selectbox(
-            "volume_filter_mode",
+            "成交量篩選模式",
             options=VOLUME_FILTER_OPTIONS,
             index=0,
         )
         min_volume_ratio_5 = st.number_input(
-            "min_volume_ratio_5",
+            "最小 5 日量比",
             value=DEFAULT_PARAMETERS["min_volume_ratio_5"],
             step=0.1,
             format="%.2f",
         )
         min_volume_ratio_20 = st.number_input(
-            "min_volume_ratio_20",
+            "最小 20 日量比",
             value=DEFAULT_PARAMETERS["min_volume_ratio_20"],
             step=0.1,
             format="%.2f",
         )
 
-        st.subheader("Screening Parameters")
+        st.subheader("篩選參數")
         min_score = st.number_input(
-            "min_score",
+            "最低分數",
             min_value=1,
             max_value=3,
             value=DEFAULT_PARAMETERS["min_score"],
             step=1,
         )
         only_latest_day = st.checkbox(
-            "only_latest_day",
+            "只顯示每檔最新一根 K 棒",
             value=DEFAULT_PARAMETERS["only_latest_day"],
         )
         show_recent_signals = st.checkbox(
-            "show_recent_signals",
+            "只顯示最近回看視窗內出現最終多頭訊號的股票",
             value=DEFAULT_PARAMETERS["show_recent_signals"],
         )
 
-        run_screening = st.button("Run Screening", type="primary", use_container_width=True)
+        run_screening = st.button("開始篩選", type="primary", use_container_width=True)
 
     if start_date > end_date:
-        st.error("start_date must be earlier than or equal to end_date.")
+        st.error("開始日期必須早於或等於結束日期。")
         return
 
     params = _build_params(
@@ -303,10 +306,10 @@ def main():
             return
 
         if not stock_codes:
-            st.warning("Please provide at least one stock symbol in the text area or CSV upload.")
+            st.warning("請至少在文字輸入區或 CSV 上傳中提供一個股票代號。")
             return
 
-        with st.spinner("Downloading data and running the screening pipeline..."):
+        with st.spinner("正在下載資料並執行篩選流程..."):
             st.session_state["screening_results"] = _run_screening(stock_codes, params)
             st.session_state["screening_params"] = params
 
@@ -314,7 +317,7 @@ def main():
     saved_params = st.session_state.get("screening_params", params)
 
     if not results:
-        st.info("Select your settings and click 'Run Screening' to start.")
+        st.info("請先設定條件，然後按下「開始篩選」。")
         return
 
     all_data = results["all_data"]
@@ -323,36 +326,36 @@ def main():
     success_list = results["success_list"]
     failed_list = results["failed_list"]
 
-    st.subheader("Download Status")
+    st.subheader("下載狀態")
     status_col1, status_col2 = st.columns(2)
-    status_col1.metric("Successful downloads", len(success_list))
-    status_col2.metric("Failed downloads", len(failed_list))
+    status_col1.metric("成功下載檔數", len(success_list))
+    status_col2.metric("失敗檔數", len(failed_list))
     if failed_list:
-        st.warning(", ".join(failed_list))
+        st.warning("下載失敗股票：" + ", ".join(failed_list))
     else:
-        st.success("All requested stock symbols downloaded successfully.")
+        st.success("所有要求的股票代號都已成功下載。")
 
-    st.subheader("Summary Metrics")
+    st.subheader("摘要指標")
     metrics = _summary_metrics(latest_result)
     metric_columns = st.columns(7)
-    metric_columns[0].metric("Total number of stocks", metrics["total_stocks"])
-    metric_columns[1].metric("Stocks with final_long_signal", metrics["final_long_signal"])
-    metric_columns[2].metric("Score 3 stocks", metrics["score_3"])
-    metric_columns[3].metric("Score 2 stocks", metrics["score_2"])
-    metric_columns[4].metric("Latest Big Red Attack Success", metrics["latest_red_attack_success"])
-    metric_columns[5].metric("Latest Break Big Black", metrics["latest_break_big_black"])
-    metric_columns[6].metric("Latest Retest Base", metrics["latest_retest_base"])
+    metric_columns[0].metric("股票總數", metrics["total_stocks"])
+    metric_columns[1].metric("最終多頭訊號數", metrics["final_long_signal"])
+    metric_columns[2].metric("3 分股票數", metrics["score_3"])
+    metric_columns[3].metric("2 分股票數", metrics["score_2"])
+    metric_columns[4].metric("最新紅攻成功數", metrics["latest_red_attack_success"])
+    metric_columns[5].metric("最新突破黑攻基準數", metrics["latest_break_big_black"])
+    metric_columns[6].metric("最新回測基準數", metrics["latest_retest_base"])
 
-    st.subheader("Screening Result Table")
+    st.subheader("篩選結果表")
     if display_df.empty:
-        st.info("No rows matched the current result filters.")
+        st.info("目前沒有符合結果篩選條件的資料列。")
     else:
         st.dataframe(display_df, use_container_width=True)
 
-    st.subheader("Chart")
+    st.subheader("圖表")
     chart_stock_codes = latest_result["StockCode"].dropna().astype(str).tolist()
     if chart_stock_codes:
-        selected_stock = st.selectbox("Select a stock", options=chart_stock_codes)
+        selected_stock = st.selectbox("選擇股票", options=chart_stock_codes)
         selected_stock_df = all_data[all_data["StockCode"] == selected_stock].copy()
         figure, chart_message = create_stock_chart(
             selected_stock_df,
@@ -363,12 +366,12 @@ def main():
         elif figure is not None:
             st.plotly_chart(figure, use_container_width=True)
     else:
-        st.info("No chart data is available.")
+        st.info("目前沒有可用圖表資料。")
 
-    st.subheader("Excel Download")
+    st.subheader("Excel 下載")
     excel_bytes = create_excel_bytes(all_data, latest_result, saved_params)
     st.download_button(
-        label="Download Excel Result",
+        label="下載 Excel 結果",
         data=excel_bytes,
         file_name=f"bullish_three_condition_{TIMEFRAME_OPTIONS[saved_params['analysis_timeframe']]}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -377,12 +380,12 @@ def main():
 
     if saved_params["volume_filter_mode"] != NO_VOLUME_FILTER:
         st.caption(
-            f"Volume filter active: {saved_params['volume_filter_mode']}."
+            f"成交量篩選已啟用：{saved_params['volume_filter_mode']}。"
         )
 
     st.caption(
-        f"Selected timeframe: {saved_params['analysis_timeframe']} "
-        f"({TIMEFRAME_LABELS[TIMEFRAME_OPTIONS[saved_params['analysis_timeframe']]]})."
+        f"目前分析週期：{saved_params['analysis_timeframe']} "
+        f"({TIMEFRAME_LABELS[TIMEFRAME_OPTIONS[saved_params['analysis_timeframe']]]})。"
     )
 
 
