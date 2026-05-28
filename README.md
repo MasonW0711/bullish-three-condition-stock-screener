@@ -1,388 +1,132 @@
-# Bullish Three-Condition Stock Screener
+# 大紅攻 / 大黑攻 訊號選股系統
 
-A complete Python + Streamlit stock screening app for **Taiwanese stock research and screening only**. It uses publicly available information from the Taiwan Stock Exchange (TWSE) or other online public sources, automatically collects the full Taiwan **listed and OTC common-stock universe**, downloads daily OHLCV data, resamples it into Daily / Weekly / Monthly K-bars, calculates the **Big Red Attack / Big Black Attack / Bullish Three-Condition Method**, shows interactive charts, and exports results to Excel for reference when considering purchases.
+> **聲明：本工具僅供研究與篩選參考，不構成任何投資建議。**
 
-> **Important:** This tool uses publicly available information for screening reference only. It is **not investment advice**.
+---
 
-## Project structure
+## 系統目標
 
-```text
-app.py
-config.py
-data_loader.py
-signal_engine.py
-chart_engine.py
-export_engine.py
-requirements.txt
-README.md
-sample_stock_list.csv
+自動下載台灣上市與上櫃股票的 OHLCV 資料，依據「**大紅攻 / 大黑攻**」策略偵測攻擊訊號，篩選出符合條件的股票供研究參考。
+
+---
+
+## 策略定義
+
+攻擊方向由**開盤價與前一根收盤價**的關係決定；收盤價只決定攻擊是否成功。
+
+**前提：**
+```
+prev_close = 前一根 K 棒的收盤價
 ```
 
-## Features
+| 訊號 | 條件 | 說明 |
+|------|------|------|
+| 大紅攻成功 | `Open > prev_close` 且 `Close > prev_close` | 多頭開高並收高 |
+| 大紅攻失敗 | `Open > prev_close` 且 `Close < prev_close` | 多頭開高但收低（≠ 大黑攻） |
+| 大黑攻成功 | `Open < prev_close` 且 `Close < prev_close` | 空頭開低並收低 |
+| 大黑攻失敗 | `Open < prev_close` 且 `Close > prev_close` | 空頭開低但收高（≠ 大紅攻） |
 
-- Automatically collect Taiwan listed and OTC common-stock symbols
-- Download daily OHLCV with `yfinance`
-- Batch Yahoo Finance downloads for better full-market screening speed
-- Resample daily data into:
-  - **Daily K**
-  - **Weekly K**
-  - **Monthly K**
-- Calculate:
-  - `prev_close`
-  - Big Red Attack / Big Black Attack
-  - `red_base`
-  - `black_base`
-  - `black_failed_base`
-  - Bullish three-condition score
-  - Optional volume filter
-- Show:
-  - download status
-  - summary metrics
-  - result table
-  - interactive Plotly chart
-  - Excel download
+> **重要：失敗的大紅攻不等於大黑攻；失敗的大黑攻不等於大紅攻。**
 
-## Requirements
+---
 
-- Python 3.11+
-- Streamlit
-- pandas
-- numpy
-- yfinance
-- plotly
-- openpyxl
+## 功能
 
-Install dependencies with:
+- 自動抓取 TWSE 上市與上櫃普通股清單（約 1900+ 檔）
+- 支援日 K / 週 K / 月 K 分析（週/月 K 由日線 Resample 產生）
+- 成交量前置過濾（最小成交量，單位：張）
+- 回看 N 根 K 棒視窗篩選
+- 互動式 K 線圖（含四種攻擊訊號標記）
+- Excel 匯出（All_Data / Matching_Signals / Latest_Summary / Failed_Downloads / Parameter_Settings）
+
+---
+
+## 安裝與執行
+
+### 本機執行
 
 ```bash
 pip install -r requirements.txt
-```
-
-## Run locally
-
-From the project folder:
-
-```bash
 streamlit run app.py
 ```
 
-## Deploy to Streamlit Cloud
+### Streamlit Cloud 部署
 
-1. Push this project to a Git repository.
-2. Open [Streamlit Cloud](https://streamlit.io/cloud).
-3. Create a new app and select your repository.
-4. Set the main file path to:
+1. Fork / Push 此 repo 至 GitHub
+2. 至 [share.streamlit.io](https://share.streamlit.io) 建立新應用程式
+3. 指向 `app.py`，Python 版本 3.11+
+4. 點擊 Deploy
 
-   ```text
-   app.py
-   ```
+---
 
-5. Streamlit Cloud will install dependencies from `requirements.txt`.
-6. Deploy.
+## 側邊欄參數說明
 
-This project does not use local absolute paths, so it is suitable for Streamlit Cloud deployment.
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| 自動抓取全市場 | 開啟 | 開啟：自動抓取 TWSE 全市場；關閉：手動輸入股票代號 |
+| 開始日期 | 今天-2年 | 資料下載起始日 |
+| 結束日期 | 今天 | 資料下載截止日 |
+| 分析週期 | 日 K | 日 K / 週 K / 月 K |
+| 最小成交量（張） | 2000 | Volume ≥ 此值（單位：張，內部換算×1000股）；設 0 = 不篩選 |
+| 回看 K 棒數 | 10 | 只顯示最近 N 根 K 棒內出現攻擊訊號的資料 |
 
-## Automatic Taiwan stock universe
+---
 
-The app no longer requires manual CSV upload for the primary workflow.
+## 輸入格式
 
-When you click **Run Screening**, the system automatically:
+手動模式下，每行一個股票代號：
 
-1. fetches the Taiwan **listed** stock universe
-2. fetches the Taiwan **OTC** stock universe
-3. filters for regular common-stock listings
-4. converts them into Yahoo Finance symbols:
-   - listed stocks -> `.TW`
-   - OTC stocks -> `.TWO`
-5. downloads daily OHLCV data in batches
-
-Public-source universe collection is based on the TWSE public ISIN pages for:
-
-- **上市**
-- **上櫃**
-
-The sample CSV file remains in the repository for reference only.
-
-## Timeframe behavior
-
-The strategy logic stays the same across all timeframes. Only the K-bar timeframe changes.
-
-- **Daily K**
-  - Uses original daily OHLCV
-  - `prev_close` = previous trading day close
-
-- **Weekly K**
-  - Built by resampling daily OHLCV with **W-FRI**
-  - `Open` = first trading day open of the week
-  - `High` = highest high of the week
-  - `Low` = lowest low of the week
-  - `Close` = last trading day close of the week
-  - `Volume` = weekly summed volume
-  - `Date` = actual last trading day of the week
-  - `prev_close` = previous weekly close
-
-- **Monthly K**
-  - Built by resampling daily OHLCV with **month-end**
-  - `Open` = first trading day open of the month
-  - `High` = highest high of the month
-  - `Low` = lowest low of the month
-  - `Close` = last trading day close of the month
-  - `Volume` = monthly summed volume
-  - `Date` = actual last trading day of the month
-  - `prev_close` = previous monthly close
-
-> The app always downloads **daily** data first and resamples **before** calculating any signal. It does **not** calculate signals on daily data and then resample.
-
-## Signal calculation flow
-
-1. Download daily OHLCV
-2. Resample by selected timeframe: Daily / Weekly / Monthly
-3. Calculate `prev_close`
-4. Calculate Big Red Attack / Big Black Attack
-5. Calculate `red_base`, `black_base`, `black_failed_base`
-6. Calculate the bullish three-condition method
-7. Apply optional volume filter
-8. Screen stocks
-
-All `rolling`, `shift`, `ffill`, and resampling logic is grouped by `StockCode` to avoid mixing data from different stocks.
-
-## Strategy definitions
-
-### Basic derived fields
-
-- `prev_close = previous K-bar close`
-- `gap_pct = (Open - prev_close) / prev_close * 100`
-- `close_vs_prev_pct = (Close - prev_close) / prev_close * 100`
-- `body_pct = (Close - Open) / Open * 100`
-- `volume_ma5 = Volume.rolling(5).mean()`
-- `volume_ma20 = Volume.rolling(20).mean()`
-- `volume_ratio_5 = Volume / volume_ma5`
-- `volume_ratio_20 = Volume / volume_ma20`
-
-### Big Red Attack / Big Black Attack
-
-This strategy does **not** use ordinary red/green candle definitions.  
-It uses **previous close** as the key reference point.
-
-For the effective **big red candle / big black candle determination**, the app uses the **most recently occurring qualifying condition**:
-
-- Effective **big red candle** uses the latest qualifying bullish event:
-  - `red_attack_success`, or
-  - `black_attack_failed`
-- Effective **big black candle** uses the latest qualifying bearish event:
-  - `black_attack_success`, or
-  - `red_attack_failed`
-
-This means the app tracks the latest qualifying bullish/bearish base before evaluating the related screening condition.
-
-#### Big Red Attack Success
-
-- `Open > prev_close`
-- `Close > prev_close`
-- If `min_gap_pct` is set:
-  - `gap_pct >= min_gap_pct`
-- If `min_close_vs_prev_pct` is set:
-  - `close_vs_prev_pct >= min_close_vs_prev_pct`
-
-Meaning: bulls opened above the previous close and still closed above it.
-
-#### Big Red Attack Failed
-
-- `Open > prev_close`
-- `Close < prev_close`
-- If `min_gap_pct` is set:
-  - `gap_pct >= min_gap_pct`
-- If `min_close_vs_prev_pct` is set:
-  - `close_vs_prev_pct <= -min_close_vs_prev_pct`
-
-Meaning: bulls opened above the previous close but failed to hold it.
-
-#### Big Black Attack Success
-
-- `Open < prev_close`
-- `Close < prev_close`
-- If `min_gap_pct` is set:
-  - `gap_pct <= -min_gap_pct`
-- If `min_close_vs_prev_pct` is set:
-  - `close_vs_prev_pct <= -min_close_vs_prev_pct`
-
-Meaning: bears opened below the previous close and still closed below it.
-
-#### Big Black Attack Failed
-
-- `Open < prev_close`
-- `Close > prev_close`
-- If `min_gap_pct` is set:
-  - `gap_pct <= -min_gap_pct`
-- If `min_close_vs_prev_pct` is set:
-  - `close_vs_prev_pct >= min_close_vs_prev_pct`
-
-Meaning: bears opened below the previous close but bulls recovered the level.
-
-### Base lines
-
-#### `red_base`
-
-When `red_attack_success` is `True`:
-
-- `red_base_raw = prev_close`
-- Then forward-fill within each `StockCode`
-
-Meaning: the support base left by a successful bullish attack.
-
-#### `black_base`
-
-When `black_attack_success` is `True`:
-
-- `black_base_raw = prev_close`
-- Then forward-fill within each `StockCode`
-
-Meaning: the base price left by a successful bearish attack.
-
-#### `black_failed_base`
-
-When `black_attack_failed` is `True`:
-
-- `black_failed_base_raw = prev_close`
-- Then forward-fill within each `StockCode`
-
-Meaning: support left behind when a bearish attack fails.
-
-## Bullish three-condition method
-
-A stock becomes a long-side candidate when at least two of the following three conditions appear within the recent lookback window.
-
-### Condition A: Big Red appears
-
-- `cond_A_red_attack_daily = red_attack_success OR black_attack_failed`
-- `cond_A_red_attack_window = rolling max of cond_A_red_attack_daily within lookback_days`
-
-### Condition B: Break Big Black
-
-- `cond_B_break_black_daily = Close > latest_big_black_base * (1 + break_buffer_pct / 100)`
-- `latest_big_black_base` is derived from the most recent qualifying bearish event:
-  - `black_attack_success`, or
-  - `red_attack_failed`
-- If `latest_big_black_base` is `NaN`, the result is `False`
-- `cond_B_break_black_window = rolling max of cond_B_break_black_daily within lookback_days`
-
-### Condition C: Retest base
-
-Retest bases:
-
-- `red_base`
-- `black_base`
-- `black_failed_base`
-
-Retest rule:
-
-- `Low <= base_price * (1 + retest_tolerance_pct / 100)`
-- `Close >= base_price * (1 - retest_break_pct / 100)`
-
-Then:
-
-- `cond_C_retest_base_daily = retest_red_base_daily OR retest_black_base_daily OR retest_black_failed_base_daily`
-- `cond_C_retest_base_window = rolling max of cond_C_retest_base_daily within lookback_days`
-
-### Long score
-
-```text
-long_signal_score =
-    cond_A_red_attack_window
-  + cond_B_break_black_window
-  + cond_C_retest_base_window
+```
+2330.TW
+2317.TW
+6182.TWO
 ```
 
-- Score range: **0 to 3**
-- `long_signal = long_signal_score >= min_score`
+- 上市股票使用 `.TW` 後綴
+- 上櫃股票使用 `.TWO` 後綴
 
-## Volume filter modes
+---
 
-- **No volume filter**
-- **Require 5-day volume ratio**
-- **Require 20-day volume ratio**
-- **Require both 5-day and 20-day volume ratios**
+## 週 K / 月 K 說明
 
-If volume filtering is enabled:
+週 K / 月 K 由日線資料 Resample 產生，**不直接使用 yfinance 週線/月線**（避免資料格式不一致）。
 
-```text
-final_long_signal = long_signal AND volume_filter_pass
+| 欄位 | 計算方式 |
+|------|----------|
+| Open | 期間第一個交易日開盤 |
+| High | 期間最高價 |
+| Low | 期間最低價 |
+| Close | 期間最後一個交易日收盤 |
+| Volume | 期間成交量加總 |
+| Date | 期間最後一個交易日 |
+
+---
+
+## 結果說明
+
+### 訊號匹配結果
+
+回看視窗內，成交量達標且有任一攻擊訊號的所有 K 棒。
+
+### 最新訊號摘要
+
+每股一列，顯示回看視窗內最新一筆攻擊訊號。
+
+---
+
+## 技術依賴
+
+```
+streamlit
+pandas
+numpy
+yfinance
+plotly
+openpyxl
+requests
+lxml
 ```
 
-If volume filtering is disabled:
+---
 
-```text
-final_long_signal = long_signal
-```
-
-## Parameter meanings
-
-- `start_date`: start date for daily download
-- `end_date`: end date for daily download
-- `analysis_timeframe`: Daily K / Weekly K / Monthly K
-- `lookback_days`: number of recent K-bars used by the windowed conditions
-- `min_gap_pct`: minimum open gap relative to `prev_close`
-- `min_close_vs_prev_pct`: minimum close move relative to `prev_close`
-- `break_buffer_pct`: required breakout margin above `black_base`
-- `retest_tolerance_pct`: allowed overshoot above a base during retest detection
-- `retest_break_pct`: allowed close below a base before the retest is considered broken
-- `volume_filter_mode`: selected volume filter behavior
-- `min_volume_ratio_5`: minimum ratio for `Volume / volume_ma5`
-- `min_volume_ratio_20`: minimum ratio for `Volume / volume_ma20`
-- `min_score`: required score for `long_signal`
-- `only_latest_day`: show only the latest K-bar result for each stock
-- `show_recent_signals`: show stocks with `final_long_signal` appearing within the recent lookback window
-
-## Excel output
-
-The download workbook contains these sheets:
-
-- `All_Data`
-- `Latest_Result`
-- `Final_Long_Signal`
-- `Score_3`
-- `Score_2`
-- `Red_Attack_Success`
-- `Black_Attack_Success`
-- `Black_Attack_Failed`
-- `Parameter_Settings`
-
-The `Parameter_Settings` sheet includes:
-
-- `start_date`
-- `end_date`
-- `analysis_timeframe`
-- `lookback_days`
-- `min_gap_pct`
-- `min_close_vs_prev_pct`
-- `break_buffer_pct`
-- `retest_tolerance_pct`
-- `retest_break_pct`
-- `volume_filter_mode`
-- `min_volume_ratio_5`
-- `min_volume_ratio_20`
-- `min_score`
-
-## Defensive design notes
-
-- Empty stock list is handled safely
-- Duplicate stock symbols are deduplicated
-- Invalid symbols do not crash the app
-- Failed downloads are isolated per stock
-- Empty downloaded data is handled safely
-- NaN `prev_close` rows do not create false attack signals
-- NaN bases do not create false break/retest signals
-- Zero denominators return `NaN`, not crashes or infinities
-- Rolling calculations handle insufficient history safely
-- Resampling is done per `StockCode`
-- Weekly/monthly signals are calculated only **after** resampling
-- Excel export is generated in memory and works on Streamlit Cloud
-
-## Sample stock list
-
-See `sample_stock_list.csv`.
-
-## Disclaimer
-
-This project is for **stock research and screening only**.  
-It does **not** provide investment advice, trading advice, or recommendations.
+*本工具僅供投資研究篩選參考，並非投資建議。投資決策請自行判斷。*

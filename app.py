@@ -1,4 +1,4 @@
-"""Streamlit entrypoint for the Bullish Three-Condition Stock Screener."""
+"""Streamlit entrypoint for the Big Red / Big Black Attack Stock Screener."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import streamlit as st
 
 import config as app_config
 from chart_engine import create_stock_chart
-from data_loader import download_stock_data, load_taiwan_stock_universe, resample_ohlcv
+from data_loader import download_stock_data, load_taiwan_stock_universe, parse_stock_list, resample_ohlcv
 from export_engine import create_excel_bytes
 from signal_engine import run_signal_pipeline
 
-APP_TITLE = getattr(app_config, "APP_TITLE", "多頭三條件選股系統")
+APP_TITLE = getattr(app_config, "APP_TITLE", "大紅攻 / 大黑攻 訊號選股系統")
 APP_PURPOSE = getattr(
     app_config,
     "APP_PURPOSE",
@@ -25,12 +25,11 @@ AUTO_UNIVERSE_DESCRIPTION = getattr(
     "系統會自動抓取台灣上市與上櫃普通股股票清單，無須手動上傳 CSV。",
 )
 DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
+DEFAULT_TEXT_STOCK_LIST = getattr(app_config, "DEFAULT_TEXT_STOCK_LIST", "2330.TW\n2317.TW\n2382.TW")
 DISPLAY_COLUMN_LABELS = getattr(app_config, "DISPLAY_COLUMN_LABELS", {})
-NO_VOLUME_FILTER = app_config.NO_VOLUME_FILTER
 RESULT_COLUMNS = app_config.RESULT_COLUMNS
 TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
 TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
-VOLUME_FILTER_OPTIONS = app_config.VOLUME_FILTER_OPTIONS
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
@@ -42,81 +41,98 @@ def _build_params(
     start_date: date,
     end_date: date,
     analysis_timeframe: str,
-    lookback_days: int,
-    min_gap_pct: float,
-    min_close_vs_prev_pct: float,
-    break_buffer_pct: float,
-    retest_tolerance_pct: float,
-    retest_break_pct: float,
-    volume_filter_mode: str,
-    min_volume_ratio_5: float,
-    min_volume_ratio_20: float,
-    min_daily_volume_lots: int,
-    min_score: int,
-    only_latest_day: bool,
-    show_recent_signals: bool,
+    lookback_bars: int,
+    min_volume: int,
 ) -> dict:
     return {
         "start_date": start_date,
         "end_date": end_date,
         "analysis_timeframe": analysis_timeframe,
-        "lookback_days": int(lookback_days),
-        "min_gap_pct": float(min_gap_pct),
-        "min_close_vs_prev_pct": float(min_close_vs_prev_pct),
-        "break_buffer_pct": float(break_buffer_pct),
-        "retest_tolerance_pct": float(retest_tolerance_pct),
-        "retest_break_pct": float(retest_break_pct),
-        "volume_filter_mode": volume_filter_mode,
-        "min_volume_ratio_5": float(min_volume_ratio_5),
-        "min_volume_ratio_20": float(min_volume_ratio_20),
-        "min_daily_volume_lots": int(min_daily_volume_lots),
-        "min_score": int(min_score),
-        "only_latest_day": bool(only_latest_day),
-        "show_recent_signals": bool(show_recent_signals),
+        "lookback_bars": int(lookback_bars),
+        "min_volume": int(min_volume),
     }
 
 
-def _prepare_display_frame(df: pd.DataFrame) -> pd.DataFrame:
-    display_df = df.copy()
-    for column in RESULT_COLUMNS:
-        if column not in display_df.columns:
-            display_df[column] = pd.NA
-    display_df = display_df[RESULT_COLUMNS].sort_values(
-        by=["final_long_signal", "long_signal_score", "volume_ratio_5", "close_vs_prev_pct"],
-        ascending=[False, False, False, False],
-        na_position="last",
-    )
-    return display_df.rename(columns=DISPLAY_COLUMN_LABELS)
-
-
-def _recent_signal_stock_codes(processed_df: pd.DataFrame, lookback_days: int) -> list[str]:
+def _compute_lookback_matches(
+    processed_df: pd.DataFrame,
+    lookback_bars: int,
+    min_volume_shares: int,
+) -> pd.DataFrame:
+    """Return K-bars in the last lookback_bars that have any attack signal and pass volume."""
     if processed_df.empty:
-        return []
+        return processed_df.copy()
 
-    recent_codes: list[str] = []
-    for stock_code, stock_df in processed_df.groupby("StockCode", sort=False):
-        recent_window = stock_df.sort_values("Date").tail(lookback_days)
-        if recent_window["final_long_signal"].fillna(False).any():
-            recent_codes.append(stock_code)
-    return recent_codes
+    # Last N bars per stock.
+    recent = (
+        processed_df
+        .sort_values(["StockCode", "Date"])
+        .groupby("StockCode", group_keys=False)
+        .tail(lookback_bars)
+    )
+
+    has_signal = (
+        recent["red_attack_success"].fillna(False)
+        | recent["red_attack_failed"].fillna(False)
+        | recent["black_attack_success"].fillna(False)
+        | recent["black_attack_failed"].fillna(False)
+    )
+    volume_ok = recent["Volume"].fillna(0) >= min_volume_shares
+
+    return recent[has_signal & volume_ok].sort_values(
+        ["Date", "StockCode"], ascending=[False, True]
+    ).reset_index(drop=True)
 
 
-def _run_screening(params: dict, progress_callback=None) -> dict:
+def _compute_latest_summary(matching_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per stock: the most recent attack signal within the lookback window."""
+    if matching_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "StockCode", "StockName", "LatestSignalDate", "Timeframe",
+                "LatestSignalSummary", "LatestOpen", "LatestClose",
+                "LatestPrevClose", "LatestVolume",
+            ]
+        )
+
+    latest = (
+        matching_df
+        .sort_values(["StockCode", "Date"])
+        .groupby("StockCode", group_keys=False)
+        .tail(1)
+    )
+
+    cols_needed = {
+        "Date": "LatestSignalDate",
+        "signal_summary": "LatestSignalSummary",
+        "Open": "LatestOpen",
+        "Close": "LatestClose",
+        "prev_close": "LatestPrevClose",
+        "Volume": "LatestVolume",
+    }
+    result = latest[
+        ["StockCode"] +
+        (["StockName"] if "StockName" in latest.columns else []) +
+        ["Timeframe"] +
+        [c for c in cols_needed]
+    ].rename(columns=cols_needed).reset_index(drop=True)
+
+    return result.sort_values("LatestSignalDate", ascending=False)
+
+
+def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str], progress_callback=None) -> dict:
     timeframe_code = TIMEFRAME_OPTIONS[params["analysis_timeframe"]]
-    universe_df = _load_taiwan_stock_universe_cached()
-    stock_codes = universe_df["StockCode"].dropna().astype(str).tolist()
+    min_volume_shares = params["min_volume"] * 1000  # convert lots → shares
+
+    universe_df = pd.DataFrame()
+    if use_auto_universe:
+        universe_df = _load_taiwan_stock_universe_cached()
+        stock_codes = universe_df["StockCode"].dropna().astype(str).tolist()
+    else:
+        stock_codes = manual_codes
+        universe_df = pd.DataFrame()  # no universe for manual mode
 
     if not stock_codes:
-        empty_df = pd.DataFrame(columns=RESULT_COLUMNS)
-        return {
-            "all_data": empty_df,
-            "latest_result": empty_df,
-            "display_df": empty_df,
-            "success_list": [],
-            "failed_list": [],
-            "recent_signal_codes": [],
-            "universe_df": universe_df,
-        }
+        return _empty_result(universe_df)
 
     daily_data, success_list, failed_list = download_stock_data(
         stock_codes=stock_codes,
@@ -126,55 +142,25 @@ def _run_screening(params: dict, progress_callback=None) -> dict:
     )
 
     if daily_data.empty:
-        empty_df = pd.DataFrame(columns=RESULT_COLUMNS)
-        return {
-            "all_data": empty_df,
-            "latest_result": empty_df,
-            "display_df": empty_df,
-            "success_list": success_list,
-            "failed_list": failed_list,
-            "recent_signal_codes": [],
-            "universe_df": universe_df,
-        }
+        return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
 
-    # Pre-filter: keep only stocks with sufficient average daily volume.
-    # yfinance returns Taiwan stock volume in shares; 1 lot (張) = 1000 shares.
-    min_lots = int(params.get("min_daily_volume_lots", 0))
-    if min_lots > 0:
-        min_shares = min_lots * 1000
+    # Pre-filter: remove stocks with insufficient average daily volume (performance).
+    if min_volume_shares > 0:
         recent_avg = daily_data.groupby("StockCode")["Volume"].apply(
             lambda x: x.tail(20).mean() if len(x) >= 20 else x.mean()
         )
-        active_stocks = set(recent_avg[recent_avg >= min_shares].index)
-        daily_data = daily_data[daily_data["StockCode"].isin(active_stocks)].copy()
-        success_list = [s for s in success_list if s in active_stocks]
+        active = set(recent_avg[recent_avg >= min_volume_shares].index)
+        daily_data = daily_data[daily_data["StockCode"].isin(active)].copy()
+        success_list = [s for s in success_list if s in active]
 
     if daily_data.empty:
-        empty_df = pd.DataFrame(columns=RESULT_COLUMNS)
-        return {
-            "all_data": empty_df,
-            "latest_result": empty_df,
-            "display_df": empty_df,
-            "success_list": success_list,
-            "failed_list": failed_list,
-            "recent_signal_codes": [],
-            "universe_df": universe_df,
-        }
+        return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
 
     timeframe_data = resample_ohlcv(daily_data, timeframe_code)
     processed = run_signal_pipeline(timeframe_data, params)
 
     if processed.empty:
-        empty_df = pd.DataFrame(columns=RESULT_COLUMNS)
-        return {
-            "all_data": empty_df,
-            "latest_result": empty_df,
-            "display_df": empty_df,
-            "success_list": success_list,
-            "failed_list": failed_list,
-            "recent_signal_codes": [],
-            "universe_df": universe_df,
-        }
+        return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
 
     # Join Chinese stock name from the universe lookup table.
     if not universe_df.empty and "StockName" in universe_df.columns:
@@ -188,48 +174,39 @@ def _run_screening(params: dict, progress_callback=None) -> dict:
     else:
         processed["StockName"] = processed["StockCode"]
 
-    latest_result = (
-        processed.sort_values(["StockCode", "Date"]).groupby("StockCode", group_keys=False).tail(1)
-    )
-    recent_signal_codes = _recent_signal_stock_codes(processed, params["lookback_days"])
-
-    display_source = latest_result if params["only_latest_day"] else processed
-    if params["show_recent_signals"]:
-        display_source = display_source[display_source["StockCode"].isin(recent_signal_codes)]
-    display_df = _prepare_display_frame(display_source)
+    matching_signals = _compute_lookback_matches(processed, params["lookback_bars"], min_volume_shares)
+    latest_summary = _compute_latest_summary(matching_signals)
 
     return {
         "all_data": processed,
-        "latest_result": latest_result,
-        "display_df": display_df,
+        "matching_signals": matching_signals,
+        "latest_summary": latest_summary,
         "success_list": success_list,
         "failed_list": failed_list,
-        "recent_signal_codes": recent_signal_codes,
         "universe_df": universe_df,
     }
 
 
-def _summary_metrics(latest_result: pd.DataFrame) -> dict:
-    if latest_result.empty:
-        return {
-            "total_stocks": 0,
-            "final_long_signal": 0,
-            "score_3": 0,
-            "score_2": 0,
-            "latest_red_attack_success": 0,
-            "latest_break_big_black": 0,
-            "latest_retest_base": 0,
-        }
-
+def _empty_result(universe_df: pd.DataFrame, success_list=None, failed_list=None) -> dict:
+    empty = pd.DataFrame()
     return {
-        "total_stocks": int(latest_result["StockCode"].nunique()),
-        "final_long_signal": int(latest_result["final_long_signal"].fillna(False).sum()),
-        "score_3": int((latest_result["long_signal_score"] == 3).sum()),
-        "score_2": int((latest_result["long_signal_score"] == 2).sum()),
-        "latest_red_attack_success": int(latest_result["cond_A_red_attack_daily"].fillna(False).sum()),
-        "latest_break_big_black": int(latest_result["cond_B_break_black_window"].fillna(False).sum()),
-        "latest_retest_base": int(latest_result["cond_C_retest_base_window"].fillna(False).sum()),
+        "all_data": empty,
+        "matching_signals": empty,
+        "latest_summary": empty,
+        "success_list": success_list or [],
+        "failed_list": failed_list or [],
+        "universe_df": universe_df,
     }
+
+
+def _prepare_display_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Select RESULT_COLUMNS (fill missing with NA) and rename to Chinese labels."""
+    display_df = df.copy()
+    for col in RESULT_COLUMNS:
+        if col not in display_df.columns:
+            display_df[col] = pd.NA
+    available = [c for c in RESULT_COLUMNS if c in display_df.columns]
+    return display_df[available].rename(columns=DISPLAY_COLUMN_LABELS)
 
 
 def main():
@@ -239,11 +216,40 @@ def main():
 
     with st.sidebar:
         st.header("篩選設定")
-        st.subheader("股票範圍")
-        st.info(AUTO_UNIVERSE_DESCRIPTION)
-        st.caption("資料來源：TWSE 公開 ISIN 清單（上市與上櫃普通股）")
 
-        st.subheader("日期與週期參數")
+        # ── Stock source ────────────────────────────────────────────────────
+        st.subheader("股票來源")
+        use_auto_universe = st.checkbox(
+            "🇹🇼 自動抓取台灣全市場股票（上市＋上櫃）",
+            value=True,
+            help=AUTO_UNIVERSE_DESCRIPTION,
+        )
+
+        manual_codes: list[str] = []
+        if not use_auto_universe:
+            st.caption("每行一個股票代號（例如 2330.TW）")
+            stock_text = st.text_area(
+                "股票代號清單",
+                value=DEFAULT_TEXT_STOCK_LIST,
+                height=150,
+            )
+            uploaded_csv = st.file_uploader("或上傳 CSV（需含 StockCode 欄位）", type=["csv"])
+            if uploaded_csv is not None:
+                try:
+                    csv_df = pd.read_csv(uploaded_csv)
+                    if "StockCode" in csv_df.columns:
+                        manual_codes = csv_df["StockCode"].dropna().astype(str).str.strip().tolist()
+                    else:
+                        st.warning("上傳的 CSV 必須包含 'StockCode' 欄位。")
+                except Exception as exc:
+                    st.warning(f"無法讀取 CSV：{exc}")
+            if not manual_codes:
+                manual_codes = parse_stock_list(stock_text)
+        else:
+            st.caption("資料來源：TWSE 公開 ISIN 清單（上市與上櫃普通股）")
+
+        # ── Date and timeframe ───────────────────────────────────────────────
+        st.subheader("日期與週期")
         start_date = st.date_input("開始日期", value=DEFAULT_PARAMETERS["start_date"])
         end_date = st.date_input("結束日期", value=DEFAULT_PARAMETERS["end_date"])
         analysis_timeframe = st.selectbox(
@@ -251,92 +257,27 @@ def main():
             options=list(TIMEFRAME_OPTIONS.keys()),
             index=0,
         )
-        lookback_days = st.number_input(
+
+        # ── Filter parameters ────────────────────────────────────────────────
+        st.subheader("篩選條件")
+        min_volume = st.number_input(
+            "最小成交量（張）",
+            min_value=0,
+            value=DEFAULT_PARAMETERS["min_volume"],
+            step=100,
+            help="台股 1 張 = 1000 股。設為 0 表示不篩選。yfinance 資料以股數計算，系統自動換算。",
+        )
+        lookback_bars = st.number_input(
             "回看 K 棒數",
             min_value=1,
-            value=DEFAULT_PARAMETERS["lookback_days"],
+            value=DEFAULT_PARAMETERS["lookback_bars"],
             step=1,
-        )
-
-        st.subheader("攻擊門檻")
-        min_gap_pct = st.number_input(
-            "最小跳空幅度 (%)",
-            value=DEFAULT_PARAMETERS["min_gap_pct"],
-            step=0.1,
-            format="%.2f",
-        )
-        min_close_vs_prev_pct = st.number_input(
-            "最小收盤相對前收盤幅度 (%)",
-            value=DEFAULT_PARAMETERS["min_close_vs_prev_pct"],
-            step=0.1,
-            format="%.2f",
-        )
-
-        st.subheader("突破與回測參數")
-        break_buffer_pct = st.number_input(
-            "突破緩衝 (%)",
-            value=DEFAULT_PARAMETERS["break_buffer_pct"],
-            step=0.1,
-            format="%.2f",
-        )
-        retest_tolerance_pct = st.number_input(
-            "回測容許值 (%)",
-            value=DEFAULT_PARAMETERS["retest_tolerance_pct"],
-            step=0.1,
-            format="%.2f",
-        )
-        retest_break_pct = st.number_input(
-            "回測跌破容許值 (%)",
-            value=DEFAULT_PARAMETERS["retest_break_pct"],
-            step=0.1,
-            format="%.2f",
-        )
-
-        st.subheader("成交量條件")
-        volume_filter_mode = st.selectbox(
-            "成交量篩選模式",
-            options=VOLUME_FILTER_OPTIONS,
-            index=0,
-        )
-        min_volume_ratio_5 = st.number_input(
-            "最小 5 日量比",
-            value=DEFAULT_PARAMETERS["min_volume_ratio_5"],
-            step=0.1,
-            format="%.2f",
-        )
-        min_volume_ratio_20 = st.number_input(
-            "最小 20 日量比",
-            value=DEFAULT_PARAMETERS["min_volume_ratio_20"],
-            step=0.1,
-            format="%.2f",
-        )
-        min_daily_volume_lots = st.number_input(
-            "最小日均成交量（張）",
-            value=DEFAULT_PARAMETERS["min_daily_volume_lots"],
-            min_value=0,
-            step=100,
-            help="設為 0 表示不篩選。台股 1 張 = 1000 股，yfinance 資料以股數計算，系統自動換算。",
-        )
-
-        st.subheader("篩選參數")
-        min_score = st.number_input(
-            "最低分數",
-            min_value=1,
-            max_value=3,
-            value=DEFAULT_PARAMETERS["min_score"],
-            step=1,
-        )
-        only_latest_day = st.checkbox(
-            "只顯示每檔最新一根 K 棒",
-            value=DEFAULT_PARAMETERS["only_latest_day"],
-        )
-        show_recent_signals = st.checkbox(
-            "只顯示最近回看視窗內出現最終多頭訊號的股票",
-            value=DEFAULT_PARAMETERS["show_recent_signals"],
+            help="只顯示最近 N 根 K 棒內出現攻擊訊號的資料列。",
         )
 
         run_screening = st.button("開始篩選", type="primary", use_container_width=True)
 
+    # ── Validation ───────────────────────────────────────────────────────────
     if start_date > end_date:
         st.error("開始日期必須早於或等於結束日期。")
         return
@@ -345,33 +286,20 @@ def main():
         start_date=start_date,
         end_date=end_date,
         analysis_timeframe=analysis_timeframe,
-        lookback_days=lookback_days,
-        min_gap_pct=min_gap_pct,
-        min_close_vs_prev_pct=min_close_vs_prev_pct,
-        break_buffer_pct=break_buffer_pct,
-        retest_tolerance_pct=retest_tolerance_pct,
-        retest_break_pct=retest_break_pct,
-        volume_filter_mode=volume_filter_mode,
-        min_volume_ratio_5=min_volume_ratio_5,
-        min_volume_ratio_20=min_volume_ratio_20,
-        min_daily_volume_lots=min_daily_volume_lots,
-        min_score=min_score,
-        only_latest_day=only_latest_day,
-        show_recent_signals=show_recent_signals,
+        lookback_bars=lookback_bars,
+        min_volume=min_volume,
     )
 
+    # ── Run screening ────────────────────────────────────────────────────────
     if run_screening:
-        try:
-            universe_df = _load_taiwan_stock_universe_cached()
-        except ValueError as error:
-            st.error(str(error))
-            return
-        except Exception as error:
-            st.error(f"無法取得台股上市與上櫃股票清單：{error}")
-            return
-
-        if universe_df.empty:
-            st.warning("目前無法取得台股上市與上櫃普通股股票清單。")
+        if use_auto_universe:
+            try:
+                _load_taiwan_stock_universe_cached()
+            except Exception as exc:
+                st.error(f"無法取得台股上市與上櫃股票清單：{exc}")
+                return
+        elif not manual_codes:
+            st.warning("請先輸入至少一個股票代號。")
             return
 
         progress_placeholder = st.sidebar.empty()
@@ -381,38 +309,48 @@ def main():
             progress_bar.progress(min(max(progress_value, 0.0), 1.0))
             progress_placeholder.caption(message)
 
-        with st.spinner("正在自動抓取台股上市與上櫃股票資料並執行篩選流程..."):
+        with st.spinner("正在下載資料並偵測攻擊訊號..."):
             st.session_state["screening_results"] = _run_screening(
                 params,
+                use_auto_universe=use_auto_universe,
+                manual_codes=manual_codes,
                 progress_callback=_progress_callback,
             )
             st.session_state["screening_params"] = params
+
         progress_bar.empty()
         progress_placeholder.empty()
 
+    # ── Retrieve cached results ───────────────────────────────────────────────
     results = st.session_state.get("screening_results")
     saved_params = st.session_state.get("screening_params", params)
 
     if not results:
-        st.info("請先設定條件，然後按下「開始篩選」。")
+        st.info("請設定條件後按下「開始篩選」。")
         return
 
-    all_data = results["all_data"]
-    latest_result = results["latest_result"]
-    display_df = results["display_df"]
-    success_list = results["success_list"]
-    failed_list = results["failed_list"]
-    universe_df = results["universe_df"]
+    all_data: pd.DataFrame = results["all_data"]
+    matching_signals: pd.DataFrame = results["matching_signals"]
+    latest_summary: pd.DataFrame = results["latest_summary"]
+    success_list: list[str] = results["success_list"]
+    failed_list: list[str] = results["failed_list"]
+    universe_df: pd.DataFrame = results["universe_df"]
 
+    # ── Download status ───────────────────────────────────────────────────────
     st.subheader("下載狀態")
-    listed_count = int((universe_df["MarketLabel"] == "上市").sum()) if not universe_df.empty else 0
-    otc_count = int((universe_df["MarketLabel"] == "上櫃").sum()) if not universe_df.empty else 0
-    status_col1, status_col2, status_col3, status_col4 = st.columns(4)
-    status_col1.metric("自動載入股票總數", int(len(universe_df)))
-    status_col2.metric("上市股票數", listed_count)
-    status_col3.metric("上櫃股票數", otc_count)
-    status_col4.metric("成功下載檔數", len(success_list))
-    st.metric("失敗檔數", len(failed_list))
+    if not universe_df.empty:
+        listed_count = int((universe_df["MarketLabel"] == "上市").sum())
+        otc_count = int((universe_df["MarketLabel"] == "上櫃").sum())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("自動載入股票總數", int(len(universe_df)))
+        c2.metric("上市股票數", listed_count)
+        c3.metric("上櫃股票數", otc_count)
+        c4.metric("成功下載檔數", len(success_list))
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("成功下載檔數", len(success_list))
+        c2.metric("失敗檔數", len(failed_list))
+
     if failed_list:
         preview = ", ".join(failed_list[:50])
         suffix = " ..." if len(failed_list) > 50 else ""
@@ -420,30 +358,60 @@ def main():
     else:
         st.success("所有要求的股票代號都已成功下載。")
 
-    st.subheader("摘要指標")
-    metrics = _summary_metrics(latest_result)
-    metric_columns = st.columns(7)
-    metric_columns[0].metric("股票總數", metrics["total_stocks"])
-    metric_columns[1].metric("最終多頭訊號數", metrics["final_long_signal"])
-    metric_columns[2].metric("3 分股票數", metrics["score_3"])
-    metric_columns[3].metric("2 分股票數", metrics["score_2"])
-    metric_columns[4].metric("最新大紅 K 數", metrics["latest_red_attack_success"])
-    metric_columns[5].metric("最新突破黑攻基準數", metrics["latest_break_big_black"])
-    metric_columns[6].metric("最新回測基準數", metrics["latest_retest_base"])
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    st.subheader("摘要")
+    total_stocks = int(all_data["StockCode"].nunique()) if not all_data.empty else 0
+    matched_stocks = int(matching_signals["StockCode"].nunique()) if not matching_signals.empty else 0
+    red_success = int(matching_signals["red_attack_success"].fillna(False).sum()) if not matching_signals.empty else 0
+    red_failed = int(matching_signals["red_attack_failed"].fillna(False).sum()) if not matching_signals.empty else 0
+    black_success = int(matching_signals["black_attack_success"].fillna(False).sum()) if not matching_signals.empty else 0
+    black_failed = int(matching_signals["black_attack_failed"].fillna(False).sum()) if not matching_signals.empty else 0
 
-    st.subheader("篩選結果表")
-    if display_df.empty:
-        st.info("目前沒有符合結果篩選條件的資料列。")
+    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+    mc1.metric("篩選後股票數", total_stocks)
+    mc2.metric(f"近 {saved_params['lookback_bars']} 棒有訊號股票數", matched_stocks)
+    mc3.metric("大紅攻成功 K 棒數", red_success)
+    mc4.metric("大紅攻失敗 K 棒數", red_failed)
+    mc5.metric("大黑攻成功 K 棒數", black_success)
+    mc6.metric("大黑攻失敗 K 棒數", black_failed)
+
+    # ── Matching signals table ────────────────────────────────────────────────
+    st.subheader("訊號匹配結果（回看視窗內、有訊號、量達標）")
+    if matching_signals.empty:
+        st.info("目前沒有符合條件的攻擊訊號 K 棒。")
     else:
-        st.dataframe(display_df, use_container_width=True)
+        display_matching = _prepare_display_frame(matching_signals)
+        st.dataframe(display_matching, use_container_width=True)
 
-    st.subheader("圖表")
-    chart_stock_codes = latest_result["StockCode"].dropna().astype(str).tolist()
-    if chart_stock_codes:
-        selected_stock = st.selectbox("選擇股票", options=chart_stock_codes)
-        selected_stock_df = all_data[all_data["StockCode"] == selected_stock].copy()
+    # ── Latest summary table ──────────────────────────────────────────────────
+    st.subheader("最新訊號摘要（每股一列）")
+    if latest_summary.empty:
+        st.info("無最新訊號摘要資料。")
+    else:
+        summary_label_map = {
+            "StockCode": "股票代號",
+            "StockName": "股票名稱",
+            "LatestSignalDate": "最新訊號日期",
+            "Timeframe": "週期",
+            "LatestSignalSummary": "最新訊號",
+            "LatestOpen": "開盤",
+            "LatestClose": "收盤",
+            "LatestPrevClose": "前一根收盤",
+            "LatestVolume": "成交量",
+        }
+        display_summary = latest_summary.rename(
+            columns={k: v for k, v in summary_label_map.items() if k in latest_summary.columns}
+        )
+        st.dataframe(display_summary, use_container_width=True)
+
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    st.subheader("K 線圖")
+    signal_stock_codes = sorted(matching_signals["StockCode"].dropna().astype(str).unique().tolist()) if not matching_signals.empty else []
+    if signal_stock_codes:
+        selected_stock = st.selectbox("選擇股票（顯示有訊號的股票）", options=signal_stock_codes)
+        selected_df = all_data[all_data["StockCode"] == selected_stock].copy()
         figure, chart_message = create_stock_chart(
-            selected_stock_df,
+            selected_df,
             timeframe_label=saved_params["analysis_timeframe"],
         )
         if chart_message:
@@ -451,26 +419,30 @@ def main():
         elif figure is not None:
             st.plotly_chart(figure, use_container_width=True)
     else:
-        st.info("目前沒有可用圖表資料。")
+        st.info("目前沒有可供選擇的有訊號股票。")
 
+    # ── Excel download ────────────────────────────────────────────────────────
     st.subheader("Excel 下載")
-    excel_bytes = create_excel_bytes(all_data, latest_result, saved_params)
+    excel_bytes = create_excel_bytes(
+        all_data=all_data,
+        matching_signals=matching_signals,
+        latest_summary=latest_summary,
+        failed_list=failed_list,
+        params=saved_params,
+    )
+    timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
     st.download_button(
         label="下載 Excel 結果",
         data=excel_bytes,
-        file_name=f"bullish_three_condition_{TIMEFRAME_OPTIONS[saved_params['analysis_timeframe']]}.xlsx",
+        file_name=f"attack_signals_{timeframe_code}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         disabled=all_data.empty,
     )
 
-    if saved_params["volume_filter_mode"] != NO_VOLUME_FILTER:
-        st.caption(
-            f"成交量篩選已啟用：{saved_params['volume_filter_mode']}。"
-        )
-
     st.caption(
-        f"目前分析週期：{saved_params['analysis_timeframe']} "
-        f"({TIMEFRAME_LABELS[TIMEFRAME_OPTIONS[saved_params['analysis_timeframe']]]})。"
+        f"目前分析週期：{saved_params['analysis_timeframe']}　"
+        f"回看 {saved_params['lookback_bars']} 根 K 棒　"
+        f"最小成交量 {saved_params['min_volume']} 張"
     )
 
 
