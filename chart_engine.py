@@ -38,6 +38,12 @@ _SIGNAL_MARKERS = {
     },
 }
 
+# Base line styles for red_base and black_base reference lines.
+_BASE_LINE_STYLES = [
+    ("red_base",   "#dc2626", "多攻基準（紅攻 prev_close）"),
+    ("black_base", "#1d4ed8", "空攻基準（黑攻 prev_close）"),
+]
+
 
 def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
     """Create an interactive candlestick chart for a single stock.
@@ -88,10 +94,6 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
     )
 
     # --- Base lines: red_base and black_base as dashed reference lines ---
-    _BASE_LINE_STYLES = [
-        ("red_base",   "#dc2626", "多攻基準（紅攻 prev_close）"),
-        ("black_base", "#1d4ed8", "空攻基準（黑攻 prev_close）"),
-    ]
     for base_col, base_color, base_label in _BASE_LINE_STYLES:
         if base_col not in chart_df.columns:
             continue

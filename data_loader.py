@@ -60,8 +60,7 @@ def parse_stock_list(text: str) -> list[str]:
 
     tokens: list[str] = []
     for line in text.splitlines():
-        parts = [part for part in line.replace(",", "\n").splitlines()]
-        tokens.extend(parts)
+        tokens.extend(line.replace(",", "\n").splitlines())
 
     cleaned = [_normalize_token(token) for token in tokens if _normalize_token(token)]
     return _dedupe_preserve_order(cleaned)
@@ -182,14 +181,7 @@ def normalize_yfinance_data(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
     if "Date" not in normalized.columns and len(normalized.columns) > 0:
         normalized = normalized.rename(columns={normalized.columns[0]: "Date"})
 
-    rename_map = {
-        "Open": "Open",
-        "High": "High",
-        "Low": "Low",
-        "Close": "Close",
-        "Volume": "Volume",
-    }
-    required_price_columns = set(rename_map.keys())
+    required_price_columns = {"Open", "High", "Low", "Close", "Volume"}
     if not required_price_columns.issubset(normalized.columns):
         return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
 
@@ -218,6 +210,7 @@ def _download_candidate(symbols: str | list[str], start_date, end_date) -> pd.Da
         progress=False,
         group_by="ticker",
         threads=True,
+        multi_level_index=True,
     )
 
 
@@ -396,7 +389,7 @@ def download_investor_flow_data(
     start_ts = end_ts - pd.Timedelta(days=max(int(lookback_days), 5))
 
     frames: list[pd.DataFrame] = []
-    for trade_date in pd.date_range(start_ts, end_ts, freq="D"):
+    for trade_date in pd.bdate_range(start_ts, end_ts):
         twse_df = _fetch_twse_investor_flow(trade_date)
         if not twse_df.empty:
             frames.append(twse_df)

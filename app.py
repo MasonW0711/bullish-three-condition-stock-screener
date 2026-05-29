@@ -246,12 +246,12 @@ def _compute_three_methods_matches(
         .sort_values(["StockCode", "Date"])
         .groupby("StockCode", group_keys=False)
         .tail(1)
+        .copy()
     )
 
     # Columns that may or may not be present, fill with safe defaults if missing.
     for cnt_col in ("bullish_methods_count", "bearish_methods_count", "final_methods_count"):
         if cnt_col not in latest.columns:
-            latest = latest.copy()
             latest[cnt_col] = 0
     for cond_col in (
         "bull_cond_1_in_window", "bull_cond_2_in_window", "bull_cond_3_in_window",
@@ -260,7 +260,6 @@ def _compute_three_methods_matches(
         "foreign_buy_streak_ok", "trust_buy_streak_ok", "foreign_sell_streak_ok", "trust_sell_streak_ok",
     ):
         if cond_col not in latest.columns:
-            latest = latest.copy()
             latest[cond_col] = "None" if cond_col == "final_methods_direction" else pd.NA
 
     def _select_cols(df: pd.DataFrame) -> pd.DataFrame:
