@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import re
 from io import StringIO
 from typing import Iterable
@@ -21,6 +23,8 @@ from config import (
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_YFINANCE_LOGGER_NAMES = ("yfinance", "peewee")
 
 
 def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
@@ -201,17 +205,29 @@ def normalize_yfinance_data(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
 
 
 def _download_candidate(symbols: str | list[str], start_date, end_date) -> pd.DataFrame:
-    return yf.download(
-        symbols,
-        start=start_date,
-        end=end_date,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-        threads=True,
-        multi_level_index=True,
-    )
+    # yfinance treats `end` as exclusive; users expect the selected end date to
+    # be included when that trading day has data.
+    end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+    loggers = [logging.getLogger(name) for name in _YFINANCE_LOGGER_NAMES]
+    previous_levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.CRITICAL)
+    try:
+        with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
+            return yf.download(
+                symbols,
+                start=start_date,
+                end=end_exclusive.date(),
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+                multi_level_index=True,
+            )
+    finally:
+        for logger, level in zip(loggers, previous_levels):
+            logger.setLevel(level)
 
 
 def download_stock_data(
@@ -238,17 +254,34 @@ def download_stock_data(
                 f"正在下載第 {chunk_index} 批股票資料（共 {len(chunk)} 檔）...",
             )
 
-        try:
-            raw_data = _download_candidate(chunk if len(chunk) > 1 else chunk[0], start_date, end_date)
-        except Exception:
+        candidate_map = {raw_code: normalize_symbol(raw_code) for raw_code in chunk}
+        primary_symbols = _dedupe_preserve_order(
+            candidates[0]
+            for candidates in candidate_map.values()
+            if candidates
+        )
+        if not primary_symbols:
             failed_list.extend(chunk)
             continue
 
+        try:
+            raw_data = _download_candidate(
+                primary_symbols if len(primary_symbols) > 1 else primary_symbols[0],
+                start_date,
+                end_date,
+            )
+        except Exception:
+            raw_data = pd.DataFrame()
+
+        unresolved_codes: list[str] = []
+
         for raw_code in chunk:
+            candidates = candidate_map.get(raw_code, [])
             resolved_frame = pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
             resolved_symbol = None
 
-            for candidate in normalize_symbol(raw_code):
+            primary_candidates = candidates[:1] if len(candidates) > 1 else candidates
+            for candidate in primary_candidates:
                 normalized = normalize_yfinance_data(raw_data, stock_code=candidate)
                 if not normalized.empty:
                     resolved_frame = normalized
@@ -256,11 +289,49 @@ def download_stock_data(
                     break
 
             if resolved_symbol is None:
+                if len(candidates) > 1:
+                    unresolved_codes.append(raw_code)
+                    continue
                 failed_list.append(raw_code)
                 continue
 
+            if resolved_symbol in success_list:
+                continue
             all_frames.append(resolved_frame)
             success_list.append(resolved_symbol)
+
+        if unresolved_codes:
+            fallback_symbols = _dedupe_preserve_order(
+                candidate
+                for raw_code in unresolved_codes
+                for candidate in candidate_map.get(raw_code, [])[1:]
+            )
+            try:
+                fallback_data = _download_candidate(
+                    fallback_symbols if len(fallback_symbols) > 1 else fallback_symbols[0],
+                    start_date,
+                    end_date,
+                )
+            except Exception:
+                fallback_data = pd.DataFrame()
+
+            for raw_code in unresolved_codes:
+                resolved_frame = pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
+                resolved_symbol = None
+                for candidate in candidate_map.get(raw_code, [])[1:]:
+                    normalized = normalize_yfinance_data(fallback_data, stock_code=candidate)
+                    if not normalized.empty:
+                        resolved_frame = normalized
+                        resolved_symbol = candidate
+                        break
+
+                if resolved_symbol is None:
+                    failed_list.append(raw_code)
+                    continue
+                if resolved_symbol in success_list:
+                    continue
+                all_frames.append(resolved_frame)
+                success_list.append(resolved_symbol)
 
         if progress_callback is not None:
             completed = min(chunk_index * YFINANCE_BATCH_SIZE, total_codes)
@@ -278,10 +349,15 @@ def download_stock_data(
 
 
 def _to_int(value) -> int:
-    text = str(value).strip().replace(",", "")
-    if text in {"", "nan", "None", "--"}:
+    text = str(value).strip().replace(",", "").replace("+", "")
+    if text in {"", "nan", "NaN", "None", "--", "-", "—"}:
         return 0
-    return int(float(text))
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _get_with_ssl_fallback(url: str) -> requests.Response:

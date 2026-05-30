@@ -139,6 +139,9 @@ def add_three_methods_conditions(df: pd.DataFrame, lookback_bars: int, pullback_
                       close beyond the reference.
     """
     output = df.copy()
+    for column in ["Open", "High", "Low", "Close", "red_base", "black_base"]:
+        if column in output.columns:
+            output[column] = pd.to_numeric(output[column], errors="coerce")
 
     has_rb = output["red_base"].notna()
     has_bb = output["black_base"].notna()
@@ -245,6 +248,8 @@ def attach_investor_flow_flags(
     investor = investor_flow_df.copy()
     investor["Date"] = pd.to_datetime(investor["Date"], errors="coerce")
     investor["BaseCode"] = investor["BaseCode"].astype(str).str.strip()
+    investor["foreign_net"] = pd.to_numeric(investor["foreign_net"], errors="coerce").fillna(0)
+    investor["trust_net"] = pd.to_numeric(investor["trust_net"], errors="coerce").fillna(0)
     investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
 
     investor["foreign_buy_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
@@ -273,20 +278,24 @@ def attach_investor_flow_flags(
             for col in flag_columns:
                 stock_output[col] = False
         else:
-            stock_output = stock_df.sort_values("Date").reset_index(drop=True)
-            last_flow_date = flow_df["Date"].max()
-            mapped_flags = (
-                flow_df.set_index("Date")[flag_columns]
-                .sort_index()
-                .reindex(stock_output["Date"]).ffill()
+            stock_output = (
+                stock_df
+                .drop(columns=[col for col in flag_columns if col in stock_df.columns])
+                .sort_values("Date")
                 .reset_index(drop=True)
             )
-            mapped_flags.columns = flag_columns
+            last_flow_date = flow_df["Date"].max()
+            stock_output = pd.merge_asof(
+                stock_output,
+                flow_df,
+                on="Date",
+                direction="backward",
+            )
             future_mask = stock_output["Date"] > last_flow_date
-            if future_mask.any():
-                mapped_flags.loc[future_mask, flag_columns] = False
             for col in flag_columns:
-                stock_output[col] = mapped_flags[col].to_numpy()
+                stock_output[col] = pd.array(stock_output[col], dtype="boolean").fillna(False).astype(bool)
+                if future_mask.any():
+                    stock_output.loc[future_mask, col] = False
         merged_groups.append(stock_output)
 
     merged = pd.concat(merged_groups, ignore_index=True)

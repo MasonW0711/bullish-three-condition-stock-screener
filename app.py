@@ -44,6 +44,32 @@ def _load_taiwan_stock_universe_cached() -> pd.DataFrame:
     return load_taiwan_stock_universe()
 
 
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _download_investor_flow_data_cached(
+    stock_codes: tuple[str, ...],
+    end_date: date,
+    lookback_days: int,
+) -> pd.DataFrame:
+    return download_investor_flow_data(
+        stock_codes=list(stock_codes),
+        end_date=end_date,
+        lookback_days=lookback_days,
+    )
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def _download_stock_data_cached(
+    stock_codes: tuple[str, ...],
+    start_date: date,
+    end_date: date,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    return download_stock_data(
+        stock_codes=list(stock_codes),
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
 def _build_params(
     start_date: date,
     end_date: date,
@@ -155,12 +181,15 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     if not stock_codes:
         return _empty_result(universe_df)
 
-    daily_data, success_list, failed_list = download_stock_data(
-        stock_codes=stock_codes,
+    if progress_callback is not None:
+        progress_callback(0.05, "正在下載或讀取股票資料快取...")
+    daily_data, success_list, failed_list = _download_stock_data_cached(
+        stock_codes=tuple(stock_codes),
         start_date=params["start_date"],
         end_date=params["end_date"],
-        progress_callback=progress_callback,
     )
+    if progress_callback is not None:
+        progress_callback(1.0, "股票資料已準備完成。")
 
     if daily_data.empty:
         return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
@@ -183,14 +212,25 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     if processed.empty:
         return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
 
-    investor_flow_df = download_investor_flow_data(
-        stock_codes=success_list,
-        end_date=params["end_date"],
-        lookback_days=max(
-            int(getattr(app_config, "INVESTOR_LOOKBACK_DAYS", 20)),
-            int(params.get("investor_consecutive_days", 3)) + 10,
-        ),
+    investor_filters_enabled = any(
+        params.get(key, False)
+        for key in (
+            "foreign_buy_streak",
+            "trust_buy_streak",
+            "foreign_sell_streak",
+            "trust_sell_streak",
+        )
     )
+    investor_flow_df = pd.DataFrame()
+    if investor_filters_enabled:
+        investor_flow_df = _download_investor_flow_data_cached(
+            stock_codes=tuple(sorted(success_list)),
+            end_date=params["end_date"],
+            lookback_days=max(
+                int(getattr(app_config, "INVESTOR_LOOKBACK_DAYS", 20)),
+                int(params.get("investor_consecutive_days", 3)) + 10,
+            ),
+        )
     processed = attach_investor_flow_flags(
         processed,
         investor_flow_df,
@@ -237,8 +277,11 @@ def _compute_three_methods_matches(
     min_conditions: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return one-row-per-stock Three Methods summaries with exclusive direction."""
+    def _empty_three_methods_frame() -> pd.DataFrame:
+        return pd.DataFrame(columns=THREE_METHODS_COLUMNS)
+
     if processed_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return _empty_three_methods_frame(), _empty_three_methods_frame()
 
     # Get the most recent row per stock.
     latest = (
@@ -278,11 +321,11 @@ def _compute_three_methods_matches(
 
     bullish = _select_cols(bullish).sort_values(
         ["final_methods_count", "bullish_methods_count"], ascending=[False, False]
-    ).reset_index(drop=True) if not bullish.empty else pd.DataFrame()
+    ).reset_index(drop=True) if not bullish.empty else _empty_three_methods_frame()
 
     bearish = _select_cols(bearish).sort_values(
         ["final_methods_count", "bearish_methods_count"], ascending=[False, False]
-    ).reset_index(drop=True) if not bearish.empty else pd.DataFrame()
+    ).reset_index(drop=True) if not bearish.empty else _empty_three_methods_frame()
 
     return bullish, bearish
 
