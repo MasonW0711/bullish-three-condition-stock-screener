@@ -1,5 +1,6 @@
 import contextlib
 import unittest
+from io import BytesIO
 from io import StringIO
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from data_loader import (
     _select_isin_table,
     _to_int,
     download_stock_data,
+    load_stock_list_from_upload,
     normalize_yfinance_data,
     resample_ohlcv,
 )
@@ -20,6 +22,25 @@ from signal_engine import add_three_methods_conditions, attach_investor_flow_fla
 
 
 class StabilityTests(unittest.TestCase):
+    def test_monthly_resample_uses_actual_last_trading_day(self):
+        daily = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-29", "2026-06-01", "2026-06-30"]),
+                "StockCode": ["2330.TW", "2330.TW", "2330.TW"],
+                "Open": [100, 102, 110],
+                "High": [105, 108, 112],
+                "Low": [99, 101, 109],
+                "Close": [103, 107, 111],
+                "Volume": [1000, 2000, 3000],
+            }
+        )
+
+        monthly = resample_ohlcv(daily, "M")
+
+        self.assertEqual(monthly.loc[0, "Date"], pd.Timestamp("2026-05-29"))
+        self.assertEqual(monthly.loc[1, "Date"], pd.Timestamp("2026-06-30"))
+        self.assertEqual(monthly.loc[1, "Volume"], 5000)
+
     def test_weekly_resample_uses_actual_last_trading_day(self):
         daily = pd.DataFrame(
             {
@@ -168,6 +189,20 @@ class StabilityTests(unittest.TestCase):
         self.assertEqual(successes, ["6182.TWO"])
         self.assertEqual(failures, [])
         self.assertEqual(data.loc[0, "StockCode"], "6182.TWO")
+
+    def test_excel_upload_supports_common_stock_code_columns(self):
+        upload_buffer = BytesIO()
+        pd.DataFrame({"股票代號": ["2330.TW", "2317.tw", None, "2330.TW"]}).to_excel(
+            upload_buffer,
+            index=False,
+            engine="openpyxl",
+        )
+        upload_buffer.name = "stocks.xlsx"
+        upload_buffer.seek(0)
+
+        result = load_stock_list_from_upload(upload_buffer)
+
+        self.assertEqual(result, ["2330.TW", "2317.TW"])
 
     def test_empty_three_methods_tables_keep_export_schema(self):
         bullish, bearish = _compute_three_methods_matches(pd.DataFrame(), min_conditions=2)

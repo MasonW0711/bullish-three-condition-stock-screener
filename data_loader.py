@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from pathlib import Path
 import re
 from io import StringIO
 from typing import Iterable
@@ -45,6 +46,18 @@ def _chunk_list(items: list[str], chunk_size: int) -> list[list[str]]:
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
+def _get_with_ssl_fallback(url: str) -> requests.Response:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, timeout=30, headers=headers)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.SSLError:
+        response = requests.get(url, timeout=30, headers=headers, verify=False)
+        response.raise_for_status()
+        return response
+
+
 def normalize_symbol(stock_code: str) -> list[str]:
     """Return one or more symbol candidates for a user-provided code."""
     normalized = _normalize_token(stock_code)
@@ -84,12 +97,10 @@ def _select_isin_table(tables: list[pd.DataFrame]) -> pd.DataFrame:
 
 def _fetch_isin_universe(url: str, suffix: str, market_label: str) -> pd.DataFrame:
     """Fetch and parse one Taiwan stock universe page from TWSE ISIN data."""
-    response = requests.get(
-        url,
-        timeout=30,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    response.raise_for_status()
+    try:
+        response = _get_with_ssl_fallback(url)
+    except requests.RequestException as exc:
+        raise ValueError(f"{market_label}股票清單下載失敗：{exc}") from exc
 
     # Use only valid pandas read_html parser strategies.
     # "html.parser" is not a supported pandas flavor, so if lxml/html5lib are
@@ -140,17 +151,30 @@ def load_taiwan_stock_universe() -> pd.DataFrame:
 
 
 def load_stock_list_from_upload(uploaded_file) -> list[str]:
-    """Load and validate a CSV upload containing a StockCode column."""
+    """Load and validate a CSV/XLSX upload containing a stock-code column."""
     if uploaded_file is None:
         return []
 
-    upload_df = pd.read_csv(uploaded_file)
-    if "StockCode" not in upload_df.columns:
-        raise ValueError("上傳的 CSV 必須包含 'StockCode' 欄位。")
+    file_name = getattr(uploaded_file, "name", "uploaded_file")
+    suffix = Path(file_name).suffix.lower()
+    reader = pd.read_excel if suffix in {".xlsx", ".xls"} else pd.read_csv
+
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+
+    try:
+        upload_df = reader(uploaded_file)
+    except Exception as exc:
+        raise ValueError(f"無法讀取上傳檔案：{exc}") from exc
+
+    candidate_columns = ("StockCode", "stock_code", "stockcode", "股票代號", "代號")
+    stock_code_column = next((column for column in candidate_columns if column in upload_df.columns), None)
+    if stock_code_column is None:
+        raise ValueError("上傳檔案必須包含股票代號欄位，例如 'StockCode'。")
 
     codes = [
         _normalize_token(str(value))
-        for value in upload_df["StockCode"].dropna().tolist()
+        for value in upload_df[stock_code_column].dropna().tolist()
         if _normalize_token(str(value))
     ]
     return _dedupe_preserve_order(codes)
@@ -360,18 +384,6 @@ def _to_int(value) -> int:
         return 0
 
 
-def _get_with_ssl_fallback(url: str) -> requests.Response:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, timeout=30, headers=headers)
-        response.raise_for_status()
-        return response
-    except requests.exceptions.SSLError:
-        response = requests.get(url, timeout=30, headers=headers, verify=False)
-        response.raise_for_status()
-        return response
-
-
 def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
     url = (
         "https://www.twse.com.tw/rwd/zh/fund/T86"
@@ -544,7 +556,7 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         daily["Timeframe"] = "D"
         return daily.reset_index(drop=True)
 
-    resample_rule = {"W": "W-FRI", "M": "ME"}[timeframe]
+    resample_rule = {"W": "W-FRI", "M": pd.offsets.MonthEnd()}[timeframe]
     frames: list[pd.DataFrame] = []
     for _, stock_df in prepared.groupby("StockCode", sort=False):
         stock_resampled = _resample_single_stock(stock_df, resample_rule)

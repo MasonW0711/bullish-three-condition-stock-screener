@@ -12,6 +12,7 @@ from chart_engine import create_stock_chart
 from data_loader import (
     download_investor_flow_data,
     download_stock_data,
+    load_stock_list_from_upload,
     load_taiwan_stock_universe,
     parse_stock_list,
     resample_ohlcv,
@@ -169,6 +170,7 @@ def _compute_latest_summary(matching_df: pd.DataFrame) -> pd.DataFrame:
 def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str], progress_callback=None) -> dict:
     timeframe_code = TIMEFRAME_OPTIONS[params["analysis_timeframe"]]
     min_volume_shares = params["min_volume"] * 1000  # convert lots → shares
+    messages: list[dict[str, str]] = []
 
     universe_df = pd.DataFrame()
     if use_auto_universe:
@@ -176,23 +178,65 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         stock_codes = universe_df["StockCode"].dropna().astype(str).tolist()
     else:
         stock_codes = manual_codes
-        universe_df = pd.DataFrame()  # no universe for manual mode
+        try:
+            manual_universe = _load_taiwan_stock_universe_cached()
+        except Exception as exc:
+            manual_universe = pd.DataFrame()
+            messages.append(
+                {
+                    "level": "warning",
+                    "text": f"無法載入股票名稱對照表，手動模式將僅顯示股票代號：{exc}",
+                }
+            )
+        if not manual_universe.empty:
+            lookup_codes = {str(code).strip().upper() for code in stock_codes if str(code).strip()}
+            lookup_base_codes = {code.split(".")[0] for code in lookup_codes}
+            universe_df = manual_universe[
+                manual_universe["StockCode"].astype(str).str.upper().isin(lookup_codes)
+                | manual_universe["BaseCode"].astype(str).str.upper().isin(lookup_base_codes)
+            ].copy()
 
     if not stock_codes:
-        return _empty_result(universe_df)
+        messages.append({"level": "warning", "text": "請先提供至少一個有效的股票代號。"})
+        return _empty_result(universe_df, messages=messages, used_auto_universe=use_auto_universe)
 
-    if progress_callback is not None:
-        progress_callback(0.05, "正在下載或讀取股票資料快取...")
-    daily_data, success_list, failed_list = _download_stock_data_cached(
-        stock_codes=tuple(stock_codes),
-        start_date=params["start_date"],
-        end_date=params["end_date"],
-    )
-    if progress_callback is not None:
-        progress_callback(1.0, "股票資料已準備完成。")
+    try:
+        if progress_callback is not None:
+            progress_callback(0.03, "正在準備股票下載清單...")
+
+            def _download_progress_callback(progress_value: float, message: str) -> None:
+                progress_callback(0.03 + min(max(progress_value, 0.0), 1.0) * 0.72, message)
+
+            daily_data, success_list, failed_list = download_stock_data(
+                stock_codes=stock_codes,
+                start_date=params["start_date"],
+                end_date=params["end_date"],
+                progress_callback=_download_progress_callback,
+            )
+        else:
+            daily_data, success_list, failed_list = _download_stock_data_cached(
+                stock_codes=tuple(stock_codes),
+                start_date=params["start_date"],
+                end_date=params["end_date"],
+            )
+    except Exception as exc:
+        messages.append({"level": "error", "text": f"股票資料下載失敗：{exc}"})
+        return _empty_result(universe_df, messages=messages, used_auto_universe=use_auto_universe)
 
     if daily_data.empty:
-        return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
+        messages.append(
+            {
+                "level": "warning",
+                "text": "下載完成，但沒有取得任何可用股價資料。請確認股票代號、日期區間或稍後再試。",
+            }
+        )
+        return _empty_result(
+            universe_df,
+            success_list=success_list,
+            failed_list=failed_list,
+            messages=messages,
+            used_auto_universe=use_auto_universe,
+        )
 
     # Pre-filter: remove stocks with insufficient average daily volume (performance).
     if min_volume_shares > 0:
@@ -204,13 +248,34 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         success_list = [s for s in success_list if s in active]
 
     if daily_data.empty:
-        return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
+        messages.append(
+            {
+                "level": "info",
+                "text": f"股票資料下載成功，但沒有股票達到最小成交量門檻（{params['min_volume']} 張）。",
+            }
+        )
+        return _empty_result(
+            universe_df,
+            success_list=success_list,
+            failed_list=failed_list,
+            messages=messages,
+            used_auto_universe=use_auto_universe,
+        )
 
+    if progress_callback is not None:
+        progress_callback(0.80, "正在整理 K 棒週期與訊號計算...")
     timeframe_data = resample_ohlcv(daily_data, timeframe_code)
     processed = run_signal_pipeline(timeframe_data, params)
 
     if processed.empty:
-        return _empty_result(universe_df, success_list=success_list, failed_list=failed_list)
+        messages.append({"level": "warning", "text": "股票資料已下載，但訊號計算後沒有可分析的資料列。"})
+        return _empty_result(
+            universe_df,
+            success_list=success_list,
+            failed_list=failed_list,
+            messages=messages,
+            used_auto_universe=use_auto_universe,
+        )
 
     investor_filters_enabled = any(
         params.get(key, False)
@@ -223,14 +288,32 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     )
     investor_flow_df = pd.DataFrame()
     if investor_filters_enabled:
-        investor_flow_df = _download_investor_flow_data_cached(
-            stock_codes=tuple(sorted(success_list)),
-            end_date=params["end_date"],
-            lookback_days=max(
-                int(getattr(app_config, "INVESTOR_LOOKBACK_DAYS", 20)),
-                int(params.get("investor_consecutive_days", 3)) + 10,
-            ),
-        )
+        if progress_callback is not None:
+            progress_callback(0.90, "正在下載法人買賣超資料...")
+        try:
+            investor_flow_df = _download_investor_flow_data_cached(
+                stock_codes=tuple(sorted(success_list)),
+                end_date=params["end_date"],
+                lookback_days=max(
+                    int(getattr(app_config, "INVESTOR_LOOKBACK_DAYS", 20)),
+                    int(params.get("investor_consecutive_days", 3)) + 10,
+                ),
+            )
+        except Exception as exc:
+            messages.append(
+                {
+                    "level": "warning",
+                    "text": f"法人買賣超資料下載失敗，相關條件將視為未達成：{exc}",
+                }
+            )
+            investor_flow_df = pd.DataFrame()
+        if investor_flow_df.empty:
+            messages.append(
+                {
+                    "level": "warning",
+                    "text": "目前無法取得最新法人買賣超資料，相關篩選條件已視為未達成。",
+                }
+            )
     processed = attach_investor_flow_flags(
         processed,
         investor_flow_df,
@@ -260,6 +343,11 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         params,
     )
 
+    if matching_signals.empty and three_methods_bullish.empty and three_methods_bearish.empty:
+        messages.append({"level": "info", "text": "本次篩選完成，但目前沒有符合條件的股票。"})
+    if progress_callback is not None:
+        progress_callback(1.0, "篩選完成。")
+
     return {
         "all_data": processed,
         "matching_signals": matching_signals,
@@ -269,6 +357,8 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         "success_list": success_list,
         "failed_list": failed_list,
         "universe_df": universe_df,
+        "messages": messages,
+        "used_auto_universe": use_auto_universe,
     }
 
 
@@ -363,17 +453,25 @@ def _apply_investor_filters(
     return bullish, bearish
 
 
-def _empty_result(universe_df: pd.DataFrame, success_list=None, failed_list=None) -> dict:
+def _empty_result(
+    universe_df: pd.DataFrame,
+    success_list=None,
+    failed_list=None,
+    messages=None,
+    used_auto_universe: bool = False,
+) -> dict:
     empty = pd.DataFrame()
     return {
         "all_data": empty,
         "matching_signals": empty,
-        "latest_summary": empty,
-        "three_methods_bullish": empty,
-        "three_methods_bearish": empty,
+        "latest_summary": _compute_latest_summary(empty),
+        "three_methods_bullish": pd.DataFrame(columns=THREE_METHODS_COLUMNS),
+        "three_methods_bearish": pd.DataFrame(columns=THREE_METHODS_COLUMNS),
         "success_list": success_list or [],
         "failed_list": failed_list or [],
         "universe_df": universe_df,
+        "messages": messages or [],
+        "used_auto_universe": used_auto_universe,
     }
 
 
@@ -387,6 +485,31 @@ def _prepare_display_frame(df: pd.DataFrame) -> pd.DataFrame:
         display_df["Timeframe"] = display_df["Timeframe"].map(TIMEFRAME_LABELS).fillna(display_df["Timeframe"])
     available = [c for c in RESULT_COLUMNS if c in display_df.columns]
     return display_df[available].rename(columns=DISPLAY_COLUMN_LABELS)
+
+
+def _prepare_summary_display_frame(latest_summary: pd.DataFrame) -> pd.DataFrame:
+    if latest_summary.empty:
+        return pd.DataFrame()
+
+    summary_label_map = {
+        "StockCode": "股票代號",
+        "StockName": "股票名稱",
+        "LatestSignalDate": "最新訊號日期",
+        "Timeframe": "週期",
+        "LatestSignalSummary": "最新訊號",
+        "LatestOpen": "開盤",
+        "LatestClose": "收盤",
+        "LatestPrevClose": "前一根收盤",
+        "LatestVolume": "成交量",
+    }
+    display_summary = latest_summary.copy()
+    if "Timeframe" in display_summary.columns:
+        display_summary["Timeframe"] = display_summary["Timeframe"].map(TIMEFRAME_LABELS).fillna(
+            display_summary["Timeframe"]
+        )
+    return display_summary.rename(
+        columns={key: value for key, value in summary_label_map.items() if key in display_summary.columns}
+    )
 
 
 def main():
@@ -413,16 +536,17 @@ def main():
                 value=DEFAULT_TEXT_STOCK_LIST,
                 height=150,
             )
-            uploaded_csv = st.file_uploader("或上傳 CSV（需含 StockCode 欄位）", type=["csv"])
-            if uploaded_csv is not None:
+            uploaded_file = st.file_uploader(
+                "或上傳 CSV 或 Excel 檔（需含股票代號欄位）",
+                type=["csv", "xlsx"],
+            )
+            if uploaded_file is not None:
                 try:
-                    csv_df = pd.read_csv(uploaded_csv)
-                    if "StockCode" in csv_df.columns:
-                        manual_codes = csv_df["StockCode"].dropna().astype(str).str.strip().tolist()
-                    else:
-                        st.warning("上傳的 CSV 必須包含 'StockCode' 欄位。")
-                except Exception as exc:
-                    st.warning(f"無法讀取 CSV：{exc}")
+                    manual_codes = load_stock_list_from_upload(uploaded_file)
+                    if not manual_codes:
+                        st.warning("上傳檔案中沒有可用的股票代號，請檢查內容。")
+                except ValueError as exc:
+                    st.warning(str(exc))
             if not manual_codes:
                 manual_codes = parse_stock_list(stock_text)
         else:
@@ -536,17 +660,21 @@ def main():
             progress_bar.progress(min(max(progress_value, 0.0), 1.0))
             progress_placeholder.caption(message)
 
-        with st.spinner("正在下載資料並偵測攻擊訊號..."):
-            st.session_state["screening_results"] = _run_screening(
-                params,
-                use_auto_universe=use_auto_universe,
-                manual_codes=manual_codes,
-                progress_callback=_progress_callback,
-            )
-            st.session_state["screening_params"] = params
-
-        progress_bar.empty()
-        progress_placeholder.empty()
+        try:
+            with st.spinner("正在下載資料並偵測攻擊訊號..."):
+                st.session_state["screening_results"] = _run_screening(
+                    params,
+                    use_auto_universe=use_auto_universe,
+                    manual_codes=manual_codes,
+                    progress_callback=_progress_callback,
+                )
+                st.session_state["screening_params"] = params
+        except Exception as exc:
+            st.error(f"篩選過程發生錯誤：{exc}")
+            return
+        finally:
+            progress_bar.empty()
+            progress_placeholder.empty()
 
     # ── Retrieve cached results ───────────────────────────────────────────────
     results = st.session_state.get("screening_results")
@@ -564,10 +692,24 @@ def main():
     success_list: list[str] = results["success_list"]
     failed_list: list[str] = results["failed_list"]
     universe_df: pd.DataFrame = results["universe_df"]
+    messages: list[dict[str, str]] = results.get("messages", [])
+    used_auto_universe: bool = bool(results.get("used_auto_universe", False))
+
+    for message in messages:
+        level = message.get("level", "info")
+        text = message.get("text", "").strip()
+        if not text:
+            continue
+        if level == "error":
+            st.error(text)
+        elif level == "warning":
+            st.warning(text)
+        else:
+            st.info(text)
 
     # ── Download status ───────────────────────────────────────────────────────
     st.subheader("下載狀態")
-    if not universe_df.empty:
+    if used_auto_universe and not universe_df.empty:
         listed_count = int((universe_df["MarketLabel"] == "上市").sum())
         otc_count = int((universe_df["MarketLabel"] == "上櫃").sum())
         c1, c2, c3, c4 = st.columns(4)
@@ -624,6 +766,7 @@ def main():
 
     # ── Matching signals table ────────────────────────────────────────────────
     st.subheader("訊號匹配結果（回看視窗內、有訊號、量達標）")
+    display_matching = pd.DataFrame()
     if matching_signals.empty:
         st.info("目前沒有符合條件的攻擊訊號 K 棒。")
     else:
@@ -632,28 +775,11 @@ def main():
 
     # ── Latest summary table ──────────────────────────────────────────────────
     st.subheader("最新訊號摘要（每股一列）")
+    display_summary = pd.DataFrame()
     if latest_summary.empty:
         st.info("無最新訊號摘要資料。")
     else:
-        summary_label_map = {
-            "StockCode": "股票代號",
-            "StockName": "股票名稱",
-            "LatestSignalDate": "最新訊號日期",
-            "Timeframe": "週期",
-            "LatestSignalSummary": "最新訊號",
-            "LatestOpen": "開盤",
-            "LatestClose": "收盤",
-            "LatestPrevClose": "前一根收盤",
-            "LatestVolume": "成交量",
-        }
-        display_summary = latest_summary.copy()
-        if "Timeframe" in display_summary.columns:
-            display_summary["Timeframe"] = display_summary["Timeframe"].map(TIMEFRAME_LABELS).fillna(
-                display_summary["Timeframe"]
-            )
-        display_summary = display_summary.rename(
-            columns={k: v for k, v in summary_label_map.items() if k in latest_summary.columns}
-        )
+        display_summary = _prepare_summary_display_frame(latest_summary)
         st.dataframe(display_summary, use_container_width=True)
 
     # ── Chart ─────────────────────────────────────────────────────────────────
@@ -662,10 +788,13 @@ def main():
     if signal_stock_codes:
         selected_stock = st.selectbox("選擇股票（顯示有訊號的股票）", options=signal_stock_codes)
         selected_df = all_data[all_data["StockCode"] == selected_stock].copy()
-        figure, chart_message = create_stock_chart(
-            selected_df,
-            timeframe_label=saved_params["analysis_timeframe"],
-        )
+        try:
+            figure, chart_message = create_stock_chart(
+                selected_df,
+                timeframe_label=saved_params["analysis_timeframe"],
+            )
+        except Exception as exc:
+            figure, chart_message = None, f"建立圖表時發生錯誤：{exc}"
         if chart_message:
             st.warning(chart_message)
         elif figure is not None:
@@ -673,24 +802,46 @@ def main():
     else:
         st.info("目前沒有可供選擇的有訊號股票。")
 
-    # ── Excel download ────────────────────────────────────────────────────────
-    st.subheader("Excel 下載")
-    excel_bytes = create_excel_bytes(
-        all_data=all_data,
-        matching_signals=matching_signals,
-        latest_summary=latest_summary,
-        three_methods_bullish=three_methods_bullish,
-        three_methods_bearish=three_methods_bearish,
-        failed_list=failed_list,
-        params=saved_params,
-    )
+    # ── Result downloads ──────────────────────────────────────────────────────
+    st.subheader("結果下載")
     timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
-    st.download_button(
+    csv_source = display_matching if not display_matching.empty else display_summary
+    csv_bytes = csv_source.to_csv(index=False).encode("utf-8-sig") if not csv_source.empty else b""
+
+    excel_bytes = b""
+    excel_error = None
+    try:
+        excel_bytes = create_excel_bytes(
+            all_data=all_data,
+            matching_signals=matching_signals,
+            latest_summary=latest_summary,
+            three_methods_bullish=three_methods_bullish,
+            three_methods_bearish=three_methods_bearish,
+            failed_list=failed_list,
+            params=saved_params,
+        )
+    except Exception as exc:
+        excel_error = f"建立 Excel 匯出檔時發生錯誤：{exc}"
+
+    if excel_error:
+        st.error(excel_error)
+
+    download_col1, download_col2 = st.columns(2)
+    download_col1.download_button(
+        label="下載 CSV 結果",
+        data=csv_bytes,
+        file_name=f"attack_signals_{timeframe_code}.csv",
+        mime="text/csv",
+        disabled=csv_source.empty,
+        use_container_width=True,
+    )
+    download_col2.download_button(
         label="下載 Excel 結果",
         data=excel_bytes,
         file_name=f"attack_signals_{timeframe_code}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=all_data.empty,
+        disabled=all_data.empty or bool(excel_error),
+        use_container_width=True,
     )
 
     active_investor_filters = [

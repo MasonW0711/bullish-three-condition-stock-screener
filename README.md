@@ -54,7 +54,7 @@ streamlit run app.py
 
 1. Fork / Push 此 repo 至 GitHub
 2. 至 [share.streamlit.io](https://share.streamlit.io) 建立新應用程式
-3. 指向 `app.py`，Python 版本 3.11+
+3. App file 指向 `app.py`（或相容入口 `main.py`），Python 版本選擇 **3.11**
 4. 點擊 Deploy
 
 ---
@@ -74,7 +74,7 @@ streamlit run app.py
 
 ## 輸入格式
 
-手動模式下，每行一個股票代號：
+手動模式下，每行一個股票代號，或上傳包含股票代號欄位的 CSV / Excel：
 
 ```
 2330.TW
