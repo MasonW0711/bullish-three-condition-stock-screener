@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pandas as pd
 
 with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
-    from app import _compute_three_methods_matches
-from config import THREE_METHODS_COLUMNS
+    from app import _compute_latest_summary
+from config import LATEST_SUMMARY_COLUMNS
 from data_loader import (
     _download_candidate,
     _select_isin_table,
@@ -18,7 +18,7 @@ from data_loader import (
     normalize_yfinance_data,
     resample_ohlcv,
 )
-from signal_engine import add_three_methods_conditions, attach_investor_flow_flags
+from signal_engine import attach_investor_flow_flags, run_signal_pipeline
 
 
 class StabilityTests(unittest.TestCase):
@@ -113,27 +113,66 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[0, "foreign_buy_streak_ok"])
         self.assertFalse(result.loc[0, "trust_buy_streak_ok"])
 
-    def test_equal_three_methods_scores_have_no_final_direction(self):
+    def test_failed_attacks_do_not_create_opposite_lines(self):
         frame = pd.DataFrame(
             {
-                "Date": pd.to_datetime(["2026-05-04"]),
-                "StockCode": ["2330.TW"],
-                "Open": [100],
-                "High": [101],
-                "Low": [99],
-                "Close": [100],
-                "red_attack_success": [True],
-                "black_attack_success": [True],
-                "red_base": [pd.NA],
-                "black_base": [pd.NA],
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
+                "StockCode": ["2330.TW"] * 3,
+                "Open": [100, 105, 95],
+                "High": [101, 106, 104],
+                "Low": [99, 97, 94],
+                "Close": [100, 98, 103],
+                "Volume": [1000, 1000, 1000],
             }
         )
 
-        result = add_three_methods_conditions(frame, lookback_bars=3)
+        result = run_signal_pipeline(frame, {"lookback_bars": 3, "min_volume": 0})
 
-        self.assertEqual(result.loc[0, "bullish_methods_count"], 1)
-        self.assertEqual(result.loc[0, "bearish_methods_count"], 1)
-        self.assertEqual(result.loc[0, "final_methods_direction"], "None")
+        self.assertTrue(result.loc[1, "red_attack_failed"])
+        self.assertFalse(result.loc[1, "black_attack_success"])
+        self.assertTrue(pd.isna(result.loc[1, "black_line"]))
+        self.assertTrue(result.loc[2, "black_attack_failed"])
+        self.assertFalse(result.loc[2, "red_attack_success"])
+        self.assertTrue(pd.isna(result.loc[2, "red_line"]))
+
+    def test_breakout_and_retest_hold_are_final_signal(self):
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 95, 99, 101],
+                "High": [101, 97, 106, 103],
+                "Low": [99, 94, 98, 99],
+                "Close": [100, 96, 105, 102],
+                "Volume": [1000, 1000, 3000, 3000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 3, "min_volume": 2000})
+
+        self.assertTrue(result.loc[2, "break_black_line_daily"])
+        self.assertEqual(result.loc[2, "active_breakout_line_type"], "Black Line")
+        self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
+        self.assertTrue(result.loc[3, "retest_hold_daily"])
+        self.assertTrue(result.loc[3, "final_signal"])
+
+    def test_retest_failure_is_not_final_signal(self):
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 95, 99, 101],
+                "High": [101, 97, 106, 103],
+                "Low": [99, 94, 98, 99],
+                "Close": [100, 96, 105, 97],
+                "Volume": [1000, 1000, 3000, 3000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 3, "min_volume": 2000})
+
+        self.assertFalse(result.loc[3, "retest_hold_daily"])
+        self.assertFalse(result.loc[3, "final_signal"])
 
     def test_invalid_universe_table_shape_raises_clear_error(self):
         bad_table = pd.DataFrame([["2330 台積電", "TW0002330008", "2020/01/01"]])
@@ -204,11 +243,10 @@ class StabilityTests(unittest.TestCase):
 
         self.assertEqual(result, ["2330.TW", "2317.TW"])
 
-    def test_empty_three_methods_tables_keep_export_schema(self):
-        bullish, bearish = _compute_three_methods_matches(pd.DataFrame(), min_conditions=2)
+    def test_empty_latest_summary_keeps_export_schema(self):
+        latest_summary = _compute_latest_summary(pd.DataFrame())
 
-        self.assertEqual(bullish.columns.tolist(), THREE_METHODS_COLUMNS)
-        self.assertEqual(bearish.columns.tolist(), THREE_METHODS_COLUMNS)
+        self.assertEqual(latest_summary.columns.tolist(), LATEST_SUMMARY_COLUMNS)
 
 
 if __name__ == "__main__":

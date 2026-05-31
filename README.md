@@ -1,95 +1,87 @@
-# 大紅攻 / 大黑攻 訊號選股系統
+# 紅黑線突破回測守住選股系統
 
 > **聲明：本工具僅供研究與篩選參考，不構成任何投資建議。**
 
----
-
 ## 系統目標
 
-自動下載台灣上市與上櫃股票的 OHLCV 資料，依據「**大紅攻 / 大黑攻**」策略偵測攻擊訊號，篩選出符合條件的股票供研究參考。
+找出最近突破最新紅線或黑線，之後回測該線且收盤守住的股票。
 
----
+流程：
+
+1. 下載日 OHLCV 資料。
+2. 依使用者選擇轉成 Daily K / Weekly K / Monthly K。
+3. 用前一根收盤價計算大紅攻與大黑攻。
+4. 大紅攻成功產生紅線，大黑攻成功產生黑線，分別逐股往後延伸。
+5. 偵測收盤價嚴格突破最新紅線或黑線。
+6. 記住最新被突破的線，篩出 Low 觸及該線且 Close 沒有跌破該線的回測守住 K 棒。
+7. 套用最近 N 根 K 棒、成交量與可選法人連續買賣超條件。
 
 ## 策略定義
 
-攻擊方向由**開盤價與前一根收盤價**的關係決定；收盤價只決定攻擊是否成功。
-
-**前提：**
-```
-prev_close = 前一根 K 棒的收盤價
-```
+攻擊方向只由 `Open` 與 `prev_close` 決定；`Close` 只決定攻擊成功或失敗。
 
 | 訊號 | 條件 | 說明 |
 |------|------|------|
-| 大紅攻成功 | `Open > prev_close` 且 `Close > prev_close` | 多頭開高並收高 |
-| 大紅攻失敗 | `Open > prev_close` 且 `Close < prev_close` | 多頭開高但收低（≠ 大黑攻） |
-| 大黑攻成功 | `Open < prev_close` 且 `Close < prev_close` | 空頭開低並收低 |
-| 大黑攻失敗 | `Open < prev_close` 且 `Close > prev_close` | 空頭開低但收高（≠ 大紅攻） |
+| 大紅攻成功 | `Open > prev_close` 且 `Close > prev_close` | 產生紅線，紅線價格為 `prev_close` |
+| 大紅攻失敗 | `Open > prev_close` 且 `Close < prev_close` | 不產生黑線 |
+| 大黑攻成功 | `Open < prev_close` 且 `Close < prev_close` | 產生黑線，黑線價格為 `prev_close` |
+| 大黑攻失敗 | `Open < prev_close` 且 `Close > prev_close` | 不產生紅線 |
 
-> **重要：失敗的大紅攻不等於大黑攻；失敗的大黑攻不等於大紅攻。**
+突破條件：
 
----
+```text
+previous Close <= previous line
+current Close > current line
+```
+
+回測守住條件：
+
+```text
+Low <= active_breakout_line
+Close >= active_breakout_line
+```
 
 ## 功能
 
-- 自動抓取 TWSE 上市與上櫃普通股清單（約 1900+ 檔）
-- 支援日 K / 週 K / 月 K 分析（週/月 K 由日線 Resample 產生）
-- 成交量前置過濾（最小成交量，單位：張）
-- 回看 N 根 K 棒視窗篩選
-- 互動式 K 線圖（含四種攻擊訊號標記）
-- Excel 匯出（All_Data / Matching_Signals / Latest_Summary / Failed_Downloads / Parameter_Settings）
-
----
+- 自動抓取 TWSE 上市與上櫃普通股清單，也支援手動輸入或上傳股票清單。
+- 支援 Daily K / Weekly K / Monthly K。
+- 可設定最近回看 K 棒數與最小成交量。
+- 保留法人條件：外資 / 投信最近 N 日連續買超或連續賣超。
+- Plotly K 線圖顯示紅線、黑線、突破標記與回測守住標記。
+- Excel 匯出 `All_Data`、`Matching_Retest_Hold`、`Latest_Summary`、`Failed_Downloads`、`Parameter_Settings`。
 
 ## 安裝與執行
-
-### 本機執行
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-### Streamlit Cloud 部署
-
-1. Fork / Push 此 repo 至 GitHub
-2. 至 [share.streamlit.io](https://share.streamlit.io) 建立新應用程式
-3. App file 指向 `app.py`（或相容入口 `main.py`），Python 版本選擇 **3.11**
-4. 點擊 Deploy
-
----
-
-## 側邊欄參數說明
+## 側邊欄參數
 
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
-| 自動抓取全市場 | 開啟 | 開啟：自動抓取 TWSE 全市場；關閉：手動輸入股票代號 |
+| 自動抓取全市場 | 開啟 | 開啟：自動抓取上市與上櫃普通股；關閉：手動輸入或上傳清單 |
 | 開始日期 | 今天-2年 | 資料下載起始日 |
 | 結束日期 | 今天 | 資料下載截止日 |
-| 分析週期 | 日 K | 日 K / 週 K / 月 K |
-| 最小成交量（張） | 2000 | Volume ≥ 此值（單位：張，內部換算×1000股）；設 0 = 不篩選 |
-| 回看 K 棒數 | 10 | 只顯示最近 N 根 K 棒內出現攻擊訊號的資料 |
-
----
+| 分析週期 | Daily K | Daily K / Weekly K / Monthly K |
+| 最小成交量（張） | 2000 | 內部換算為股數後套用 |
+| 回看 K 棒數 | 10 | 只保留最近 N 根 K 棒內的有效回測守住訊號 |
+| 法人連續買賣超天數 | 3 | 勾選法人條件時使用 |
 
 ## 輸入格式
 
-手動模式下，每行一個股票代號，或上傳包含股票代號欄位的 CSV / Excel：
+手動模式下，每行一個股票代號，或上傳包含 `StockCode` 欄位的 CSV / Excel：
 
-```
+```text
 2330.TW
 2317.TW
 6182.TWO
 ```
 
-- 上市股票使用 `.TW` 後綴
-- 上櫃股票使用 `.TWO` 後綴
+## 週 K / 月 K
 
----
-
-## 週 K / 月 K 說明
-
-週 K / 月 K 由日線資料 Resample 產生，**不直接使用 yfinance 週線/月線**（避免資料格式不一致）。
+週 K / 月 K 由日線資料重新取樣產生：
 
 | 欄位 | 計算方式 |
 |------|----------|
@@ -98,35 +90,4 @@ streamlit run app.py
 | Low | 期間最低價 |
 | Close | 期間最後一個交易日收盤 |
 | Volume | 期間成交量加總 |
-| Date | 期間最後一個交易日 |
-
----
-
-## 結果說明
-
-### 訊號匹配結果
-
-回看視窗內，成交量達標且有任一攻擊訊號的所有 K 棒。
-
-### 最新訊號摘要
-
-每股一列，顯示回看視窗內最新一筆攻擊訊號。
-
----
-
-## 技術依賴
-
-```
-streamlit
-pandas
-numpy
-yfinance
-plotly
-openpyxl
-requests
-lxml
-```
-
----
-
-*本工具僅供投資研究篩選參考，並非投資建議。投資決策請自行判斷。*
+| Date | 期間最後一個實際交易日 |

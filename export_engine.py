@@ -1,4 +1,4 @@
-"""Excel export helpers for the Big Red / Big Black Attack Stock Screener."""
+"""Excel export helpers for the breakout-and-retest-hold stock screener."""
 
 from __future__ import annotations
 
@@ -15,14 +15,12 @@ def _sheet_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def create_excel_bytes(
     all_data: pd.DataFrame,
-    matching_signals: pd.DataFrame,
+    matching_retest_hold: pd.DataFrame,
     latest_summary: pd.DataFrame,
-    three_methods_bullish: pd.DataFrame,
-    three_methods_bearish: pd.DataFrame,
     failed_list: list[str],
     params: dict,
 ) -> bytes:
-    """Create an in-memory Excel workbook with seven sheets."""
+    """Create an in-memory Excel workbook with the required sheets."""
     parameter_sheet = pd.DataFrame(
         {
             "Parameter": [
@@ -31,8 +29,6 @@ def create_excel_bytes(
                 "analysis_timeframe",
                 "min_volume",
                 "lookback_bars",
-                "min_conditions",
-                "pullback_pct",
                 "investor_consecutive_days",
                 "foreign_buy_streak",
                 "trust_buy_streak",
@@ -45,8 +41,6 @@ def create_excel_bytes(
                 params["analysis_timeframe"],
                 params["min_volume"],
                 params["lookback_bars"],
-                params.get("min_conditions", 2),
-                params.get("pullback_pct", 2.0),
                 params.get("investor_consecutive_days", 3),
                 params.get("foreign_buy_streak", False),
                 params.get("trust_buy_streak", False),
@@ -56,15 +50,11 @@ def create_excel_bytes(
         }
     )
 
-    failed_sheet = pd.DataFrame({"FailedStockCode": failed_list})
-
     workbook_frames = {
         "All_Data": _sheet_frame(all_data),
-        "Matching_Signals": _sheet_frame(matching_signals),
+        "Matching_Retest_Hold": _sheet_frame(matching_retest_hold),
         "Latest_Summary": _sheet_frame(latest_summary),
-        "ThreeMethods_Bullish": _sheet_frame(three_methods_bullish),
-        "ThreeMethods_Bearish": _sheet_frame(three_methods_bearish),
-        "Failed_Downloads": failed_sheet,
+        "Failed_Downloads": pd.DataFrame({"FailedStockCode": failed_list}),
         "Parameter_Settings": parameter_sheet,
     }
 

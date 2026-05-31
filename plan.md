@@ -57,9 +57,10 @@ Stabilize the Streamlit Taiwan stock screener so that:
 
 ### Phase 3 — Signal pipeline validation
 - validate attack direction exclusivity
-- validate Three Methods exclusivity
+- validate failed attacks do not create opposite lines
+- validate breakout above red/black lines
+- validate retest-hold success and failure examples
 - validate configurable investor streak days
-- validate pullback rules against explicit examples
 
 ### Phase 4 — Surface consistency cleanup
 - unify display labels
@@ -113,9 +114,10 @@ Stabilize the Streamlit Taiwan stock screener so that:
 ### Must be added as durable regression checks
 1. weekly resample uses real final trading day
 2. investor flags stop after last available investor date
-3. equal bullish/bearish Three Methods score => no direction
-4. invalid universe table shape raises clear error
-5. yfinance MultiIndex normalization still yields OHLCV columns
+3. breakout above black/red line sets the active breakout line
+4. retest failure is not a final signal
+5. invalid universe table shape raises clear error
+6. yfinance MultiIndex normalization still yields OHLCV columns
 
 ---
 
