@@ -50,12 +50,42 @@ Close >= active_breakout_line
 - Plotly K 線圖顯示紅線、黑線、突破標記與回測守住標記。
 - Excel 匯出 `All_Data`、`Matching_Retest_Hold`、`Latest_Summary`、`Failed_Downloads`、`Parameter_Settings`。
 
-## 安裝與執行
+## 安裝與執行（Python 開發模式）
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## 桌面執行檔（免 Python）
+
+### 直接使用已封裝版本
+
+- **Windows x64**：下載 `BullishThreeConditionStockScreener-windows-x64.zip`，解壓縮後執行資料夾中的 `BullishThreeConditionStockScreener.exe`。
+- **macOS Intel**：下載 `BullishThreeConditionStockScreener-macos-intel.zip`，解壓縮後執行 `BullishThreeConditionStockScreener.app`。
+- **macOS Apple Silicon**：下載 `BullishThreeConditionStockScreener-macos-apple-silicon.zip`，解壓縮後執行 `BullishThreeConditionStockScreener.app`。
+- 執行檔會自動在本機啟動 Streamlit，並開啟預設瀏覽器。
+- **Windows** 若要結束程式，請直接關閉啟動時一起打開的命令視窗；**macOS** 可直接結束 `BullishThreeConditionStockScreener.app`。
+
+> macOS 與 Windows 的封裝檔都不需要另外安裝 Python，但第一次執行未簽章程式時，系統可能會要求手動允許開啟。
+
+### 本機打包
+
+```bash
+python -m pip install -r requirements.txt -r requirements-build.txt
+python scripts/build_desktop.py
+```
+
+打包完成後的產物位置：
+
+- **Windows**：`dist/BullishThreeConditionStockScreener/BullishThreeConditionStockScreener.exe`
+- **macOS**：`dist/BullishThreeConditionStockScreener.app`
+
+### GitHub Actions 自動打包
+
+- Workflow 檔案：`.github/workflows/build-desktop-executables.yml`
+- 在 GitHub Actions 手動執行 **Build desktop executables**，即可產生 Windows / macOS 下載檔。
+- 推送 `v*` 標籤時，workflow 會同時上傳 artifacts，並把 zip 檔附加到 GitHub Release。
 
 ## 側邊欄參數
 
