@@ -7,13 +7,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 _LINE_STYLES = [
-    ("red_line", "#dc2626", "Red Line"),
-    ("black_line", "#111827", "Black Line"),
+    ("red_line", "#dc2626", "紅線"),
+    ("black_line", "#111827", "黑線"),
 ]
 
 _MARKER_STYLES = [
-    ("break_red_line_daily", "Break Above Red Line", "#dc2626", "triangle-up", "High", 1),
-    ("break_black_line_daily", "Break Above Black Line", "#111827", "triangle-up", "High", 1),
+    ("break_red_line_daily", "突破紅線", "#dc2626", "triangle-up", "High", 1),
+    ("break_black_line_daily", "突破黑線", "#111827", "triangle-up", "High", 1),
 ]
 
 
@@ -52,7 +52,7 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
             high=chart_df["High"],
             low=chart_df["Low"],
             close=chart_df["Close"],
-            name="K Line",
+            name="K線",
         ),
         row=1,
         col=1,
@@ -90,7 +90,7 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
                 mode="markers",
                 name=label,
                 marker={"color": color, "size": 11, "symbol": symbol},
-                hovertemplate="%{x|%Y-%m-%d}<br>" + label + "<br>Close: %{customdata:.2f}<extra></extra>",
+                hovertemplate="%{x|%Y-%m-%d}<br>" + label + "<br>收盤：%{customdata:.2f}<extra></extra>",
                 customdata=rows["Close"].values,
             ),
             row=1,
@@ -100,8 +100,8 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
     if "retest_hold_daily" in chart_df.columns:
         retest_rows = chart_df[chart_df["retest_hold_daily"].fillna(False)]
         for line_type, label, color in [
-            ("Red Line", "Retest Hold Above Red Line", "#f97316"),
-            ("Black Line", "Retest Hold Above Black Line", "#2563eb"),
+            ("Red Line", "紅線回測守住", "#f97316"),
+            ("Black Line", "黑線回測守住", "#2563eb"),
         ]:
             rows = retest_rows[retest_rows["active_breakout_line_type"] == line_type]
             if rows.empty:
@@ -113,7 +113,7 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
                     mode="markers",
                     name=label,
                     marker={"color": color, "size": 11, "symbol": "circle"},
-                    hovertemplate="%{x|%Y-%m-%d}<br>" + label + "<br>Close: %{customdata:.2f}<extra></extra>",
+                    hovertemplate="%{x|%Y-%m-%d}<br>" + label + "<br>收盤：%{customdata:.2f}<extra></extra>",
                     customdata=rows["Close"].values,
                 ),
                 row=1,
@@ -124,7 +124,7 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
         go.Bar(
             x=chart_df["Date"],
             y=chart_df["Volume"],
-            name="Volume",
+            name="成交量",
             marker={"color": volume_colors},
         ),
         row=2,
@@ -132,13 +132,13 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
     )
 
     fig.update_layout(
-        title=f"{stock_code} Breakout / Retest Hold ({timeframe_label})",
+        title=f"{stock_code} 突破／回測守住（{timeframe_label}）",
         xaxis_rangeslider_visible=False,
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         margin={"l": 20, "r": 20, "t": 70, "b": 20},
         height=720,
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="價格", row=1, col=1)
+    fig.update_yaxes(title_text="成交量", row=2, col=1)
 
     return fig, None

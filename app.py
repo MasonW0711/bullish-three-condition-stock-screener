@@ -323,7 +323,17 @@ def _prepare_display_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame
             display_df[col] = pd.NA
     if "Timeframe" in display_df.columns:
         display_df["Timeframe"] = display_df["Timeframe"].map(TIMEFRAME_LABELS).fillna(display_df["Timeframe"])
-    return display_df[columns].rename(columns=DISPLAY_COLUMN_LABELS)
+    selected = display_df[columns].copy()
+    # 將布林欄位（突破、回測守住、法人條件等）以中文「是／否」呈現，提升可讀性。
+    # 僅針對真正的布林值，避免誤判只含 0/1 的整數欄位。
+    for col in selected.columns:
+        non_null = selected[col].dropna()
+        if not non_null.empty and all(
+            type(value) is bool or type(value).__name__ == "bool_"
+            for value in non_null.unique()
+        ):
+            selected[col] = selected[col].map({True: "是", False: "否"})
+    return selected.rename(columns=DISPLAY_COLUMN_LABELS)
 
 
 def main():
