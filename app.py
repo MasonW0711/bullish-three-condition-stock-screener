@@ -21,6 +21,8 @@ from export_engine import create_excel_bytes
 from signal_engine import attach_investor_flow_flags, run_signal_pipeline
 
 APP_TITLE = app_config.APP_TITLE
+APP_VERSION = app_config.APP_VERSION
+APP_UPDATED = app_config.APP_UPDATED
 APP_PURPOSE = app_config.APP_PURPOSE
 AUTO_UNIVERSE_DESCRIPTION = app_config.AUTO_UNIVERSE_DESCRIPTION
 DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
@@ -327,6 +329,7 @@ def _prepare_display_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
+    st.caption(f"版本 v{APP_VERSION}　更新日期：{APP_UPDATED}")
     st.caption(APP_PURPOSE)
 
     with st.sidebar:
@@ -404,7 +407,7 @@ def main():
             value=DEFAULT_PARAMETERS["trust_sell_streak"],
         )
 
-        run_screening = st.button("開始篩選", type="primary", use_container_width=True)
+        run_screening = st.button("開始篩選", type="primary", width="stretch")
 
     if start_date > end_date:
         st.error("開始日期必須早於或等於結束日期。")
@@ -525,7 +528,7 @@ def main():
         st.info("目前沒有符合條件的回測守住 K 棒。")
     else:
         display_matching = _prepare_display_frame(matching_retest_hold, RESULT_COLUMNS)
-        st.dataframe(display_matching, use_container_width=True)
+        st.dataframe(display_matching, width="stretch")
 
     st.subheader("最新摘要（每股一列）")
     display_summary = pd.DataFrame()
@@ -533,7 +536,7 @@ def main():
         st.info("無最新摘要資料。")
     else:
         display_summary = _prepare_display_frame(latest_summary, LATEST_SUMMARY_COLUMNS)
-        st.dataframe(display_summary, use_container_width=True)
+        st.dataframe(display_summary, width="stretch")
 
     st.subheader("K 線圖")
     signal_stock_codes = (
@@ -554,7 +557,7 @@ def main():
         if chart_message:
             st.warning(chart_message)
         elif figure is not None:
-            st.plotly_chart(figure, use_container_width=True)
+            st.plotly_chart(figure, width="stretch")
     else:
         st.info("目前沒有可供選擇的符合條件股票。")
 
@@ -587,7 +590,7 @@ def main():
         file_name=f"retest_hold_{timeframe_code}.csv",
         mime="text/csv",
         disabled=csv_source.empty,
-        use_container_width=True,
+        width="stretch",
     )
     download_col2.download_button(
         label="下載 Excel 結果",
@@ -595,7 +598,7 @@ def main():
         file_name=f"retest_hold_{timeframe_code}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         disabled=all_data.empty or bool(excel_error),
-        use_container_width=True,
+        width="stretch",
     )
 
     active_investor_filters = [

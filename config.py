@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+APP_VERSION = "1.0.1"
+APP_UPDATED = "2026-06-03"
+
 APP_TITLE = "紅黑線突破回測守住選股系統"
 APP_PURPOSE = (
     "本工具使用台灣證券交易所（TWSE）或其他網路公開資訊進行台股篩選，"
