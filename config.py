@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 APP_UPDATED = "2026-06-04"
 
 APP_TITLE = "紅黑線突破回測守住選股系統"
@@ -165,4 +165,31 @@ DISPLAY_COLUMN_LABELS = {
     "LatestClose": "收盤",
     "LatestVolume": "成交量",
     "SignalSummary": "訊號摘要",
+    "foreign_net": "外資買賣超",
+    "trust_net": "投信買賣超",
+    "red_line_raw": "紅線（原始）",
+    "black_line_raw": "黑線（原始）",
+}
+
+# Excel 匯出用：工作表名稱中文化
+EXCEL_SHEET_LABELS = {
+    "All_Data": "完整資料",
+    "Matching_Retest_Hold": "符合回測守住",
+    "Latest_Summary": "最新摘要",
+    "Failed_Downloads": "下載失敗清單",
+    "Parameter_Settings": "參數設定",
+}
+
+# Excel 匯出用：參數設定工作表的參數名稱中文化
+EXCEL_PARAMETER_LABELS = {
+    "start_date": "開始日期",
+    "end_date": "結束日期",
+    "analysis_timeframe": "分析週期",
+    "min_volume": "最小成交量（張）",
+    "lookback_bars": "回看 K 棒數",
+    "investor_consecutive_days": "法人連續買賣超天數",
+    "foreign_buy_streak": "外資連續買超條件",
+    "trust_buy_streak": "投信連續買超條件",
+    "foreign_sell_streak": "外資連續賣超條件",
+    "trust_sell_streak": "投信連續賣超條件",
 }
