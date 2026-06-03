@@ -13,6 +13,7 @@ from data_loader import (
     _download_candidate,
     _select_isin_table,
     _to_int,
+    download_investor_flow_data,
     download_stock_data,
     load_stock_list_from_upload,
     normalize_yfinance_data,
@@ -223,10 +224,13 @@ class StabilityTests(unittest.TestCase):
         ).set_index("Date")
 
         with patch("data_loader._download_candidate", side_effect=[pd.DataFrame(), fallback_raw]):
-            data, successes, failures = download_stock_data(["6182"], "2026-05-01", "2026-05-29")
+            data, successes, failures, download_errors = download_stock_data(
+                ["6182"], "2026-05-01", "2026-05-29"
+            )
 
         self.assertEqual(successes, ["6182.TWO"])
         self.assertEqual(failures, [])
+        self.assertEqual(download_errors, [])
         self.assertEqual(data.loc[0, "StockCode"], "6182.TWO")
 
     def test_excel_upload_supports_common_stock_code_columns(self):
@@ -247,6 +251,60 @@ class StabilityTests(unittest.TestCase):
         latest_summary = _compute_latest_summary(pd.DataFrame())
 
         self.assertEqual(latest_summary.columns.tolist(), LATEST_SUMMARY_COLUMNS)
+
+    def test_normalize_yfinance_data_tolerates_unexpected_shape(self):
+        # yfinance schema drift must not raise; it should yield an empty frame.
+        malformed = pd.DataFrame({"unexpected": [1, 2, 3]})
+
+        result = normalize_yfinance_data(malformed, stock_code="2330.TW")
+
+        self.assertTrue(result.empty)
+
+    def test_download_stock_data_reports_batch_errors(self):
+        # A raising download must be recorded as a diagnostic note, not swallowed.
+        with patch("data_loader._download_candidate", side_effect=RuntimeError("boom")):
+            data, successes, failures, download_errors = download_stock_data(
+                ["2330"], "2026-05-01", "2026-05-29"
+            )
+
+        self.assertTrue(data.empty)
+        self.assertEqual(successes, [])
+        self.assertTrue(len(download_errors) >= 1)
+        self.assertIn("boom", download_errors[0])
+
+    def test_investor_flow_counts_transient_fetch_failures(self):
+        # Network failures per day must be counted, not silently dropped.
+        with patch("data_loader._fetch_twse_investor_flow", side_effect=RuntimeError("net")), patch(
+            "data_loader._fetch_tpex_investor_flow", side_effect=RuntimeError("net")
+        ):
+            result = download_investor_flow_data(["2330"], "2026-05-05", lookback_days=5)
+
+        self.assertTrue(result.empty)
+        self.assertGreater(result.attrs.get("fetch_failures", 0), 0)
+        self.assertEqual(
+            result.attrs.get("fetch_failures"), result.attrs.get("fetch_attempts")
+        )
+
+    def test_attach_investor_flags_degrade_when_merge_fails(self):
+        bars = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-25", "2026-05-26"]),
+                "StockCode": ["2330.TW", "2330.TW"],
+            }
+        )
+        flow = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-25"]),
+                "BaseCode": ["2330"],
+                "foreign_net": [10],
+                "trust_net": [-5],
+            }
+        )
+        with patch("signal_engine.pd.merge_asof", side_effect=ValueError("version")):
+            result = attach_investor_flow_flags(bars, flow, consecutive_days=1)
+
+        # Pipeline survives; flags degrade to False instead of aborting.
+        self.assertFalse(bool(result["foreign_buy_streak_ok"].any()))
 
 
 if __name__ == "__main__":

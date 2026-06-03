@@ -16,6 +16,8 @@ import yfinance as yf
 
 from config import (
     INVESTOR_LOOKBACK_DAYS,
+    REQUEST_RETRIES,
+    REQUEST_TIMEOUT,
     REQUIRED_OHLCV_COLUMNS,
     TAIWAN_COMMON_STOCK_CFICODE,
     TWSE_LISTED_ISIN_URL,
@@ -24,6 +26,8 @@ from config import (
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
 
 _YFINANCE_LOGGER_NAMES = ("yfinance", "peewee")
 
@@ -46,16 +50,34 @@ def _chunk_list(items: list[str], chunk_size: int) -> list[list[str]]:
     return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
-def _get_with_ssl_fallback(url: str) -> requests.Response:
-    headers = {"User-Agent": "Mozilla/5.0"}
+def _request_once(url: str, headers: dict) -> requests.Response:
+    """Single GET attempt with an automatic insecure retry on SSL failure."""
     try:
-        response = requests.get(url, timeout=30, headers=headers)
+        response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
         response.raise_for_status()
         return response
     except requests.exceptions.SSLError:
-        response = requests.get(url, timeout=30, headers=headers, verify=False)
+        response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers, verify=False)
         response.raise_for_status()
         return response
+
+
+def _get_with_ssl_fallback(url: str) -> requests.Response:
+    """GET a URL with bounded retries for transient timeouts/connection errors.
+
+    SSL certificate problems fall back to an insecure request (TWSE/TPEX still
+    serve valid data). Timeouts and connection drops — common on the Streamlit
+    Cloud runtime — are retried; other HTTP errors fail immediately.
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    last_exc: Exception | None = None
+    for attempt in range(max(int(REQUEST_RETRIES), 0) + 1):
+        try:
+            return _request_once(url, headers)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            logger.warning("請求逾時或連線中斷（第 %d 次嘗試）：%s", attempt + 1, url)
+    raise last_exc if last_exc is not None else RuntimeError(f"請求失敗：{url}")
 
 
 def normalize_symbol(stock_code: str) -> list[str]:
@@ -185,47 +207,55 @@ def normalize_yfinance_data(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
 
-    normalized = df.copy()
+    # yfinance output shape can drift across versions/environments (MultiIndex
+    # layout, renamed index, missing columns). Treat any structural surprise as
+    # "no usable data for this symbol" instead of letting a KeyError abort the
+    # whole batch.
+    try:
+        normalized = df.copy()
 
-    # yfinance may return MultiIndex columns in some environments. For a
-    # single-symbol download we extract the requested symbol level when present.
-    if isinstance(normalized.columns, pd.MultiIndex):
-        ticker_level_values = normalized.columns.get_level_values(0)
-        price_level_values = normalized.columns.get_level_values(-1)
-        if stock_code in ticker_level_values:
-            normalized = normalized.xs(stock_code, axis=1, level=0, drop_level=True)
-        elif stock_code in price_level_values:
-            normalized = normalized.xs(stock_code, axis=1, level=-1, drop_level=True)
-        else:
-            normalized.columns = [
-                "_".join(str(part) for part in column if part)
-                for column in normalized.columns.to_flat_index()
-            ]
+        # yfinance may return MultiIndex columns in some environments. For a
+        # single-symbol download we extract the requested symbol level when present.
+        if isinstance(normalized.columns, pd.MultiIndex):
+            ticker_level_values = normalized.columns.get_level_values(0)
+            price_level_values = normalized.columns.get_level_values(-1)
+            if stock_code in ticker_level_values:
+                normalized = normalized.xs(stock_code, axis=1, level=0, drop_level=True)
+            elif stock_code in price_level_values:
+                normalized = normalized.xs(stock_code, axis=1, level=-1, drop_level=True)
+            else:
+                normalized.columns = [
+                    "_".join(str(part) for part in column if part)
+                    for column in normalized.columns.to_flat_index()
+                ]
 
-    normalized = normalized.reset_index()
+        normalized = normalized.reset_index()
 
-    if "Datetime" in normalized.columns and "Date" not in normalized.columns:
-        normalized = normalized.rename(columns={"Datetime": "Date"})
-    if "Date" not in normalized.columns and len(normalized.columns) > 0:
-        normalized = normalized.rename(columns={normalized.columns[0]: "Date"})
+        if "Datetime" in normalized.columns and "Date" not in normalized.columns:
+            normalized = normalized.rename(columns={"Datetime": "Date"})
+        if "Date" not in normalized.columns and len(normalized.columns) > 0:
+            normalized = normalized.rename(columns={normalized.columns[0]: "Date"})
 
-    required_price_columns = {"Open", "High", "Low", "Close", "Volume"}
-    if not required_price_columns.issubset(normalized.columns):
+        required_price_columns = {"Open", "High", "Low", "Close", "Volume"}
+        if not required_price_columns.issubset(normalized.columns):
+            return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
+
+        normalized = normalized[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+        normalized["Date"] = pd.to_datetime(
+            normalized["Date"], errors="coerce", utc=True
+        ).dt.tz_localize(None)
+
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
+
+        normalized["StockCode"] = stock_code
+        normalized = normalized.dropna(subset=["Date"]).drop_duplicates(subset=["Date"])
+        normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"], how="any")
+        normalized = normalized[REQUIRED_OHLCV_COLUMNS].sort_values("Date").reset_index(drop=True)
+        return normalized
+    except Exception as exc:  # pragma: no cover - defensive against yfinance drift
+        logger.warning("正規化 %s 的 yfinance 資料失敗：%s", stock_code, exc)
         return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
-
-    normalized = normalized[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-    normalized["Date"] = pd.to_datetime(normalized["Date"], errors="coerce", utc=True).dt.tz_localize(
-        None
-    )
-
-    for column in ["Open", "High", "Low", "Close", "Volume"]:
-        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
-
-    normalized["StockCode"] = stock_code
-    normalized = normalized.dropna(subset=["Date"]).drop_duplicates(subset=["Date"])
-    normalized = normalized.dropna(subset=["Open", "High", "Low", "Close"], how="any")
-    normalized = normalized[REQUIRED_OHLCV_COLUMNS].sort_values("Date").reset_index(drop=True)
-    return normalized
 
 
 def _download_candidate(symbols: str | list[str], start_date, end_date) -> pd.DataFrame:
@@ -259,16 +289,23 @@ def download_stock_data(
     start_date,
     end_date,
     progress_callback=None,
-) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """Download daily OHLCV data and return combined data plus success/failure lists."""
+) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
+    """Download daily OHLCV data.
+
+    Returns combined data, the success list, the failure list, and a list of
+    human-readable diagnostic notes for batch-level download errors (network /
+    rate-limit failures). The notes let the UI distinguish "no data" from "the
+    download itself failed" instead of silently swallowing the exception.
+    """
     success_list: list[str] = []
     failed_list: list[str] = []
+    download_errors: list[str] = []
     all_frames: list[pd.DataFrame] = []
     deduped_codes = _dedupe_preserve_order(stock_codes)
 
     total_codes = len(deduped_codes)
     if total_codes == 0:
-        return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS), success_list, failed_list
+        return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS), success_list, failed_list, download_errors
 
     for chunk_index, chunk in enumerate(_chunk_list(deduped_codes, YFINANCE_BATCH_SIZE), start=1):
         if progress_callback is not None:
@@ -294,8 +331,11 @@ def download_stock_data(
                 start_date,
                 end_date,
             )
-        except Exception:
+        except Exception as exc:
             raw_data = pd.DataFrame()
+            note = f"第 {chunk_index} 批下載失敗（網路或來源異常）：{type(exc).__name__}: {exc}"
+            logger.warning(note)
+            download_errors.append(note)
 
         unresolved_codes: list[str] = []
 
@@ -336,8 +376,11 @@ def download_stock_data(
                     start_date,
                     end_date,
                 )
-            except Exception:
+            except Exception as exc:
                 fallback_data = pd.DataFrame()
+                note = f"第 {chunk_index} 批備援下載失敗（網路或來源異常）：{type(exc).__name__}: {exc}"
+                logger.warning(note)
+                download_errors.append(note)
 
             for raw_code in unresolved_codes:
                 resolved_frame = pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
@@ -365,11 +408,11 @@ def download_stock_data(
             )
 
     if not all_frames:
-        return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS), success_list, failed_list
+        return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS), success_list, failed_list, download_errors
 
     all_data = pd.concat(all_frames, ignore_index=True)
     all_data = all_data.sort_values(["StockCode", "Date"]).reset_index(drop=True)
-    return all_data, success_list, failed_list
+    return all_data, success_list, failed_list, download_errors
 
 
 def _to_int(value) -> int:
@@ -384,30 +427,37 @@ def _to_int(value) -> int:
         return 0
 
 
+_INVESTOR_COLUMNS = ["Date", "BaseCode", "foreign_net", "trust_net"]
+
+
+def _empty_investor_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=_INVESTOR_COLUMNS)
+
+
 def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
+    # Network/decode errors are allowed to propagate so the caller can tell a
+    # transient failure (retry-worthy, worth surfacing) apart from a genuine
+    # "no data for this day" result. Structural surprises return empty.
     url = (
         "https://www.twse.com.tw/rwd/zh/fund/T86"
         f"?date={trade_date.strftime('%Y%m%d')}&selectType=ALLBUT0999&response=json"
     )
-    try:
-        response = _get_with_ssl_fallback(url)
-        payload = response.json()
-    except Exception:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+    response = _get_with_ssl_fallback(url)
+    payload = response.json()
 
     if payload.get("stat") != "OK":
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
 
     rows = payload.get("data") or []
     if not rows:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
 
     frame = pd.DataFrame(rows)
     if frame.shape[1] < 11:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
     code_series = frame.iloc[:, 0].astype(str).str.strip()
     if not code_series.str.fullmatch(r"\d{4}").any():
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
     result = pd.DataFrame(
         {
             "Date": trade_date.normalize(),
@@ -425,22 +475,19 @@ def _fetch_tpex_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
         "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
         f"?l=zh-tw&d={roc_date}&o=json"
     )
-    try:
-        response = _get_with_ssl_fallback(url)
-        payload = response.json()
-    except Exception:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+    response = _get_with_ssl_fallback(url)
+    payload = response.json()
 
     tables = payload.get("tables") or []
     if not tables or not tables[0].get("data"):
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
 
     frame = pd.DataFrame(tables[0]["data"])
     if frame.shape[1] < 14:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
     code_series = frame.iloc[:, 0].astype(str).str.strip()
     if not code_series.str.fullmatch(r"\d{4}").any():
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
     # OTC schema:
     # 0 code, 1 name, 2-4 foreign excl dealer, 5-7 foreign dealer,
     # 8-10 foreign incl dealer, 11-13 trust.
@@ -471,27 +518,47 @@ def download_investor_flow_data(
         if str(code).split(".")[0].strip()
     }
     if not base_codes:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        return _empty_investor_frame()
 
     end_ts = pd.Timestamp(end_date).normalize()
     start_ts = end_ts - pd.Timedelta(days=max(int(lookback_days), 5))
 
     frames: list[pd.DataFrame] = []
+    fetch_attempts = 0
+    fetch_failures = 0
     for trade_date in pd.bdate_range(start_ts, end_ts):
-        twse_df = _fetch_twse_investor_flow(trade_date)
-        if not twse_df.empty:
-            frames.append(twse_df)
-        tpex_df = _fetch_tpex_investor_flow(trade_date)
-        if not tpex_df.empty:
-            frames.append(tpex_df)
+        for source_name, fetch in (
+            ("TWSE", _fetch_twse_investor_flow),
+            ("TPEX", _fetch_tpex_investor_flow),
+        ):
+            fetch_attempts += 1
+            try:
+                source_df = fetch(trade_date)
+            except Exception as exc:
+                # Transient network/source failure for this day — isolate it,
+                # keep going, and count it so the UI can report partial coverage
+                # instead of silently treating filters as unmet.
+                fetch_failures += 1
+                logger.warning(
+                    "%s 法人資料抓取失敗（%s）：%s", source_name, trade_date.date(), exc
+                )
+                continue
+            if not source_df.empty:
+                frames.append(source_df)
 
     if not frames:
-        return pd.DataFrame(columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        empty = _empty_investor_frame()
+        empty.attrs["fetch_attempts"] = fetch_attempts
+        empty.attrs["fetch_failures"] = fetch_failures
+        return empty
 
     output = pd.concat(frames, ignore_index=True)
     output = output[output["BaseCode"].isin(base_codes)].copy()
     output = output.drop_duplicates(subset=["Date", "BaseCode"]).sort_values(["BaseCode", "Date"])
-    return output.reset_index(drop=True)
+    output = output.reset_index(drop=True)
+    output.attrs["fetch_attempts"] = fetch_attempts
+    output.attrs["fetch_failures"] = fetch_failures
+    return output
 
 
 def _resample_single_stock(stock_df: pd.DataFrame, rule: str) -> pd.DataFrame:
