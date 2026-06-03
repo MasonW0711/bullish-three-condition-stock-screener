@@ -26,6 +26,12 @@ TAIWAN_COMMON_STOCK_CFICODE = "ESVUFR"
 YFINANCE_BATCH_SIZE = 75
 INVESTOR_LOOKBACK_DAYS = 20
 
+# Network resilience for TWSE/TPEX requests. The cloud runtime frequently hits
+# slow responses at market peaks, so the timeout is generous and transient
+# failures are retried a bounded number of times before giving up.
+REQUEST_TIMEOUT = 60
+REQUEST_RETRIES = 2
+
 TIMEFRAME_OPTIONS = {
     "Daily K": "D",
     "Weekly K": "W",

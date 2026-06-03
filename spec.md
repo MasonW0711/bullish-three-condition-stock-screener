@@ -1,131 +1,145 @@
-# Taiwan Stock Screener Specification
+# 台股篩選器規格書
 
-## 1. Goal
+## 1. 目標
 
-Provide a Streamlit-based Taiwan stock screening system for research only.
+提供一套以 Streamlit 為介面的台股篩選系統，僅供研究參考使用。
 
-The app must find stocks that:
+本工具用來找出符合下列條件的股票：
 
-1. broke above the latest Big Red line or Big Black line,
-2. later retested that broken line,
-3. closed at or above that line,
-4. passed the recent-window, volume, and optional institutional-flow filters.
+1. 突破「最新的大紅線或大黑線」，
+2. 之後又回測該條被突破的線，
+3. 收盤價守在該線之上（含等於），
+4. 並通過近期窗格、量能、以及選用的法人買賣超過濾條件。
 
-This tool is not investment advice.
+本工具不構成投資建議。
 
-## 2. Product Scope
+## 2. 產品範圍
 
-Included:
+### 2.1 本工具的「三種篩選方法」
 
-- Taiwan listed (`.TW`) and OTC (`.TWO`) common stocks
-- Daily OHLCV via yfinance
-- Weekly/monthly bars resampled from daily bars only
-- Big Red / Big Black Attack signal detection
-- Red line / black line creation from successful attacks
-- Breakout above red or black line
-- Retest-hold screening
-- Optional institutional flow filters
-- Plotly candlestick chart
-- Excel export
+「三種篩選方法」即本系統的核心篩選邏輯，依序為：
 
-Excluded:
+1. **破線突破**：突破最新的大紅線 / 大黑線（見 §3.4）。
+2. **回測守住**：回測該被突破的線並在其上收盤（見 §3.5）。
+3. **量能 / 法人過濾**：近期窗格內成交量達標，並（選用）符合外資 / 投信連續買賣條件（見 §3.7）。
 
-- order placement
-- broker integration
-- backtesting engine
-- portfolio management
-- intraday data
-- Three Methods scoring
-- breakout buffer, retest tolerance, volume ratio, moving-average volume filters
+> 註：本工具並無任何「評分（scoring）」機制；三種方法是「逐層過濾」，不是加權計分。
 
-## 3. Core Domain Rules
+### 2.2 包含
 
-### 3.1 Attack Direction
+- 台灣上市（`.TW`）與上櫃（`.TWO`）普通股
+- 透過 yfinance 取得日線 OHLCV
+- 由日線重取樣（resample）出週線 / 月線
+- 大紅攻 / 大黑攻訊號偵測
+- 由攻擊成功產生紅線 / 黑線
+- 突破紅線或黑線
+- 回測守住篩選
+- 選用的法人買賣超過濾
+- Plotly K 線圖
+- Excel 匯出
 
-- `Open > prev_close` means only Big Red Attack.
-- `Open < prev_close` means only Big Black Attack.
-- Failed attacks never convert to the opposite direction.
+### 2.3 排除
 
-### 3.2 Attack Success
+- 下單
+- 券商整合
+- 回測引擎
+- 投資組合管理
+- 分鐘線（盤中資料）
+- 突破緩衝、回測容差、量能比率、均量過濾等進階參數
 
-- Big Red Attack Success: `Open > prev_close` and `Close > prev_close`
-- Big Red Attack Failed: `Open > prev_close` and `Close < prev_close`
-- Big Black Attack Success: `Open < prev_close` and `Close < prev_close`
-- Big Black Attack Failed: `Open < prev_close` and `Close > prev_close`
+## 3. 核心領域規則
 
-### 3.3 Lines
+### 3.1 攻擊方向
 
-- `red_line_raw = prev_close` only when Big Red Attack Success is true.
-- `black_line_raw = prev_close` only when Big Black Attack Success is true.
-- `red_line` and `black_line` are forward-filled separately within each `StockCode`.
+- `Open > prev_close` 只可能是「大紅攻」。
+- `Open < prev_close` 只可能是「大黑攻」。
+- 攻擊失敗不會轉成相反方向。
 
-### 3.4 Breakout
+### 3.2 攻擊成敗
 
-- Break red line: previous `Close <= previous red_line` and current `Close > current red_line`.
-- Break black line: previous `Close <= previous black_line` and current `Close > current black_line`.
-- If both break on the same K-bar, black line has display priority.
+- 大紅攻成功：`Open > prev_close` 且 `Close > prev_close`
+- 大紅攻失敗：`Open > prev_close` 且 `Close < prev_close`
+- 大黑攻成功：`Open < prev_close` 且 `Close < prev_close`
+- 大黑攻失敗：`Open < prev_close` 且 `Close > prev_close`
 
-### 3.5 Retest Hold
+### 3.3 紅線 / 黑線
 
-- The latest broken line is forward-filled per stock as the active breakout line.
-- Valid retest hold: `Low <= active_breakout_line_price` and `Close >= active_breakout_line_price`.
-- If `Close < active_breakout_line_price`, it is not a valid signal.
+- 僅在「大紅攻成功」為真時，`red_line_raw = prev_close`。
+- 僅在「大黑攻成功」為真時，`black_line_raw = prev_close`。
+- `red_line` 與 `black_line` 各自在每一個 `StockCode` 內向前填補（forward-fill）。
 
-### 3.6 Timeframe Order
+### 3.4 突破
 
-Always:
+- 突破紅線：前一根 `Close <= 前一根 red_line`，且當根 `Close > 當根 red_line`。
+- 突破黑線：前一根 `Close <= 前一根 black_line`，且當根 `Close > 當根 black_line`。
+- 若同一根 K 棒同時突破兩線，顯示上以黑線優先。
 
-1. download daily data
-2. resample to selected timeframe
-3. calculate `prev_close`
-4. calculate attack signals
-5. create red/black lines
-6. detect breakouts
-7. detect retest hold
-8. apply lookback, volume, and optional institutional filters
+### 3.5 回測守住
 
-Signals must never be calculated on daily bars and then resampled.
+- 最新被突破的線，會在每檔股票內向前填補，作為當前的回測線。
+- 有效的回測守住：`Low <= 當前回測線價格` 且 `Close >= 當前回測線價格`。
+- 若 `Close < 當前回測線價格`，則不算有效訊號。
 
-### 3.7 Investor Streak Rule
+### 3.6 時間框架順序
 
-`investor_consecutive_days = N`
+固定流程：
 
-For a bar date:
+1. 下載日線資料
+2. 重取樣為所選週期
+3. 計算 `prev_close`
+4. 計算攻擊訊號
+5. 產生紅線 / 黑線
+6. 偵測突破
+7. 偵測回測守住
+8. 套用回看窗格、量能、以及選用的法人過濾
 
-- foreign buy filter passes only if the latest N trading days all have `foreign_net > 0`
-- trust buy filter passes only if the latest N trading days all have `trust_net > 0`
-- foreign sell filter passes only if the latest N trading days all have `foreign_net < 0`
-- trust sell filter passes only if the latest N trading days all have `trust_net < 0`
+訊號絕不可在日線上計算後再去重取樣。
 
-Investor flow maps to each K-bar using the latest available investor date on or before the bar date, and flags must not propagate beyond the last available investor-flow date.
+### 3.7 法人連續日規則
 
-## 4. Output Contracts
+`investor_consecutive_days = N`（可設定參數，預設 3）。
 
-### 4.1 Matching Retest Hold
+對於某根 K 棒日期：
 
-Rows where `final_signal == True`, sorted by:
+- 外資連買條件成立，僅當最近 N 個交易日的 `foreign_net > 0` 全部成立。
+- 投信連買條件成立，僅當最近 N 個交易日的 `trust_net > 0` 全部成立。
+- 外資連賣條件成立，僅當最近 N 個交易日的 `foreign_net < 0` 全部成立。
+- 投信連賣條件成立，僅當最近 N 個交易日的 `trust_net < 0` 全部成立。
 
-1. `Date` descending
-2. `StockCode` ascending
+法人資料以「該 K 棒日期當天或之前、最近一個有資料的法人日期」對應到每根 K 棒；旗標不得延伸到「最後一個有法人資料的日期」之後。
 
-### 4.2 Latest Summary
+## 4. 輸出契約
 
-One row per stock showing the latest valid retest-hold signal inside the lookback window.
+### 4.1 符合回測守住
 
-### 4.3 Excel Export
+`final_signal == True` 的列，排序方式：
 
-Sheets:
+1. `Date` 由新到舊
+2. `StockCode` 由小到大
+
+### 4.2 最新摘要
+
+每檔股票一列，顯示回看窗格內「最新一筆有效回測守住訊號」。
+
+### 4.3 Excel 匯出
+
+固定五個工作表：
 
 - `All_Data`
 - `Matching_Retest_Hold`
 - `Latest_Summary`
-- `Failed_Downloads`
+- `Failed_Downloads`（含 `FailedStockCode` 失敗代號欄，以及 `DiagnosticNote` 批次層級的網路 / 來源錯誤診斷欄）
 - `Parameter_Settings`
 
-## 5. Stability Invariants
+## 5. 穩定不變式
 
-- Weekly uses the actual last trading day of the week.
-- Monthly uses the actual last trading day of the month.
-- Any shift, forward-fill, rolling, and resampling logic must be grouped by stock.
-- External source schema drift should fail clearly.
-- UI labels, internal parameters, and Excel parameter sheet must describe the same behavior.
+- 週線使用該週「實際的最後一個交易日」。
+- 月線使用該月「實際的最後一個交易日」。
+- 最後交易日以 yfinance 實際回傳的最後一根日線為準，不補假日、不對齊到自然週期結尾。
+- 任何 shift、forward-fill、rolling、resample 都必須以股票（`StockCode` / `BaseCode`）分組。
+- UI 標籤、內部參數、Excel 參數表必須描述相同的行為。
+
+### 5.1 外部資料錯誤策略
+
+- **結構性錯誤**（欄位數 / 表格格式與預期不符，例如股票清單表格欄數不對）→ **明確報錯**並指出來源，不可靜默吞掉。
+- **暫時性錯誤**（單一股票下載失敗、單日法人 API 連線逾時 / 中斷）→ **隔離該筆、記錄原因、繼續執行**，不可中斷整批；失敗原因需可被使用者看到（`st.warning` 與 Excel `Failed_Downloads`），不可讓過濾條件靜默全部失效。

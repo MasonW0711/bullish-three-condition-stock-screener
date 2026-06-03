@@ -13,12 +13,31 @@ def _sheet_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df.copy()
 
 
+def _failed_downloads_frame(failed_list: list[str], download_notes: list[str]) -> pd.DataFrame:
+    """Build the Failed_Downloads sheet with codes and batch-level diagnostics.
+
+    The two columns describe different things (per-stock failures vs batch-level
+    network/source errors), so they are padded to equal length and shown side by
+    side rather than row-aligned.
+    """
+    codes = list(failed_list or [])
+    notes = list(download_notes or [])
+    height = max(len(codes), len(notes))
+    return pd.DataFrame(
+        {
+            "FailedStockCode": codes + [""] * (height - len(codes)),
+            "DiagnosticNote": notes + [""] * (height - len(notes)),
+        }
+    )
+
+
 def create_excel_bytes(
     all_data: pd.DataFrame,
     matching_retest_hold: pd.DataFrame,
     latest_summary: pd.DataFrame,
     failed_list: list[str],
     params: dict,
+    download_notes: list[str] | None = None,
 ) -> bytes:
     """Create an in-memory Excel workbook with the required sheets."""
     parameter_sheet = pd.DataFrame(
@@ -54,7 +73,7 @@ def create_excel_bytes(
         "All_Data": _sheet_frame(all_data),
         "Matching_Retest_Hold": _sheet_frame(matching_retest_hold),
         "Latest_Summary": _sheet_frame(latest_summary),
-        "Failed_Downloads": pd.DataFrame({"FailedStockCode": failed_list}),
+        "Failed_Downloads": _failed_downloads_frame(failed_list, download_notes or []),
         "Parameter_Settings": parameter_sheet,
     }
 

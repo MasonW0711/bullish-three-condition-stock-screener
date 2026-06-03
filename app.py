@@ -56,7 +56,7 @@ def _download_stock_data_cached(
     stock_codes: tuple[str, ...],
     start_date: date,
     end_date: date,
-) -> tuple[pd.DataFrame, list[str], list[str]]:
+) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
     return download_stock_data(
         stock_codes=list(stock_codes),
         start_date=start_date,
@@ -161,6 +161,7 @@ def _empty_result(
     failed_list=None,
     messages=None,
     used_auto_universe: bool = False,
+    download_errors=None,
 ) -> dict:
     empty = pd.DataFrame()
     return {
@@ -169,6 +170,7 @@ def _empty_result(
         "latest_summary": _compute_latest_summary(empty),
         "success_list": success_list or [],
         "failed_list": failed_list or [],
+        "download_errors": download_errors or [],
         "universe_df": universe_df,
         "messages": messages or [],
         "used_auto_universe": used_auto_universe,
@@ -210,14 +212,14 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             def _download_progress_callback(progress_value: float, message: str) -> None:
                 progress_callback(0.03 + min(max(progress_value, 0.0), 1.0) * 0.70, message)
 
-            daily_data, success_list, failed_list = download_stock_data(
+            daily_data, success_list, failed_list, download_errors = download_stock_data(
                 stock_codes=stock_codes,
                 start_date=params["start_date"],
                 end_date=params["end_date"],
                 progress_callback=_download_progress_callback,
             )
         else:
-            daily_data, success_list, failed_list = _download_stock_data_cached(
+            daily_data, success_list, failed_list, download_errors = _download_stock_data_cached(
                 stock_codes=tuple(stock_codes),
                 start_date=params["start_date"],
                 end_date=params["end_date"],
@@ -225,6 +227,14 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     except Exception as exc:
         messages.append({"level": "error", "text": f"股票資料下載失敗：{exc}"})
         return _empty_result(universe_df, messages=messages, used_auto_universe=use_auto_universe)
+
+    if download_errors:
+        sample = "；".join(download_errors[:3])
+        more = f"（另有 {len(download_errors) - 3} 筆未列出）" if len(download_errors) > 3 else ""
+        messages.append({
+            "level": "warning",
+            "text": f"部分股票批次下載失敗，可能是網路逾時或來源限流：{sample}{more}",
+        })
 
     if daily_data.empty:
         messages.append({"level": "warning", "text": "下載完成，但沒有取得任何可用股價資料。"})
@@ -234,6 +244,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             failed_list=failed_list,
             messages=messages,
             used_auto_universe=use_auto_universe,
+            download_errors=download_errors,
         )
 
     if progress_callback is not None:
@@ -259,8 +270,15 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         except Exception as exc:
             messages.append({"level": "warning", "text": f"法人買賣超資料下載失敗，法人條件將視為未達成：{exc}"})
             investor_flow_df = pd.DataFrame()
+        fetch_failures = int(investor_flow_df.attrs.get("fetch_failures", 0))
+        fetch_attempts = int(investor_flow_df.attrs.get("fetch_attempts", 0))
         if investor_flow_df.empty:
             messages.append({"level": "warning", "text": "目前無法取得最新法人買賣超資料，法人條件已視為未達成。"})
+        elif fetch_failures > 0:
+            messages.append({
+                "level": "warning",
+                "text": f"法人買賣超資料有 {fetch_failures}/{fetch_attempts} 次抓取失敗（網路或來源異常），受影響日期的法人條件可能不準確。",
+            })
 
     processed = attach_investor_flow_flags(
         processed,
@@ -289,6 +307,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         "latest_summary": latest_summary,
         "success_list": success_list,
         "failed_list": failed_list,
+        "download_errors": download_errors,
         "universe_df": universe_df,
         "messages": messages,
         "used_auto_universe": use_auto_universe,
@@ -553,6 +572,7 @@ def main():
             latest_summary=latest_summary,
             failed_list=failed_list,
             params=saved_params,
+            download_notes=results.get("download_errors", []),
         )
     except Exception as exc:
         excel_error = f"建立 Excel 匯出檔時發生錯誤：{exc}"

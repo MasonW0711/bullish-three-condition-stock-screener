@@ -190,18 +190,26 @@ def attach_investor_flow_flags(
             for col in flag_columns:
                 stock_output[col] = False
         else:
-            stock_output = (
-                stock_df.drop(columns=[col for col in flag_columns if col in stock_df.columns])
-                .sort_values("Date")
-                .reset_index(drop=True)
-            )
-            last_flow_date = flow_df["Date"].max()
-            stock_output = pd.merge_asof(stock_output, flow_df, on="Date", direction="backward")
-            future_mask = stock_output["Date"] > last_flow_date
-            for col in flag_columns:
-                stock_output[col] = pd.array(stock_output[col], dtype="boolean").fillna(False).astype(bool)
-                if future_mask.any():
-                    stock_output.loc[future_mask, col] = False
+            try:
+                stock_output = (
+                    stock_df.drop(columns=[col for col in flag_columns if col in stock_df.columns])
+                    .sort_values("Date")
+                    .reset_index(drop=True)
+                )
+                last_flow_date = flow_df["Date"].max()
+                stock_output = pd.merge_asof(stock_output, flow_df, on="Date", direction="backward")
+                future_mask = stock_output["Date"] > last_flow_date
+                for col in flag_columns:
+                    stock_output[col] = pd.array(stock_output[col], dtype="boolean").fillna(False).astype(bool)
+                    if future_mask.any():
+                        stock_output.loc[future_mask, col] = False
+            except Exception:
+                # merge_asof can raise on pandas version / dtype edge cases.
+                # Degrade this stock's investor flags to False instead of
+                # aborting the whole screening run.
+                stock_output = stock_df.copy()
+                for col in flag_columns:
+                    stock_output[col] = False
         merged_groups.append(stock_output)
 
     merged = pd.concat(merged_groups, ignore_index=True)
