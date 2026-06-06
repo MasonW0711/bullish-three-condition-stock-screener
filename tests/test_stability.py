@@ -19,7 +19,11 @@ from data_loader import (
     normalize_yfinance_data,
     resample_ohlcv,
 )
-from signal_engine import attach_investor_flow_flags, run_signal_pipeline
+from signal_engine import (
+    attach_investor_flow_flags,
+    build_direction_signals,
+    run_signal_pipeline,
+)
 
 
 class StabilityTests(unittest.TestCase):
@@ -155,6 +159,8 @@ class StabilityTests(unittest.TestCase):
         self.assertEqual(result.loc[2, "active_breakout_line_type"], "Black Line")
         self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
         self.assertTrue(result.loc[3, "retest_hold_daily"])
+        self.assertTrue(result.loc[3, "p1_break_up_hold"])
+        self.assertFalse(result.loc[3, "p3_break_down_reject"])
         self.assertTrue(result.loc[3, "final_signal"])
 
     def test_retest_failure_is_not_final_signal(self):
@@ -172,7 +178,14 @@ class StabilityTests(unittest.TestCase):
 
         result = run_signal_pipeline(frame, {"lookback_bars": 3, "min_volume": 2000})
 
+        # The long P1 hold genuinely fails (close below the breakout line).
         self.assertFalse(result.loc[3, "retest_hold_daily"])
+        self.assertFalse(result.loc[3, "p1_break_up_hold"])
+        # Bar 3 is itself a fresh new-line appearance (bars_since == 0), so the
+        # appearance-bar-excluded window keeps P4 from firing; the bar matches
+        # no path and final_signal stays False.
+        self.assertEqual(result.loc[3, "bars_since_new_line"], 0)
+        self.assertFalse(result.loc[3, "p4_new_line_reject"])
         self.assertFalse(result.loc[3, "final_signal"])
 
     def test_invalid_universe_table_shape_raises_clear_error(self):
@@ -305,6 +318,195 @@ class StabilityTests(unittest.TestCase):
 
         # Pipeline survives; flags degrade to False instead of aborting.
         self.assertFalse(bool(result["foreign_buy_streak_ok"].any()))
+
+    def test_breakdown_sets_active_line_and_p3_reject(self):
+        # Red line at 100 (bar1 red success); bar2 closes below it -> P3 reject.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
+                "StockCode": ["2330.TW"] * 3,
+                "Open": [100, 101, 104],
+                "High": [101, 104, 104],
+                "Low": [99, 100, 96],
+                "Close": [100, 103, 98],
+                "Volume": [1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        self.assertTrue(result.loc[2, "break_down_red_line"])
+        self.assertFalse(result.loc[2, "break_red_line_daily"])
+        self.assertEqual(result.loc[2, "active_breakdown_line_type"], "Red Line")
+        self.assertEqual(result.loc[2, "active_breakdown_line_price"], 100)
+        self.assertTrue(result.loc[2, "retest_reject_daily"])
+        self.assertTrue(result.loc[2, "p3_break_down_reject"])
+
+    def test_p3_reject_failure_when_close_above_line(self):
+        # bar2 breaks the red line down (active breakdown line = 100); bar3 closes
+        # above the line so it is NOT a reject even though the line is active.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 104, 97],
+                "High": [101, 104, 104, 103],
+                "Low": [99, 100, 96, 96],
+                "Close": [100, 103, 98, 102],
+                "Volume": [1000, 1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        self.assertEqual(result.loc[3, "active_breakdown_line_price"], 100)
+        self.assertFalse(result.loc[3, "retest_reject_daily"])
+        self.assertFalse(result.loc[3, "p3_break_down_reject"])
+
+    def test_new_line_window_excludes_appearance_and_expires(self):
+        # Red line appears at bar1; later attack-failure bars retest above it.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 101, 102, 103, 104],
+                "High": [101, 104, 105, 106, 107],
+                "Low": [99, 100, 99, 99, 99],
+                "Close": [100, 103, 104, 105, 106],
+                "Volume": [1000, 1000, 1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0, "new_line_window": 2})
+
+        # Appearance bar (bars_since == 0) is excluded from the window.
+        self.assertEqual(result.loc[1, "bars_since_new_line"], 0)
+        self.assertFalse(result.loc[1, "p2_new_line_hold"])
+        # Inside the window (bars 1..2): P2 holds.
+        self.assertEqual(result.loc[2, "bars_since_new_line"], 1)
+        self.assertTrue(result.loc[2, "p2_new_line_hold"])
+        self.assertTrue(result.loc[3, "p2_new_line_hold"])
+        # Beyond the window (bars_since == 3 > 2): expired.
+        self.assertEqual(result.loc[4, "bars_since_new_line"], 3)
+        self.assertFalse(result.loc[4, "new_line_window_valid"])
+        self.assertFalse(result.loc[4, "p2_new_line_hold"])
+
+    def test_p4_new_line_reject_within_window(self):
+        # Black line appears at bar1 (price below it); bar2 rejects below within window.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
+                "StockCode": ["2330.TW"] * 3,
+                "Open": [100, 98, 96],
+                "High": [101, 101, 102],
+                "Low": [99, 96, 95],
+                "Close": [100, 97, 99],
+                "Volume": [1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        self.assertEqual(result.loc[2, "bars_since_new_line"], 1)
+        self.assertTrue(result.loc[2, "p4_new_line_reject"])
+        # No downward break occurred (price was already below the line), so P3 stays off.
+        self.assertFalse(result.loc[2, "p3_break_down_reject"])
+
+    def test_prev_close_equal_to_line_is_breakout_not_breakdown(self):
+        # bar3 has prev_close == prev red_line (both 100); a close above must be a
+        # breakout, never a breakdown (§3.4 equality rule).
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 99, 101],
+                "High": [101, 104, 104, 105],
+                "Low": [99, 100, 99, 99],
+                "Close": [100, 103, 100, 104],
+                "Volume": [1000, 1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        self.assertTrue(result.loc[3, "break_red_line_daily"])
+        self.assertFalse(result.loc[3, "break_down_red_line"])
+        # Up-break and down-break can never both fire on the same line/bar.
+        self.assertFalse(bool((result["break_red_line_daily"] & result["break_down_red_line"]).any()))
+        self.assertFalse(bool((result["break_black_line_daily"] & result["break_down_black_line"]).any()))
+
+    def test_direction_signals_explode_into_multiple_rows(self):
+        # bar2 satisfies both P3 (break-down reject) and P4 (new-line reject):
+        # two short rows, no long rows, and no cross-direction dedup.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
+                "StockCode": ["2330.TW"] * 3,
+                "Open": [100, 101, 104],
+                "High": [101, 104, 104],
+                "Low": [99, 100, 96],
+                "Close": [100, 103, 98],
+                "Volume": [1000, 1000, 1000],
+            }
+        )
+        processed = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+        processed = attach_investor_flow_flags(processed, pd.DataFrame(), consecutive_days=3)
+
+        bundle = build_direction_signals(processed, {"direction_filter": "全部"})
+        long_signals = bundle["long_signals"]
+        short_signals = bundle["short_signals"]
+
+        self.assertTrue(long_signals.empty)
+        self.assertEqual(len(short_signals), 2)
+        self.assertEqual(
+            set(short_signals["signal_type"]),
+            {"P3_BreakDown_Reject", "P4_NewLine_Reject"},
+        )
+        self.assertEqual(set(short_signals["direction"]), {"Short"})
+
+    def test_investor_filters_are_direction_aware(self):
+        # A selected BUY streak must gate long signals only, never short signals.
+        processed = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-05", "2026-05-05"]),
+                "Timeframe": ["D", "D"],
+                "StockCode": ["1111.TW", "2222.TW"],
+                "StockName": ["1111.TW", "2222.TW"],
+                "Open": [50, 60],
+                "High": [51, 61],
+                "Low": [49, 59],
+                "Close": [50, 60],
+                "Volume": [1000, 1000],
+                "prev_close": [49, 61],
+                "p1_final": [True, False],
+                "p2_final": [False, False],
+                "p3_final": [False, True],
+                "p4_final": [False, False],
+                "active_breakout_line_type": ["Red Line", None],
+                "active_breakout_line_price": [50.0, float("nan")],
+                "active_new_line_type": [None, None],
+                "active_new_line_price": [float("nan"), float("nan")],
+                "active_breakdown_line_type": [None, "Black Line"],
+                "active_breakdown_line_price": [float("nan"), 60.0],
+                "foreign_buy_streak_ok": [False, False],
+                "trust_buy_streak_ok": [False, False],
+                "foreign_sell_streak_ok": [False, False],
+                "trust_sell_streak_ok": [False, False],
+            }
+        )
+
+        bundle = build_direction_signals(
+            processed,
+            {"direction_filter": "全部", "foreign_buy_streak": True},
+        )
+
+        # Long P1 is filtered out (buy streak not satisfied)...
+        self.assertTrue(bundle["long_signals"].empty)
+        # ...but the short P3 survives because no sell filter was selected.
+        self.assertEqual(len(bundle["short_signals"]), 1)
+        self.assertEqual(bundle["short_signals"].loc[0, "signal_type"], "P3_BreakDown_Reject")
 
 
 if __name__ == "__main__":

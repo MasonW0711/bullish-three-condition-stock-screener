@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "1.0.3"
-APP_UPDATED = "2026-06-04"
+APP_VERSION = "2.0.0"
+APP_UPDATED = "2026-06-07"
 
-APP_TITLE = "紅黑線突破回測守住選股系統"
+APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (
     "本工具使用台灣證券交易所（TWSE）或其他網路公開資訊進行台股篩選，"
-    "供您作為評估是否買進的參考，並不構成投資建議。"
+    "依方向（做多／做空）分流呈現符合訊號的股票，供您作為評估參考，並不構成投資建議。"
 )
 AUTO_UNIVERSE_DESCRIPTION = "系統會自動抓取台灣上市與上櫃普通股股票清單，無須手動上傳 CSV。"
 
@@ -42,6 +42,9 @@ TIMEFRAME_OPTIONS = {
 }
 TIMEFRAME_LABELS = {code: label for label, code in TIMEFRAME_OPTIONS.items()}
 
+# Direction routing (v2). The values double as the direction_filter选项 shown in the UI.
+DIRECTION_FILTER_OPTIONS = ["全部", "做多", "做空"]
+
 DEFAULT_PARAMETERS = {
     "start_date": date.today() - timedelta(days=365 * 2),
     "end_date": date.today(),
@@ -50,6 +53,9 @@ DEFAULT_PARAMETERS = {
     # UI uses lots (張); internal calculations convert to shares.
     "min_volume": 2000,
     "investor_consecutive_days": 3,
+    # v2 additions.
+    "new_line_window": 5,
+    "direction_filter": "全部",
     "foreign_buy_streak": False,
     "trust_buy_streak": False,
     "foreign_sell_streak": False,
@@ -93,32 +99,74 @@ RESULT_COLUMNS = [
     "signal_summary",
     "red_line",
     "black_line",
+    "new_line_appeared",
+    "new_line_type",
+    "new_line_price",
     "break_red_line_daily",
     "break_black_line_daily",
     "breakout_line_type",
     "breakout_line_price",
+    "break_down_red_line",
+    "break_down_black_line",
+    "breakdown_line_type",
+    "breakdown_line_price",
     "active_breakout_line_type",
     "active_breakout_line_price",
+    "active_breakdown_line_type",
+    "active_breakdown_line_price",
+    "bars_since_new_line",
+    "active_new_line_type",
+    "active_new_line_price",
+    "new_line_window_valid",
     "retest_hold_daily",
+    "retest_reject_daily",
+    "p1_break_up_hold",
+    "p2_new_line_hold",
+    "p3_break_down_reject",
+    "p4_new_line_reject",
     *INVESTOR_FLAG_COLUMNS,
     "volume_pass",
     "lookback_rank",
+    "p1_final",
+    "p2_final",
+    "p3_final",
+    "p4_final",
     "final_signal",
+]
+
+# Unified schema for the exploded Long_Signals / Short_Signals frames (§3.8).
+SIGNAL_COLUMNS = [
+    "Date",
+    "Timeframe",
+    "StockCode",
+    "StockName",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "prev_close",
+    "direction",
+    "signal_type",
+    "retest_line_type",
+    "retest_line_price",
+    *INVESTOR_FLAG_COLUMNS,
 ]
 
 LATEST_SUMMARY_COLUMNS = [
     "StockCode",
     "StockName",
+    "Direction",
+    "SignalType",
     "LatestSignalDate",
     "Timeframe",
-    "ActiveBreakoutLineType",
-    "ActiveBreakoutLinePrice",
+    "RetestLineType",
+    "RetestLinePrice",
     "LatestOpen",
     "LatestHigh",
     "LatestLow",
     "LatestClose",
     "LatestVolume",
-    "SignalSummary",
     *INVESTOR_FLAG_COLUMNS,
 ]
 
@@ -142,13 +190,39 @@ DISPLAY_COLUMN_LABELS = {
     "signal_summary": "訊號摘要",
     "red_line": "紅線",
     "black_line": "黑線",
+    "new_line_appeared": "新線出現",
+    "new_line_type": "新線類型",
+    "new_line_price": "新線價格",
     "break_red_line_daily": "突破紅線",
     "break_black_line_daily": "突破黑線",
     "breakout_line_type": "突破線類型",
     "breakout_line_price": "突破線價格",
-    "active_breakout_line_type": "目前回測線類型",
-    "active_breakout_line_price": "目前回測線價格",
+    "break_down_red_line": "跌破紅線",
+    "break_down_black_line": "跌破黑線",
+    "breakdown_line_type": "跌破線類型",
+    "breakdown_line_price": "跌破線價格",
+    "active_breakout_line_type": "目前突破回測線類型",
+    "active_breakout_line_price": "目前突破回測線價格",
+    "active_breakdown_line_type": "目前跌破回測線類型",
+    "active_breakdown_line_price": "目前跌破回測線價格",
+    "bars_since_new_line": "新線後第幾根",
+    "active_new_line_type": "目前新線類型",
+    "active_new_line_price": "目前新線價格",
+    "new_line_window_valid": "新線窗格有效",
     "retest_hold_daily": "回測守住",
+    "retest_reject_daily": "回測壓回",
+    "p1_break_up_hold": "P1突破守住",
+    "p2_new_line_hold": "P2新線守住",
+    "p3_break_down_reject": "P3跌破壓回",
+    "p4_new_line_reject": "P4新線壓回",
+    "p1_final": "P1符合",
+    "p2_final": "P2符合",
+    "p3_final": "P3符合",
+    "p4_final": "P4符合",
+    "direction": "方向",
+    "signal_type": "訊號路徑",
+    "retest_line_type": "回測線類型",
+    "retest_line_price": "回測線價格",
     "foreign_buy_streak_ok": "外資連買條件",
     "trust_buy_streak_ok": "投信連買條件",
     "foreign_sell_streak_ok": "外資連賣條件",
@@ -156,9 +230,11 @@ DISPLAY_COLUMN_LABELS = {
     "volume_pass": "成交量達標",
     "lookback_rank": "最近K棒序",
     "final_signal": "最終符合",
+    "Direction": "方向",
+    "SignalType": "訊號路徑",
     "LatestSignalDate": "最新訊號日期",
-    "ActiveBreakoutLineType": "回測線類型",
-    "ActiveBreakoutLinePrice": "回測線價格",
+    "RetestLineType": "回測線類型",
+    "RetestLinePrice": "回測線價格",
     "LatestOpen": "開盤",
     "LatestHigh": "最高",
     "LatestLow": "最低",
@@ -174,8 +250,10 @@ DISPLAY_COLUMN_LABELS = {
 # Excel 匯出用：工作表名稱中文化
 EXCEL_SHEET_LABELS = {
     "All_Data": "完整資料",
-    "Matching_Retest_Hold": "符合回測守住",
-    "Latest_Summary": "最新摘要",
+    "Long_Signals": "做多訊號",
+    "Short_Signals": "做空訊號",
+    "Latest_Summary_Long": "做多最新摘要",
+    "Latest_Summary_Short": "做空最新摘要",
     "Failed_Downloads": "下載失敗清單",
     "Parameter_Settings": "參數設定",
 }
@@ -185,11 +263,13 @@ EXCEL_PARAMETER_LABELS = {
     "start_date": "開始日期",
     "end_date": "結束日期",
     "analysis_timeframe": "分析週期",
+    "direction_filter": "方向過濾",
     "min_volume": "最小成交量（張）",
     "lookback_bars": "回看 K 棒數",
+    "new_line_window": "新線回測窗格（交易日）",
     "investor_consecutive_days": "法人連續買賣超天數",
-    "foreign_buy_streak": "外資連續買超條件",
-    "trust_buy_streak": "投信連續買超條件",
-    "foreign_sell_streak": "外資連續賣超條件",
-    "trust_sell_streak": "投信連續賣超條件",
+    "foreign_buy_streak": "外資連續買超條件（做多）",
+    "trust_buy_streak": "投信連續買超條件（做多）",
+    "foreign_sell_streak": "外資連續賣超條件（做空）",
+    "trust_sell_streak": "投信連續賣超條件（做空）",
 }

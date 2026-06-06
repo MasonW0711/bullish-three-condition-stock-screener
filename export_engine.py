@@ -54,13 +54,15 @@ def _failed_downloads_frame(failed_list: list[str], download_notes: list[str]) -
 
 def create_excel_bytes(
     all_data: pd.DataFrame,
-    matching_retest_hold: pd.DataFrame,
-    latest_summary: pd.DataFrame,
+    long_signals: pd.DataFrame,
+    short_signals: pd.DataFrame,
+    latest_summary_long: pd.DataFrame,
+    latest_summary_short: pd.DataFrame,
     failed_list: list[str],
     params: dict,
     download_notes: list[str] | None = None,
 ) -> bytes:
-    """Create an in-memory Excel workbook with the required sheets."""
+    """Create an in-memory Excel workbook with the v2 long/short sheets (§4.3)."""
     parameter_sheet = pd.DataFrame(
         {
             "參數": [
@@ -69,8 +71,10 @@ def create_excel_bytes(
                     "start_date",
                     "end_date",
                     "analysis_timeframe",
+                    "direction_filter",
                     "min_volume",
                     "lookback_bars",
+                    "new_line_window",
                     "investor_consecutive_days",
                     "foreign_buy_streak",
                     "trust_buy_streak",
@@ -82,8 +86,10 @@ def create_excel_bytes(
                 params["start_date"],
                 params["end_date"],
                 params["analysis_timeframe"],
+                params.get("direction_filter", "全部"),
                 params["min_volume"],
                 params["lookback_bars"],
+                params.get("new_line_window", 5),
                 params.get("investor_consecutive_days", 3),
                 "是" if params.get("foreign_buy_streak", False) else "否",
                 "是" if params.get("trust_buy_streak", False) else "否",
@@ -95,8 +101,10 @@ def create_excel_bytes(
 
     workbook_frames = {
         "All_Data": _localize_frame(all_data),
-        "Matching_Retest_Hold": _localize_frame(matching_retest_hold),
-        "Latest_Summary": _localize_frame(latest_summary),
+        "Long_Signals": _localize_frame(long_signals),
+        "Short_Signals": _localize_frame(short_signals),
+        "Latest_Summary_Long": _localize_frame(latest_summary_long),
+        "Latest_Summary_Short": _localize_frame(latest_summary_short),
         "Failed_Downloads": _failed_downloads_frame(failed_list, download_notes or []),
         "Parameter_Settings": parameter_sheet,
     }

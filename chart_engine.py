@@ -14,11 +14,18 @@ _LINE_STYLES = [
 _MARKER_STYLES = [
     ("break_red_line_daily", "突破紅線", "#dc2626", "triangle-up", "High", 1),
     ("break_black_line_daily", "突破黑線", "#111827", "triangle-up", "High", 1),
+    ("break_down_red_line", "跌破紅線", "#dc2626", "triangle-down", "Low", -1),
+    ("break_down_black_line", "跌破黑線", "#111827", "triangle-down", "Low", -1),
 ]
 
 
-def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
-    """Create an interactive candlestick chart for one stock."""
+def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str, direction: str | None = None):
+    """Create an interactive candlestick chart for one stock.
+
+    ``direction`` (做多 / 做空 / None) only adjusts the title; all relevant
+    breakout/breakdown and retest markers are drawn regardless so the chart
+    stays informative on either tab.
+    """
     if stock_df is None or stock_df.empty:
         return None, "目前沒有可供顯示的資料。"
 
@@ -120,6 +127,29 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
                 col=1,
             )
 
+    if "retest_reject_daily" in chart_df.columns:
+        reject_rows = chart_df[chart_df["retest_reject_daily"].fillna(False)]
+        for line_type, label, color in [
+            ("Red Line", "紅線回測壓回", "#b91c1c"),
+            ("Black Line", "黑線回測壓回", "#1e3a8a"),
+        ]:
+            rows = reject_rows[reject_rows["active_breakdown_line_type"] == line_type]
+            if rows.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=rows["Date"],
+                    y=rows["High"] + y_offset,
+                    mode="markers",
+                    name=label,
+                    marker={"color": color, "size": 11, "symbol": "x"},
+                    hovertemplate="%{x|%Y-%m-%d}<br>" + label + "<br>收盤：%{customdata:.2f}<extra></extra>",
+                    customdata=rows["Close"].values,
+                ),
+                row=1,
+                col=1,
+            )
+
     fig.add_trace(
         go.Bar(
             x=chart_df["Date"],
@@ -131,8 +161,9 @@ def create_stock_chart(stock_df: pd.DataFrame, timeframe_label: str):
         col=1,
     )
 
+    direction_suffix = f"｜{direction}" if direction else ""
     fig.update_layout(
-        title=f"{stock_code} 突破／回測守住（{timeframe_label}）",
+        title=f"{stock_code} 突破／跌破與回測（{timeframe_label}{direction_suffix}）",
         xaxis_rangeslider_visible=False,
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         margin={"l": 20, "r": 20, "t": 70, "b": 20},

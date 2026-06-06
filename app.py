@@ -18,7 +18,11 @@ from data_loader import (
     resample_ohlcv,
 )
 from export_engine import create_excel_bytes
-from signal_engine import attach_investor_flow_flags, run_signal_pipeline
+from signal_engine import (
+    attach_investor_flow_flags,
+    build_direction_signals,
+    run_signal_pipeline,
+)
 
 APP_TITLE = app_config.APP_TITLE
 APP_VERSION = app_config.APP_VERSION
@@ -27,10 +31,12 @@ APP_PURPOSE = app_config.APP_PURPOSE
 AUTO_UNIVERSE_DESCRIPTION = app_config.AUTO_UNIVERSE_DESCRIPTION
 DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
 DEFAULT_TEXT_STOCK_LIST = app_config.DEFAULT_TEXT_STOCK_LIST
+DIRECTION_FILTER_OPTIONS = app_config.DIRECTION_FILTER_OPTIONS
 DISPLAY_COLUMN_LABELS = app_config.DISPLAY_COLUMN_LABELS
 INVESTOR_FLAG_COLUMNS = app_config.INVESTOR_FLAG_COLUMNS
 LATEST_SUMMARY_COLUMNS = app_config.LATEST_SUMMARY_COLUMNS
 RESULT_COLUMNS = app_config.RESULT_COLUMNS
+SIGNAL_COLUMNS = app_config.SIGNAL_COLUMNS
 TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
 TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
 
@@ -72,6 +78,8 @@ def _build_params(
     analysis_timeframe: str,
     lookback_bars: int,
     min_volume: int,
+    new_line_window: int = 5,
+    direction_filter: str = "全部",
     investor_consecutive_days: int = 3,
     foreign_buy_streak: bool = False,
     trust_buy_streak: bool = False,
@@ -84,6 +92,8 @@ def _build_params(
         "analysis_timeframe": analysis_timeframe,
         "lookback_bars": int(lookback_bars),
         "min_volume": int(min_volume),
+        "new_line_window": max(int(new_line_window), 1),
+        "direction_filter": direction_filter,
         "investor_consecutive_days": max(int(investor_consecutive_days), 1),
         "foreign_buy_streak": bool(foreign_buy_streak),
         "trust_buy_streak": bool(trust_buy_streak),
@@ -105,45 +115,24 @@ def _selected_investor_columns(params: dict) -> list[str]:
     ]
 
 
-def _apply_selected_investor_filters(processed_df: pd.DataFrame, params: dict) -> pd.DataFrame:
-    output = processed_df.copy()
-    for col in INVESTOR_FLAG_COLUMNS:
-        if col not in output.columns:
-            output[col] = False
-    required_cols = _selected_investor_columns(params)
-    output["investor_filter_pass"] = True
-    if required_cols:
-        output["investor_filter_pass"] = output[required_cols].fillna(False).all(axis=1)
-        output["final_signal"] = output["final_signal"].fillna(False) & output["investor_filter_pass"]
-    return output
-
-
-def _compute_matching_retest_hold(processed_df: pd.DataFrame) -> pd.DataFrame:
-    if processed_df.empty:
-        return processed_df.copy()
-    return (
-        processed_df[processed_df["final_signal"].fillna(False)]
-        .sort_values(["Date", "StockCode"], ascending=[False, True])
-        .reset_index(drop=True)
-    )
-
-
-def _compute_latest_summary(matching_df: pd.DataFrame) -> pd.DataFrame:
-    if matching_df.empty:
+def _compute_latest_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
+    """Latest valid signal per stock for one direction's exploded frame (§4.2)."""
+    if signals_df is None or signals_df.empty:
         return pd.DataFrame(columns=LATEST_SUMMARY_COLUMNS)
 
     latest = (
-        matching_df.sort_values(["StockCode", "Date"])
+        signals_df.sort_values(["StockCode", "Date"])
         .groupby("StockCode", group_keys=False)
         .tail(1)
         .copy()
     )
-    latest["SignalSummary"] = "Retest Hold Above " + latest["active_breakout_line_type"].fillna("")
     summary = latest.rename(
         columns={
             "Date": "LatestSignalDate",
-            "active_breakout_line_type": "ActiveBreakoutLineType",
-            "active_breakout_line_price": "ActiveBreakoutLinePrice",
+            "direction": "Direction",
+            "signal_type": "SignalType",
+            "retest_line_type": "RetestLineType",
+            "retest_line_price": "RetestLinePrice",
             "Open": "LatestOpen",
             "High": "LatestHigh",
             "Low": "LatestLow",
@@ -166,10 +155,13 @@ def _empty_result(
     download_errors=None,
 ) -> dict:
     empty = pd.DataFrame()
+    empty_summary = _compute_latest_summary(empty)
     return {
         "all_data": empty,
-        "matching_retest_hold": empty,
-        "latest_summary": _compute_latest_summary(empty),
+        "long_signals": empty,
+        "short_signals": empty,
+        "latest_summary_long": empty_summary,
+        "latest_summary_short": empty_summary,
         "success_list": success_list or [],
         "failed_list": failed_list or [],
         "download_errors": download_errors or [],
@@ -287,7 +279,6 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         investor_flow_df,
         consecutive_days=params.get("investor_consecutive_days", 3),
     )
-    processed = _apply_selected_investor_filters(processed, params)
 
     if not universe_df.empty and "StockName" in universe_df.columns:
         name_map = universe_df[["StockCode", "StockName"]].drop_duplicates("StockCode").set_index("StockCode")
@@ -296,17 +287,22 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     else:
         processed["StockName"] = processed["StockCode"]
 
-    matching_retest_hold = _compute_matching_retest_hold(processed)
-    latest_summary = _compute_latest_summary(matching_retest_hold)
-    if matching_retest_hold.empty:
+    direction_bundle = build_direction_signals(processed, params)
+    long_signals = direction_bundle["long_signals"]
+    short_signals = direction_bundle["short_signals"]
+    latest_summary_long = _compute_latest_summary(long_signals)
+    latest_summary_short = _compute_latest_summary(short_signals)
+    if long_signals.empty and short_signals.empty:
         messages.append({"level": "info", "text": "本次篩選完成，但目前沒有符合條件的股票。"})
     if progress_callback is not None:
         progress_callback(1.0, "篩選完成。")
 
     return {
         "all_data": processed,
-        "matching_retest_hold": matching_retest_hold,
-        "latest_summary": latest_summary,
+        "long_signals": long_signals,
+        "short_signals": short_signals,
+        "latest_summary_long": latest_summary_long,
+        "latest_summary_short": latest_summary_short,
         "success_list": success_list,
         "failed_list": failed_list,
         "download_errors": download_errors,
@@ -334,6 +330,57 @@ def _prepare_display_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame
         ):
             selected[col] = selected[col].map({True: "是", False: "否"})
     return selected.rename(columns=DISPLAY_COLUMN_LABELS)
+
+
+def _render_direction_results(
+    direction_label: str,
+    key_prefix: str,
+    signals_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    all_data: pd.DataFrame,
+    saved_params: dict,
+) -> None:
+    """Render one direction's signal table, latest summary, and K-line chart."""
+    st.markdown(f"#### {direction_label}符合訊號")
+    if signals_df is None or signals_df.empty:
+        st.info(f"目前沒有符合條件的{direction_label}訊號。")
+    else:
+        st.dataframe(_prepare_display_frame(signals_df, SIGNAL_COLUMNS), width="stretch")
+
+    st.markdown(f"#### {direction_label}最新摘要（每股一列）")
+    if summary_df is None or summary_df.empty:
+        st.info("無最新摘要資料。")
+    else:
+        st.dataframe(_prepare_display_frame(summary_df, LATEST_SUMMARY_COLUMNS), width="stretch")
+
+    st.markdown(f"#### {direction_label} K 線圖")
+    signal_stock_codes = (
+        sorted(signals_df["StockCode"].dropna().astype(str).unique().tolist())
+        if signals_df is not None and not signals_df.empty
+        else []
+    )
+    if not signal_stock_codes:
+        st.info(f"目前沒有可供選擇的{direction_label}股票。")
+        return
+
+    selected_stock = st.selectbox(
+        "選擇股票",
+        options=signal_stock_codes,
+        key=f"{key_prefix}_chart_select",
+    )
+    selected_df = all_data[all_data["StockCode"] == selected_stock].copy()
+    try:
+        figure, chart_message = create_stock_chart(
+            selected_df,
+            timeframe_label=saved_params["analysis_timeframe"],
+            direction=direction_label,
+        )
+    except Exception as exc:
+        figure, chart_message = None, f"建立圖表時發生錯誤：{exc}"
+    if chart_message:
+        st.warning(chart_message)
+    elif figure is not None:
+        st.plotly_chart(figure, width="stretch")
 
 
 def main():
@@ -391,8 +438,22 @@ def main():
             value=DEFAULT_PARAMETERS["lookback_bars"],
             step=1,
         )
+        new_line_window = st.number_input(
+            "新線回測窗格（交易日）",
+            min_value=1,
+            value=DEFAULT_PARAMETERS["new_line_window"],
+            step=1,
+            help="新紅／黑線出現後幾個交易日內，仍可作為 P2／P4 新線回測的基準線（不含出現當根）。",
+        )
+        direction_filter = st.selectbox(
+            "方向過濾",
+            options=DIRECTION_FILTER_OPTIONS,
+            index=DIRECTION_FILTER_OPTIONS.index(DEFAULT_PARAMETERS["direction_filter"]),
+            help="選擇只看做多（P1／P2）、只看做空（P3／P4），或兩者皆顯示。",
+        )
 
         st.subheader("法人條件")
+        st.caption("連買條件用於做多結果、連賣條件用於做空結果。")
         investor_consecutive_days = st.number_input(
             "法人連續買賣超天數",
             min_value=1,
@@ -401,19 +462,19 @@ def main():
             step=1,
         )
         foreign_buy_streak = st.checkbox(
-            f"外資最近 {int(investor_consecutive_days)} 日連續買超",
+            f"做多：外資最近 {int(investor_consecutive_days)} 日連續買超",
             value=DEFAULT_PARAMETERS["foreign_buy_streak"],
         )
         trust_buy_streak = st.checkbox(
-            f"投信最近 {int(investor_consecutive_days)} 日連續買超",
+            f"做多：投信最近 {int(investor_consecutive_days)} 日連續買超",
             value=DEFAULT_PARAMETERS["trust_buy_streak"],
         )
         foreign_sell_streak = st.checkbox(
-            f"外資最近 {int(investor_consecutive_days)} 日連續賣超",
+            f"做空：外資最近 {int(investor_consecutive_days)} 日連續賣超",
             value=DEFAULT_PARAMETERS["foreign_sell_streak"],
         )
         trust_sell_streak = st.checkbox(
-            f"投信最近 {int(investor_consecutive_days)} 日連續賣超",
+            f"做空：投信最近 {int(investor_consecutive_days)} 日連續賣超",
             value=DEFAULT_PARAMETERS["trust_sell_streak"],
         )
 
@@ -429,6 +490,8 @@ def main():
         analysis_timeframe=analysis_timeframe,
         lookback_bars=lookback_bars,
         min_volume=min_volume,
+        new_line_window=new_line_window,
+        direction_filter=direction_filter,
         investor_consecutive_days=investor_consecutive_days,
         foreign_buy_streak=foreign_buy_streak,
         trust_buy_streak=trust_buy_streak,
@@ -477,8 +540,10 @@ def main():
         return
 
     all_data: pd.DataFrame = results["all_data"]
-    matching_retest_hold: pd.DataFrame = results["matching_retest_hold"]
-    latest_summary: pd.DataFrame = results["latest_summary"]
+    long_signals: pd.DataFrame = results["long_signals"]
+    short_signals: pd.DataFrame = results["short_signals"]
+    latest_summary_long: pd.DataFrame = results["latest_summary_long"]
+    latest_summary_short: pd.DataFrame = results["latest_summary_short"]
     success_list: list[str] = results["success_list"]
     failed_list: list[str] = results["failed_list"]
     universe_df: pd.DataFrame = results["universe_df"]
@@ -518,71 +583,67 @@ def main():
     else:
         st.success("所有要求的股票代號都已成功下載。")
 
+    def _col_sum(frame: pd.DataFrame, *cols: str) -> int:
+        if frame is None or frame.empty:
+            return 0
+        mask = pd.Series(False, index=frame.index)
+        for col in cols:
+            if col in frame.columns:
+                mask = mask | frame[col].fillna(False)
+        return int(mask.sum())
+
     st.subheader("摘要")
     total_stocks = int(all_data["StockCode"].nunique()) if not all_data.empty else 0
-    matched_stocks = int(matching_retest_hold["StockCode"].nunique()) if not matching_retest_hold.empty else 0
-    breakout_count = int(
-        (all_data["break_red_line_daily"].fillna(False) | all_data["break_black_line_daily"].fillna(False)).sum()
-    ) if not all_data.empty else 0
-    retest_count = int(all_data["retest_hold_daily"].fillna(False).sum()) if not all_data.empty else 0
+    long_stocks = int(long_signals["StockCode"].nunique()) if not long_signals.empty else 0
+    short_stocks = int(short_signals["StockCode"].nunique()) if not short_signals.empty else 0
+    breakout_count = _col_sum(all_data, "break_red_line_daily", "break_black_line_daily")
+    breakdown_count = _col_sum(all_data, "break_down_red_line", "break_down_black_line")
+    hold_count = _col_sum(all_data, "retest_hold_daily")
+    reject_count = _col_sum(all_data, "retest_reject_daily")
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1, mc2, mc3 = st.columns(3)
     mc1.metric("可分析股票數", total_stocks)
-    mc2.metric("符合股票數", matched_stocks)
-    mc3.metric("突破 K 棒數", breakout_count)
-    mc4.metric("回測守住 K 棒數", retest_count)
+    mc2.metric("做多符合股票數", long_stocks)
+    mc3.metric("做空符合股票數", short_stocks)
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    bc1.metric("突破 K 棒數", breakout_count)
+    bc2.metric("跌破 K 棒數", breakdown_count)
+    bc3.metric("回測守住 K 棒數", hold_count)
+    bc4.metric("回測壓回 K 棒數", reject_count)
 
-    st.subheader("符合條件的回測守住 K 棒")
-    display_matching = pd.DataFrame()
-    if matching_retest_hold.empty:
-        st.info("目前沒有符合條件的回測守住 K 棒。")
-    else:
-        display_matching = _prepare_display_frame(matching_retest_hold, RESULT_COLUMNS)
-        st.dataframe(display_matching, width="stretch")
-
-    st.subheader("最新摘要（每股一列）")
-    display_summary = pd.DataFrame()
-    if latest_summary.empty:
-        st.info("無最新摘要資料。")
-    else:
-        display_summary = _prepare_display_frame(latest_summary, LATEST_SUMMARY_COLUMNS)
-        st.dataframe(display_summary, width="stretch")
-
-    st.subheader("K 線圖")
-    signal_stock_codes = (
-        sorted(matching_retest_hold["StockCode"].dropna().astype(str).unique().tolist())
-        if not matching_retest_hold.empty
-        else []
-    )
-    if signal_stock_codes:
-        selected_stock = st.selectbox("選擇股票（顯示符合條件的股票）", options=signal_stock_codes)
-        selected_df = all_data[all_data["StockCode"] == selected_stock].copy()
-        try:
-            figure, chart_message = create_stock_chart(
-                selected_df,
-                timeframe_label=saved_params["analysis_timeframe"],
-            )
-        except Exception as exc:
-            figure, chart_message = None, f"建立圖表時發生錯誤：{exc}"
-        if chart_message:
-            st.warning(chart_message)
-        elif figure is not None:
-            st.plotly_chart(figure, width="stretch")
-    else:
-        st.info("目前沒有可供選擇的符合條件股票。")
+    direction_filter = saved_params.get("direction_filter", "全部")
+    long_tab, short_tab = st.tabs(["做多", "做空"])
+    with long_tab:
+        if direction_filter == "做空":
+            st.info("方向過濾設為「做空」，已隱藏做多結果。")
+        else:
+            _render_direction_results("做多", "long", long_signals, latest_summary_long, all_data, saved_params)
+    with short_tab:
+        if direction_filter == "做多":
+            st.info("方向過濾設為「做多」，已隱藏做空結果。")
+        else:
+            _render_direction_results("做空", "short", short_signals, latest_summary_short, all_data, saved_params)
 
     st.subheader("結果下載")
     timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
-    csv_source = display_matching if not display_matching.empty else display_summary
-    csv_bytes = csv_source.to_csv(index=False).encode("utf-8-sig") if not csv_source.empty else b""
+    combined_signals = pd.concat(
+        [frame for frame in (long_signals, short_signals) if not frame.empty],
+        ignore_index=True,
+    ) if (not long_signals.empty or not short_signals.empty) else pd.DataFrame()
+    display_combined = (
+        _prepare_display_frame(combined_signals, SIGNAL_COLUMNS) if not combined_signals.empty else pd.DataFrame()
+    )
+    csv_bytes = display_combined.to_csv(index=False).encode("utf-8-sig") if not display_combined.empty else b""
 
     excel_bytes = b""
     excel_error = None
     try:
         excel_bytes = create_excel_bytes(
             all_data=all_data,
-            matching_retest_hold=matching_retest_hold,
-            latest_summary=latest_summary,
+            long_signals=long_signals,
+            short_signals=short_signals,
+            latest_summary_long=latest_summary_long,
+            latest_summary_short=latest_summary_short,
             failed_list=failed_list,
             params=saved_params,
             download_notes=results.get("download_errors", []),
@@ -595,35 +656,38 @@ def main():
 
     download_col1, download_col2 = st.columns(2)
     download_col1.download_button(
-        label="下載 CSV 結果",
+        label="下載 CSV 結果（做多＋做空）",
         data=csv_bytes,
-        file_name=f"retest_hold_{timeframe_code}.csv",
+        file_name=f"signals_{timeframe_code}.csv",
         mime="text/csv",
-        disabled=csv_source.empty,
+        disabled=display_combined.empty,
         width="stretch",
     )
     download_col2.download_button(
         label="下載 Excel 結果",
         data=excel_bytes,
-        file_name=f"retest_hold_{timeframe_code}.xlsx",
+        file_name=f"signals_{timeframe_code}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         disabled=all_data.empty or bool(excel_error),
         width="stretch",
     )
 
+    days = saved_params.get("investor_consecutive_days", 3)
     active_investor_filters = [
         label
         for enabled, label in (
-            (saved_params.get("foreign_buy_streak"), f"外資近{saved_params.get('investor_consecutive_days', 3)}日連買"),
-            (saved_params.get("trust_buy_streak"), f"投信近{saved_params.get('investor_consecutive_days', 3)}日連買"),
-            (saved_params.get("foreign_sell_streak"), f"外資近{saved_params.get('investor_consecutive_days', 3)}日連賣"),
-            (saved_params.get("trust_sell_streak"), f"投信近{saved_params.get('investor_consecutive_days', 3)}日連賣"),
+            (saved_params.get("foreign_buy_streak"), f"做多-外資近{days}日連買"),
+            (saved_params.get("trust_buy_streak"), f"做多-投信近{days}日連買"),
+            (saved_params.get("foreign_sell_streak"), f"做空-外資近{days}日連賣"),
+            (saved_params.get("trust_sell_streak"), f"做空-投信近{days}日連賣"),
         )
         if enabled
     ]
     st.caption(
         f"目前分析週期：{saved_params['analysis_timeframe']}　"
+        f"方向過濾：{direction_filter}　"
         f"回看 {saved_params['lookback_bars']} 根 K 棒　"
+        f"新線窗格 {saved_params.get('new_line_window', 5)} 日　"
         f"最小成交量 {saved_params['min_volume']} 張　"
         f"法人條件：{'、'.join(active_investor_filters) if active_investor_filters else '無'}"
     )
