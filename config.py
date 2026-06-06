@@ -46,7 +46,8 @@ TIMEFRAME_LABELS = {code: label for label, code in TIMEFRAME_OPTIONS.items()}
 DIRECTION_FILTER_OPTIONS = ["全部", "做多", "做空"]
 
 DEFAULT_PARAMETERS = {
-    "start_date": date.today() - timedelta(days=365 * 2),
+    # 預設只抓最近一個月，避免全市場 × 長區間下載在雲端逾時。
+    "start_date": date.today() - timedelta(days=30),
     "end_date": date.today(),
     "analysis_timeframe": "Daily K",
     "lookback_bars": 10,
