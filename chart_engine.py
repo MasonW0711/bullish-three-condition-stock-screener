@@ -6,16 +6,19 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# 「黑線」沿用策略術語，但實際以綠色繪製，避免在深色背景下看不見近黑色線條。
+_BLACK_LINE_COLOR = "#16a34a"
+
 _LINE_STYLES = [
     ("red_line", "#dc2626", "紅線"),
-    ("black_line", "#111827", "黑線"),
+    ("black_line", _BLACK_LINE_COLOR, "黑線"),
 ]
 
 _MARKER_STYLES = [
     ("break_red_line_daily", "突破紅線", "#dc2626", "triangle-up", "High", 1),
-    ("break_black_line_daily", "突破黑線", "#111827", "triangle-up", "High", 1),
+    ("break_black_line_daily", "突破黑線", _BLACK_LINE_COLOR, "triangle-up", "High", 1),
     ("break_down_red_line", "跌破紅線", "#dc2626", "triangle-down", "Low", -1),
-    ("break_down_black_line", "跌破黑線", "#111827", "triangle-down", "Low", -1),
+    ("break_down_black_line", "跌破黑線", _BLACK_LINE_COLOR, "triangle-down", "Low", -1),
 ]
 
 
