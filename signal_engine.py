@@ -14,10 +14,14 @@ short/down and new-line columns are additive.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from config import SIGNAL_COLUMNS
+
+logger = logging.getLogger(__name__)
 
 _PATH_SPECS = [
     # (final_col, direction, signal_type, line_type_col, line_price_col, side)
@@ -312,8 +316,14 @@ def attach_investor_flow_flags(
     investor = investor_flow_df.copy()
     investor["Date"] = pd.to_datetime(investor["Date"], errors="coerce")
     investor["BaseCode"] = investor["BaseCode"].astype(str).str.strip()
-    investor["foreign_net"] = pd.to_numeric(investor["foreign_net"], errors="coerce").fillna(0)
-    investor["trust_net"] = pd.to_numeric(investor["trust_net"], errors="coerce").fillna(0)
+    investor["foreign_net"] = pd.to_numeric(investor["foreign_net"], errors="coerce")
+    investor["trust_net"] = pd.to_numeric(investor["trust_net"], errors="coerce")
+    anomaly_count = int(investor[["foreign_net", "trust_net"]].isna().sum().sum())
+    if anomaly_count:
+        # 無法解析的買賣超數值：保守補 0（不會成立連買／連賣），但留下紀錄。
+        logger.warning("法人買賣超資料含 %d 筆無法解析的數值，相關日期的法人條件以未達成處理。", anomaly_count)
+    investor["foreign_net"] = investor["foreign_net"].fillna(0)
+    investor["trust_net"] = investor["trust_net"].fillna(0)
     investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
 
     investor["foreign_buy_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
@@ -329,13 +339,22 @@ def attach_investor_flow_flags(
         lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
     )
 
+    # 先把法人表按 BaseCode 分組建索引，避免之後逐檔股票全表掃描
+    # （全市場 1800 檔時是 O(檔數 × 法人列數) 的劣化點）。
+    investor_groups: dict[str, pd.DataFrame] = {
+        str(key).strip(): group for key, group in investor.groupby("BaseCode", sort=False)
+    }
+
     merged_groups: list[pd.DataFrame] = []
     for base_code, stock_df in output.sort_values(["BaseCode", "Date"]).groupby("BaseCode", sort=False):
+        flow_group = investor_groups.get(str(base_code).strip())
         flow_df = (
-            investor[investor["BaseCode"] == str(base_code).strip()][["Date", *flag_columns]]
+            flow_group[["Date", *flag_columns]]
             .drop_duplicates(subset=["Date"], keep="last")
             .sort_values("Date")
             .reset_index(drop=True)
+            if flow_group is not None
+            else pd.DataFrame(columns=["Date", *flag_columns])
         )
         if flow_df.empty:
             stock_output = stock_df.copy()
@@ -355,10 +374,11 @@ def attach_investor_flow_flags(
                     stock_output[col] = pd.array(stock_output[col], dtype="boolean").fillna(False).astype(bool)
                     if future_mask.any():
                         stock_output.loc[future_mask, col] = False
-            except Exception:
+            except Exception as exc:
                 # merge_asof can raise on pandas version / dtype edge cases.
                 # Degrade this stock's investor flags to False instead of
-                # aborting the whole screening run.
+                # aborting the whole screening run — but never silently.
+                logger.warning("法人旗標合併失敗，%s 的法人條件降級為未達成：%s", base_code, exc)
                 stock_output = stock_df.copy()
                 for col in flag_columns:
                     stock_output[col] = False

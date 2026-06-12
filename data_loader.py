@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 from io import StringIO
@@ -56,7 +58,10 @@ def _request_once(url: str, headers: dict) -> requests.Response:
         response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
         response.raise_for_status()
         return response
-    except requests.exceptions.SSLError:
+    except requests.exceptions.SSLError as exc:
+        # 降級為不驗證憑證屬於安全性讓步（可能遭中間人竄改資料），
+        # 必須留下紀錄，不可無聲發生。
+        logger.warning("SSL 憑證驗證失敗，改以不驗證憑證方式重試：%s（%s）", url, exc)
         response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers, verify=False)
         response.raise_for_status()
         return response
@@ -71,12 +76,16 @@ def _get_with_ssl_fallback(url: str) -> requests.Response:
     """
     headers = {"User-Agent": "Mozilla/5.0"}
     last_exc: Exception | None = None
-    for attempt in range(max(int(REQUEST_RETRIES), 0) + 1):
+    total_attempts = max(int(REQUEST_RETRIES), 0) + 1
+    for attempt in range(total_attempts):
         try:
             return _request_once(url, headers)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             last_exc = exc
             logger.warning("請求逾時或連線中斷（第 %d 次嘗試）：%s", attempt + 1, url)
+            # 指數退避：立即重試對限流中的來源只會雪上加霜。
+            if attempt + 1 < total_attempts:
+                time.sleep(min(2 ** attempt, 8))
     raise last_exc if last_exc is not None else RuntimeError(f"請求失敗：{url}")
 
 
@@ -212,22 +221,25 @@ def normalize_yfinance_data(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
     # "no usable data for this symbol" instead of letting a KeyError abort the
     # whole batch.
     try:
-        normalized = df.copy()
-
-        # yfinance may return MultiIndex columns in some environments. For a
-        # single-symbol download we extract the requested symbol level when present.
-        if isinstance(normalized.columns, pd.MultiIndex):
-            ticker_level_values = normalized.columns.get_level_values(0)
-            price_level_values = normalized.columns.get_level_values(-1)
+        # yfinance may return MultiIndex columns in some environments. Extract
+        # the requested symbol's columns BEFORE copying — this function is
+        # called once per symbol on the same batch frame, and copying the
+        # whole batch every time is O(batch²) memory churn.
+        if isinstance(df.columns, pd.MultiIndex):
+            ticker_level_values = df.columns.get_level_values(0)
+            price_level_values = df.columns.get_level_values(-1)
             if stock_code in ticker_level_values:
-                normalized = normalized.xs(stock_code, axis=1, level=0, drop_level=True)
+                normalized = df.xs(stock_code, axis=1, level=0, drop_level=True).copy()
             elif stock_code in price_level_values:
-                normalized = normalized.xs(stock_code, axis=1, level=-1, drop_level=True)
+                normalized = df.xs(stock_code, axis=1, level=-1, drop_level=True).copy()
             else:
+                normalized = df.copy()
                 normalized.columns = [
                     "_".join(str(part) for part in column if part)
                     for column in normalized.columns.to_flat_index()
                 ]
+        else:
+            normalized = df.copy()
 
         normalized = normalized.reset_index()
 
@@ -298,6 +310,7 @@ def download_stock_data(
     download itself failed" instead of silently swallowing the exception.
     """
     success_list: list[str] = []
+    success_set: set[str] = set()
     failed_list: list[str] = []
     download_errors: list[str] = []
     all_frames: list[pd.DataFrame] = []
@@ -359,10 +372,11 @@ def download_stock_data(
                 failed_list.append(raw_code)
                 continue
 
-            if resolved_symbol in success_list:
+            if resolved_symbol in success_set:
                 continue
             all_frames.append(resolved_frame)
             success_list.append(resolved_symbol)
+            success_set.add(resolved_symbol)
 
         if unresolved_codes:
             fallback_symbols = _dedupe_preserve_order(
@@ -395,10 +409,11 @@ def download_stock_data(
                 if resolved_symbol is None:
                     failed_list.append(raw_code)
                     continue
-                if resolved_symbol in success_list:
+                if resolved_symbol in success_set:
                     continue
                 all_frames.append(resolved_frame)
                 success_list.append(resolved_symbol)
+                success_set.add(resolved_symbol)
 
         if progress_callback is not None:
             completed = min(chunk_index * YFINANCE_BATCH_SIZE, total_codes)
@@ -415,7 +430,14 @@ def download_stock_data(
     return all_data, success_list, failed_list, download_errors
 
 
-def _to_int(value) -> int:
+def _to_int(value) -> int | None:
+    """Parse an institutional-flow number from public TWSE/TPEX tables.
+
+    Dash / empty placeholders mean "no value reported" and map to 0; anything
+    else that fails to parse returns ``None`` so callers can surface the data
+    anomaly instead of silently treating it as a zero net position (which
+    would silently break consecutive-day streaks).
+    """
     text = str(value).strip().replace(",", "").replace("+", "")
     if text in {"", "nan", "NaN", "None", "--", "-", "—"}:
         return 0
@@ -424,7 +446,7 @@ def _to_int(value) -> int:
     try:
         return int(float(text))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 _INVESTOR_COLUMNS = ["Date", "BaseCode", "foreign_net", "trust_net"]
@@ -432,6 +454,32 @@ _INVESTOR_COLUMNS = ["Date", "BaseCode", "foreign_net", "trust_net"]
 
 def _empty_investor_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=_INVESTOR_COLUMNS)
+
+
+def _locate_investor_net_columns(fields: list[str]) -> tuple[int, int]:
+    """Locate the foreign / trust net buy-sell columns by field name.
+
+    Raises ValueError when the expected columns cannot be identified, so a
+    source-side schema change surfaces as a fetch failure (counted and shown
+    in the UI) instead of silently reading the wrong column.
+    """
+
+    def _find(predicate) -> int | None:
+        return next((index for index, field in enumerate(fields) if predicate(field)), None)
+
+    def _is_foreign_net(field: str) -> bool:
+        # The dealer-only column (外資自營商買賣超) must not match.
+        return "買賣超" in field and ("外資" in field or "外陸資" in field) and "自營商買賣超" not in field
+
+    # Prefer the "excluding foreign dealer" variant when both are present.
+    foreign_index = _find(lambda field: _is_foreign_net(field) and "不含" in field)
+    if foreign_index is None:
+        foreign_index = _find(_is_foreign_net)
+    trust_index = _find(lambda field: "投信" in field and "買賣超" in field)
+
+    if foreign_index is None or trust_index is None:
+        raise ValueError(f"法人資料欄位格式改變，無法定位外資／投信買賣超欄位：{fields}")
+    return foreign_index, trust_index
 
 
 def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
@@ -455,6 +503,19 @@ def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
     if frame.shape[1] < 11:
         return _empty_investor_frame()
+
+    # Locate net buy/sell columns by field name; positional indexes are only a
+    # fallback when the payload carries no field metadata.
+    fields = [str(field).strip() for field in (payload.get("fields") or [])]
+    if fields:
+        foreign_index, trust_index = _locate_investor_net_columns(fields)
+        if frame.shape[1] <= max(foreign_index, trust_index):
+            raise ValueError(
+                f"TWSE T86 資料欄數（{frame.shape[1]}）與欄位定義（{len(fields)}）不符。"
+            )
+    else:
+        foreign_index, trust_index = 4, 10
+
     code_series = frame.iloc[:, 0].astype(str).str.strip()
     if not code_series.str.fullmatch(r"\d{4}").any():
         return _empty_investor_frame()
@@ -462,18 +523,63 @@ def _fetch_twse_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
         {
             "Date": trade_date.normalize(),
             "BaseCode": code_series,
-            "foreign_net": frame.iloc[:, 4].map(_to_int),
-            "trust_net": frame.iloc[:, 10].map(_to_int),
+            "foreign_net": frame.iloc[:, foreign_index].map(_to_int),
+            "trust_net": frame.iloc[:, trust_index].map(_to_int),
         }
     )
     return result[result["BaseCode"].str.fullmatch(r"\d{4}", na=False)].reset_index(drop=True)
 
 
+# TPEX daily institutional layout (verified against the live API):
+# 0 code, 1 name, 2-4 foreign excl dealer, 5-7 foreign dealer,
+# 8-10 foreign incl dealer, 11-13 trust, 14-22 dealer groups,
+# 23 three-institution total.
+_TPEX_FOREIGN_NET_INDEX = 4
+_TPEX_TRUST_NET_INDEX = 13
+_TPEX_EXPECTED_FIELD_COUNT = 24
+
+
+def _validate_tpex_net_columns(fields: list[str], frame: pd.DataFrame) -> tuple[int, int]:
+    """Validate the TPEX generic-name layout and return (foreign, trust) indexes.
+
+    TPEX repeats generic 買進/賣出/買賣超 field names without institution
+    prefixes, so the column meaning is validated structurally instead:
+    expected field count, the three-institution total as the last column, and
+    net == buy - sell arithmetic on each used net column (an inserted or
+    reordered column breaks at least one of these). Raises ValueError so a
+    schema change surfaces as a counted fetch failure instead of reading the
+    wrong column.
+    """
+    if any("投信" in field for field in fields):
+        # If TPEX ever ships institution-prefixed names, prefer locating by name.
+        return _locate_investor_net_columns(fields)
+
+    if len(fields) != _TPEX_EXPECTED_FIELD_COUNT or frame.shape[1] != len(fields):
+        raise ValueError(
+            f"TPEX 法人資料欄位數改變（欄位定義 {len(fields)}、資料 {frame.shape[1]} 欄，"
+            f"預期 {_TPEX_EXPECTED_FIELD_COUNT} 欄），請確認來源格式。"
+        )
+    if "三大法人買賣超" not in fields[-1]:
+        raise ValueError(f"TPEX 法人資料最後一欄不是三大法人合計：{fields[-1]}")
+
+    for net_index in (_TPEX_FOREIGN_NET_INDEX, _TPEX_TRUST_NET_INDEX):
+        if fields[net_index] != "買賣超股數":
+            raise ValueError(f"TPEX 法人資料第 {net_index} 欄不是買賣超股數：{fields[net_index]}")
+        buy = pd.to_numeric(frame.iloc[:, net_index - 2].map(_to_int), errors="coerce")
+        sell = pd.to_numeric(frame.iloc[:, net_index - 1].map(_to_int), errors="coerce")
+        net = pd.to_numeric(frame.iloc[:, net_index].map(_to_int), errors="coerce")
+        # Tolerate isolated placeholder rows, but a systematic mismatch means
+        # the columns no longer line up.
+        if len(frame) > 0 and (buy - sell).eq(net).mean() < 0.99:
+            raise ValueError(f"TPEX 法人資料第 {net_index} 欄不符合買賣超＝買進－賣出，欄位可能位移。")
+    return _TPEX_FOREIGN_NET_INDEX, _TPEX_TRUST_NET_INDEX
+
+
 def _fetch_tpex_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
-    roc_date = f"{trade_date.year - 1911:03d}/{trade_date.month:02d}/{trade_date.day:02d}"
+    # 新版 TPEX OpenAPI 端點（舊版 /web/stock/...php 已是相容轉址，隨時可能下線）。
     url = (
-        "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
-        f"?l=zh-tw&d={roc_date}&o=json"
+        "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+        f"?type=Daily&sect=EW&date={trade_date.strftime('%Y/%m/%d')}&response=json"
     )
     response = _get_with_ssl_fallback(url)
     payload = response.json()
@@ -485,66 +591,82 @@ def _fetch_tpex_investor_flow(trade_date: pd.Timestamp) -> pd.DataFrame:
     frame = pd.DataFrame(tables[0]["data"])
     if frame.shape[1] < 14:
         return _empty_investor_frame()
+
+    fields = [str(field).strip() for field in (tables[0].get("fields") or [])]
+    if fields:
+        foreign_index, trust_index = _validate_tpex_net_columns(fields, frame)
+    else:
+        foreign_index, trust_index = _TPEX_FOREIGN_NET_INDEX, _TPEX_TRUST_NET_INDEX
+
     code_series = frame.iloc[:, 0].astype(str).str.strip()
     if not code_series.str.fullmatch(r"\d{4}").any():
         return _empty_investor_frame()
-    # OTC schema:
-    # 0 code, 1 name, 2-4 foreign excl dealer, 5-7 foreign dealer,
-    # 8-10 foreign incl dealer, 11-13 trust.
     result = pd.DataFrame(
         {
             "Date": trade_date.normalize(),
             "BaseCode": code_series,
-            "foreign_net": frame.iloc[:, 4].map(_to_int),
-            "trust_net": frame.iloc[:, 13].map(_to_int),
+            "foreign_net": frame.iloc[:, foreign_index].map(_to_int),
+            "trust_net": frame.iloc[:, trust_index].map(_to_int),
         }
     )
     return result[result["BaseCode"].str.fullmatch(r"\d{4}", na=False)].reset_index(drop=True)
 
 
 def download_investor_flow_data(
-    stock_codes: list[str],
+    stock_codes: list[str] | None,
     end_date,
     lookback_days: int = INVESTOR_LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     """Download recent daily institutional net buy/sell data for Taiwan stocks.
 
+    The source data is whole-market per day; ``stock_codes=None`` keeps every
+    stock (callers can cache the market-wide result and filter afterwards).
     The returned data is daily, regardless of the selected K-bar timeframe.
     It is later mapped to the latest selected K-bar by bar end date.
     """
-    base_codes = {
-        str(code).split(".")[0].strip()
-        for code in stock_codes
-        if str(code).split(".")[0].strip()
-    }
-    if not base_codes:
-        return _empty_investor_frame()
+    base_codes: set[str] | None = None
+    if stock_codes is not None:
+        base_codes = {
+            str(code).split(".")[0].strip()
+            for code in stock_codes
+            if str(code).split(".")[0].strip()
+        }
+        if not base_codes:
+            return _empty_investor_frame()
 
     end_ts = pd.Timestamp(end_date).normalize()
     start_ts = end_ts - pd.Timedelta(days=max(int(lookback_days), 5))
 
-    frames: list[pd.DataFrame] = []
-    fetch_attempts = 0
-    fetch_failures = 0
-    for trade_date in pd.bdate_range(start_ts, end_ts):
+    fetch_tasks = [
+        (trade_date, source_name, fetch)
+        for trade_date in pd.bdate_range(start_ts, end_ts)
         for source_name, fetch in (
             ("TWSE", _fetch_twse_investor_flow),
             ("TPEX", _fetch_tpex_investor_flow),
-        ):
-            fetch_attempts += 1
-            try:
-                source_df = fetch(trade_date)
-            except Exception as exc:
-                # Transient network/source failure for this day — isolate it,
-                # keep going, and count it so the UI can report partial coverage
-                # instead of silently treating filters as unmet.
-                fetch_failures += 1
-                logger.warning(
-                    "%s 法人資料抓取失敗（%s）：%s", source_name, trade_date.date(), exc
-                )
-                continue
-            if not source_df.empty:
-                frames.append(source_df)
+        )
+    ]
+
+    def _fetch_one(task) -> tuple[pd.DataFrame | None, Exception | None]:
+        trade_date, source_name, fetch = task
+        try:
+            return fetch(trade_date), None
+        except Exception as exc:
+            # Transient network/source failure for this day — isolate it,
+            # keep going, and count it so the UI can report partial coverage
+            # instead of silently treating filters as unmet.
+            logger.warning("%s 法人資料抓取失敗（%s）：%s", source_name, trade_date.date(), exc)
+            return None, exc
+
+    # 每個交易日 × 兩個來源約 40 個請求；小規模並行可大幅縮短雲端等待時間，
+    # 並行數刻意壓低以免觸發來源限流。
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fetch_results = list(pool.map(_fetch_one, fetch_tasks))
+
+    fetch_attempts = len(fetch_tasks)
+    fetch_failures = sum(1 for _, exc in fetch_results if exc is not None)
+    frames: list[pd.DataFrame] = [
+        frame for frame, exc in fetch_results if exc is None and frame is not None and not frame.empty
+    ]
 
     if not frames:
         empty = _empty_investor_frame()
@@ -553,7 +675,8 @@ def download_investor_flow_data(
         return empty
 
     output = pd.concat(frames, ignore_index=True)
-    output = output[output["BaseCode"].isin(base_codes)].copy()
+    if base_codes is not None:
+        output = output[output["BaseCode"].isin(base_codes)].copy()
     output = output.drop_duplicates(subset=["Date", "BaseCode"]).sort_values(["BaseCode", "Date"])
     output = output.reset_index(drop=True)
     output.attrs["fetch_attempts"] = fetch_attempts

@@ -9,6 +9,7 @@ import streamlit as st
 
 import config as app_config
 from chart_engine import create_stock_chart
+from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
 from data_loader import (
     download_investor_flow_data,
     download_stock_data,
@@ -46,45 +47,52 @@ def _load_taiwan_stock_universe_cached() -> pd.DataFrame:
     return load_taiwan_stock_universe()
 
 
+# 法人資料一律抓「全市場」再過濾，因此快取鍵只需日期與回看天數；
+# 若把股票清單放進快取鍵，換一批清單就會重抓相同的全市場資料。
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def _download_investor_flow_data_cached(
-    stock_codes: tuple[str, ...],
     end_date: date,
     lookback_days: int,
 ) -> pd.DataFrame:
     return download_investor_flow_data(
-        stock_codes=list(stock_codes),
+        stock_codes=None,
         end_date=end_date,
         lookback_days=lookback_days,
     )
 
 
+# 底線開頭的參數不會進入 st.cache_data 的快取鍵：首跑會以 callback 回報
+# 下載進度，相同條件重跑則直接命中快取、不再重新下載。
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def _download_stock_data_cached(
     stock_codes: tuple[str, ...],
     start_date: date,
     end_date: date,
+    _progress_callback=None,
 ) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
     return download_stock_data(
         stock_codes=list(stock_codes),
         start_date=start_date,
         end_date=end_date,
+        progress_callback=_progress_callback,
     )
 
 
+# 所有參數一律由呼叫端明確提供；預設值只存在於 config.DEFAULT_PARAMETERS，
+# 避免兩處定義隨時間漂移。
 def _build_params(
     start_date: date,
     end_date: date,
     analysis_timeframe: str,
     lookback_bars: int,
     min_volume: int,
-    new_line_window: int = 5,
-    direction_filter: str = "全部",
-    investor_consecutive_days: int = 3,
-    foreign_buy_streak: bool = False,
-    trust_buy_streak: bool = False,
-    foreign_sell_streak: bool = False,
-    trust_sell_streak: bool = False,
+    new_line_window: int,
+    direction_filter: str,
+    investor_consecutive_days: int,
+    foreign_buy_streak: bool,
+    trust_buy_streak: bool,
+    foreign_sell_streak: bool,
+    trust_sell_streak: bool,
 ) -> dict:
     return {
         "start_date": start_date,
@@ -115,15 +123,28 @@ def _selected_investor_columns(params: dict) -> list[str]:
     ]
 
 
+# 同一根 K 棒可能同時命中兩條路徑；摘要每股只留一列時，
+# 以「突破型」優先（P1 > P2、P3 > P4），避免取決於資料排列順序。
+_SIGNAL_TYPE_PRIORITY = {
+    "P1_BreakUp_Hold": 2,
+    "P2_NewLine_Hold": 1,
+    "P3_BreakDown_Reject": 2,
+    "P4_NewLine_Reject": 1,
+}
+
+
 def _compute_latest_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
     """Latest valid signal per stock for one direction's exploded frame (§4.2)."""
     if signals_df is None or signals_df.empty:
         return pd.DataFrame(columns=LATEST_SUMMARY_COLUMNS)
 
+    ranked = signals_df.copy()
+    ranked["_priority"] = ranked["signal_type"].map(_SIGNAL_TYPE_PRIORITY).fillna(0)
     latest = (
-        signals_df.sort_values(["StockCode", "Date"])
+        ranked.sort_values(["StockCode", "Date", "_priority"])
         .groupby("StockCode", group_keys=False)
         .tail(1)
+        .drop(columns=["_priority"])
         .copy()
     )
     summary = latest.rename(
@@ -200,24 +221,21 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         return _empty_result(universe_df, messages=messages, used_auto_universe=use_auto_universe)
 
     try:
+        download_progress_callback = None
         if progress_callback is not None:
             progress_callback(0.03, "正在準備股票下載清單...")
 
             def _download_progress_callback(progress_value: float, message: str) -> None:
                 progress_callback(0.03 + min(max(progress_value, 0.0), 1.0) * 0.70, message)
 
-            daily_data, success_list, failed_list, download_errors = download_stock_data(
-                stock_codes=stock_codes,
-                start_date=params["start_date"],
-                end_date=params["end_date"],
-                progress_callback=_download_progress_callback,
-            )
-        else:
-            daily_data, success_list, failed_list, download_errors = _download_stock_data_cached(
-                stock_codes=tuple(stock_codes),
-                start_date=params["start_date"],
-                end_date=params["end_date"],
-            )
+            download_progress_callback = _download_progress_callback
+
+        daily_data, success_list, failed_list, download_errors = _download_stock_data_cached(
+            stock_codes=tuple(stock_codes),
+            start_date=params["start_date"],
+            end_date=params["end_date"],
+            _progress_callback=download_progress_callback,
+        )
     except Exception as exc:
         messages.append({"level": "error", "text": f"股票資料下載失敗：{exc}"})
         return _empty_result(universe_df, messages=messages, used_auto_universe=use_auto_universe)
@@ -244,6 +262,23 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     if progress_callback is not None:
         progress_callback(0.78, "正在整理 K 棒週期與紅黑線訊號...")
     timeframe_data = resample_ohlcv(daily_data, timeframe_code)
+
+    # 防呆：日期區間太短時（例如 30 天 × 月 K），K 棒數不足以計算回看條件，
+    # 結果必然為空。明確告知使用者是「資料不夠」而不是「市場沒訊號」。
+    if not timeframe_data.empty:
+        median_bars = int(timeframe_data.groupby("StockCode").size().median())
+        # 訊號管線需要 prev_close（少一根）加上回看範圍才有意義。
+        required_bars = min(int(params["lookback_bars"]), 5) + 1
+        if median_bars < required_bars:
+            messages.append({
+                "level": "warning",
+                "text": (
+                    f"目前日期區間在「{params['analysis_timeframe']}」下，每檔股票僅約 {median_bars} 根 K 棒，"
+                    f"不足以判斷突破與回測訊號（建議至少 {required_bars} 根）。"
+                    "若篩選結果為空，請拉長日期區間或改用較短的分析週期。"
+                ),
+            })
+
     pipeline_params = {**params, "min_volume": min_volume_shares}
     processed = run_signal_pipeline(timeframe_data, pipeline_params)
 
@@ -254,13 +289,21 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             progress_callback(0.88, "正在下載法人買賣超資料...")
         try:
             investor_flow_df = _download_investor_flow_data_cached(
-                stock_codes=tuple(sorted(success_list)),
                 end_date=params["end_date"],
                 lookback_days=max(
                     int(app_config.INVESTOR_LOOKBACK_DAYS),
                     int(params.get("investor_consecutive_days", 3)) + 10,
                 ),
             )
+            if not investor_flow_df.empty:
+                screened_base_codes = {
+                    str(code).split(".")[0].strip() for code in success_list
+                }
+                filtered_flow = investor_flow_df[
+                    investor_flow_df["BaseCode"].isin(screened_base_codes)
+                ].reset_index(drop=True)
+                filtered_flow.attrs = dict(investor_flow_df.attrs)
+                investor_flow_df = filtered_flow
         except Exception as exc:
             messages.append({"level": "warning", "text": f"法人買賣超資料下載失敗，法人條件將視為未達成：{exc}"})
             investor_flow_df = pd.DataFrame()
@@ -319,16 +362,7 @@ def _prepare_display_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame
             display_df[col] = pd.NA
     if "Timeframe" in display_df.columns:
         display_df["Timeframe"] = display_df["Timeframe"].map(TIMEFRAME_LABELS).fillna(display_df["Timeframe"])
-    selected = display_df[columns].copy()
-    # 將布林欄位（突破、回測守住、法人條件等）以中文「是／否」呈現，提升可讀性。
-    # 僅針對真正的布林值，避免誤判只含 0/1 的整數欄位。
-    for col in selected.columns:
-        non_null = selected[col].dropna()
-        if not non_null.empty and all(
-            type(value) is bool or type(value).__name__ == "bool_"
-            for value in non_null.unique()
-        ):
-            selected[col] = selected[col].map({True: "是", False: "否"})
+    selected = booleans_to_chinese(display_df[columns])
     return selected.rename(columns=DISPLAY_COLUMN_LABELS)
 
 
@@ -383,12 +417,8 @@ def _render_direction_results(
         st.plotly_chart(figure, width="stretch")
 
 
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption(f"版本 v{APP_VERSION}　更新日期：{APP_UPDATED}")
-    st.caption(APP_PURPOSE)
-
+def _render_sidebar() -> dict:
+    """Render the sidebar form and return all user inputs as one dict."""
     with st.sidebar:
         st.header("篩選設定")
 
@@ -416,8 +446,9 @@ def main():
             st.caption("資料來源：TWSE 公開 ISIN 清單（上市與上櫃普通股）")
 
         st.subheader("日期與週期")
-        start_date = st.date_input("開始日期", value=DEFAULT_PARAMETERS["start_date"])
-        end_date = st.date_input("結束日期", value=DEFAULT_PARAMETERS["end_date"])
+        default_start_date, default_end_date = app_config.default_date_range()
+        start_date = st.date_input("開始日期", value=default_start_date)
+        end_date = st.date_input("結束日期", value=default_end_date)
         analysis_timeframe = st.selectbox(
             "分析週期",
             options=list(TIMEFRAME_OPTIONS.keys()),
@@ -430,7 +461,12 @@ def main():
             min_value=0,
             value=DEFAULT_PARAMETERS["min_volume"],
             step=100,
-            help="台股 1 張 = 1000 股。設為 0 表示不篩選。",
+            help=(
+                "台股 1 張 = 1000 股。設為 0 表示不篩選。"
+                "門檻套用在「所選分析週期的單根 K 棒」成交量："
+                "日 K 比對單日量、週 K 比對一週總量、月 K 比對一月總量，"
+                "切換週期時請自行調整數值。"
+            ),
         )
         lookback_bars = st.number_input(
             "回看 K 棒數",
@@ -480,24 +516,44 @@ def main():
 
         run_screening = st.button("開始篩選", type="primary", width="stretch")
 
-    if start_date > end_date:
+    return {
+        "use_auto_universe": use_auto_universe,
+        "manual_codes": manual_codes,
+        "run_screening": run_screening,
+        "start_date": start_date,
+        "end_date": end_date,
+        "params": _build_params(
+            start_date=start_date,
+            end_date=end_date,
+            analysis_timeframe=analysis_timeframe,
+            lookback_bars=lookback_bars,
+            min_volume=min_volume,
+            new_line_window=new_line_window,
+            direction_filter=direction_filter,
+            investor_consecutive_days=investor_consecutive_days,
+            foreign_buy_streak=foreign_buy_streak,
+            trust_buy_streak=trust_buy_streak,
+            foreign_sell_streak=foreign_sell_streak,
+            trust_sell_streak=trust_sell_streak,
+        ),
+    }
+
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+    st.caption(f"版本 v{APP_VERSION}　更新日期：{APP_UPDATED}")
+    st.caption(APP_PURPOSE)
+
+    sidebar = _render_sidebar()
+    use_auto_universe = sidebar["use_auto_universe"]
+    manual_codes = sidebar["manual_codes"]
+    run_screening = sidebar["run_screening"]
+    params = sidebar["params"]
+
+    if sidebar["start_date"] > sidebar["end_date"]:
         st.error("開始日期必須早於或等於結束日期。")
         return
-
-    params = _build_params(
-        start_date=start_date,
-        end_date=end_date,
-        analysis_timeframe=analysis_timeframe,
-        lookback_bars=lookback_bars,
-        min_volume=min_volume,
-        new_line_window=new_line_window,
-        direction_filter=direction_filter,
-        investor_consecutive_days=investor_consecutive_days,
-        foreign_buy_streak=foreign_buy_streak,
-        trust_buy_streak=trust_buy_streak,
-        foreign_sell_streak=foreign_sell_streak,
-        trust_sell_streak=trust_sell_streak,
-    )
 
     if run_screening:
         if use_auto_universe:
@@ -526,6 +582,8 @@ def main():
                     progress_callback=_progress_callback,
                 )
                 st.session_state["screening_params"] = params
+                # 匯出檔以 run_id 為快取鍵：只有新一次篩選才需要重建。
+                st.session_state["screening_run_id"] = st.session_state.get("screening_run_id", 0) + 1
         except Exception as exc:
             st.error(f"篩選過程發生錯誤：{exc}")
             return
@@ -626,30 +684,53 @@ def main():
 
     st.subheader("結果下載")
     timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
-    combined_signals = pd.concat(
-        [frame for frame in (long_signals, short_signals) if not frame.empty],
-        ignore_index=True,
-    ) if (not long_signals.empty or not short_signals.empty) else pd.DataFrame()
-    display_combined = (
-        _prepare_display_frame(combined_signals, SIGNAL_COLUMNS) if not combined_signals.empty else pd.DataFrame()
-    )
-    csv_bytes = display_combined.to_csv(index=False).encode("utf-8-sig") if not display_combined.empty else b""
 
-    excel_bytes = b""
-    excel_error = None
-    try:
-        excel_bytes = create_excel_bytes(
-            all_data=all_data,
-            long_signals=long_signals,
-            short_signals=short_signals,
-            latest_summary_long=latest_summary_long,
-            latest_summary_short=latest_summary_short,
-            failed_list=failed_list,
-            params=saved_params,
-            download_notes=results.get("download_errors", []),
+    # 匯出內容只在新一次篩選後改變；以 run_id 快取，避免每次 UI 互動
+    # （例如切換 K 線圖股票）都對全量資料重建 Excel。
+    run_id = st.session_state.get("screening_run_id", 0)
+    export_cache = st.session_state.get("export_cache")
+    if export_cache is None or export_cache.get("run_id") != run_id:
+        combined_signals = pd.concat(
+            [frame for frame in (long_signals, short_signals) if not frame.empty],
+            ignore_index=True,
+        ) if (not long_signals.empty or not short_signals.empty) else pd.DataFrame()
+        display_combined = (
+            _prepare_display_frame(combined_signals, SIGNAL_COLUMNS) if not combined_signals.empty else pd.DataFrame()
         )
-    except Exception as exc:
-        excel_error = f"建立 Excel 匯出檔時發生錯誤：{exc}"
+        csv_bytes = (
+            sanitize_for_spreadsheet(display_combined).to_csv(index=False).encode("utf-8-sig")
+            if not display_combined.empty
+            else b""
+        )
+
+        excel_bytes = b""
+        excel_error = None
+        try:
+            excel_bytes = create_excel_bytes(
+                all_data=all_data,
+                long_signals=long_signals,
+                short_signals=short_signals,
+                latest_summary_long=latest_summary_long,
+                latest_summary_short=latest_summary_short,
+                failed_list=failed_list,
+                params=saved_params,
+                download_notes=results.get("download_errors", []),
+            )
+        except Exception as exc:
+            excel_error = f"建立 Excel 匯出檔時發生錯誤：{exc}"
+
+        export_cache = {
+            "run_id": run_id,
+            "csv_bytes": csv_bytes,
+            "csv_empty": display_combined.empty,
+            "excel_bytes": excel_bytes,
+            "excel_error": excel_error,
+        }
+        st.session_state["export_cache"] = export_cache
+
+    csv_bytes = export_cache["csv_bytes"]
+    excel_bytes = export_cache["excel_bytes"]
+    excel_error = export_cache["excel_error"]
 
     if excel_error:
         st.error(excel_error)
@@ -660,7 +741,7 @@ def main():
         data=csv_bytes,
         file_name=f"signals_{timeframe_code}.csv",
         mime="text/csv",
-        disabled=display_combined.empty,
+        disabled=bool(export_cache["csv_empty"]),
         width="stretch",
     )
     download_col2.download_button(

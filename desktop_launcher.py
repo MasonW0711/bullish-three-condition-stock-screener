@@ -150,13 +150,19 @@ def main() -> None:
         app_path = resolve_app_path()
         flag_options = _build_streamlit_flags(host, port)
         bootstrap.load_config_options(flag_options)
-        original_on_server_start = bootstrap._on_server_start
 
-        def _patched_on_server_start(server) -> None:
-            original_on_server_start(server)
-            _start_idle_shutdown_monitor(server, idle_timeout_seconds)
+        # _on_server_start 是 Streamlit 私有 API（閒置自動關閉的掛載點）。
+        # 若未來版本移除該屬性，改為「沒有閒置自動關閉」繼續啟動，
+        # 而不是讓整個桌面應用程式無法開啟。
+        original_on_server_start = getattr(bootstrap, "_on_server_start", None)
+        if callable(original_on_server_start):
 
-        bootstrap._on_server_start = _patched_on_server_start
+            def _patched_on_server_start(server) -> None:
+                original_on_server_start(server)
+                _start_idle_shutdown_monitor(server, idle_timeout_seconds)
+
+            bootstrap._on_server_start = _patched_on_server_start
+
         try:
             bootstrap.run(
                 str(app_path),
@@ -165,7 +171,8 @@ def main() -> None:
                 flag_options=flag_options,
             )
         finally:
-            bootstrap._on_server_start = original_on_server_start
+            if callable(original_on_server_start):
+                bootstrap._on_server_start = original_on_server_start
     except Exception:
         log_path = _write_error_log(traceback.format_exc())
         _show_error_dialog(f"應用程式啟動失敗，詳細錯誤已寫入：\n{log_path}")

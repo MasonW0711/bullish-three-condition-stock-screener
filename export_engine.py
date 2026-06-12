@@ -12,25 +12,25 @@ from config import (
     EXCEL_SHEET_LABELS,
     TIMEFRAME_LABELS,
 )
+from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
+
+# Excel（openpyxl）單一工作表上限為 1,048,576 列；超過會直接寫入失敗。
+# 留一點餘裕並截斷，同時在診斷訊息中明確告知，不做無聲截斷。
+EXCEL_MAX_ROWS_PER_SHEET = 1_000_000
 
 
 def _localize_frame(df: pd.DataFrame) -> pd.DataFrame:
     """以中文呈現匯出資料：週期名稱、布林值（是／否）與欄位標題。
 
     未列於 DISPLAY_COLUMN_LABELS 的技術欄位會保留原欄名。
+    字串儲存格會先做公式注入消毒再寫入活頁簿。
     """
     if df is None or df.empty:
         return pd.DataFrame()
     frame = df.copy()
     if "Timeframe" in frame.columns:
         frame["Timeframe"] = frame["Timeframe"].map(TIMEFRAME_LABELS).fillna(frame["Timeframe"])
-    for col in frame.columns:
-        non_null = frame[col].dropna()
-        if not non_null.empty and all(
-            type(value) is bool or type(value).__name__ == "bool_"
-            for value in non_null.unique()
-        ):
-            frame[col] = frame[col].map({True: "是", False: "否"})
+    frame = sanitize_for_spreadsheet(booleans_to_chinese(frame))
     return frame.rename(columns=DISPLAY_COLUMN_LABELS)
 
 
@@ -99,13 +99,35 @@ def create_excel_bytes(
         }
     )
 
+    notes = list(download_notes or [])
+
+    def _truncate_for_excel(df: pd.DataFrame, sheet_key: str) -> pd.DataFrame:
+        if df is None or len(df) <= EXCEL_MAX_ROWS_PER_SHEET:
+            return df
+        sheet_label = EXCEL_SHEET_LABELS.get(sheet_key, sheet_key)
+        notes.append(
+            f"「{sheet_label}」資料共 {len(df)} 列，超過 Excel 工作表上限，"
+            f"僅保留日期較新的 {EXCEL_MAX_ROWS_PER_SHEET} 列。完整資料請改用 CSV 或縮短日期區間。"
+        )
+        if "Date" in df.columns:
+            # 保留最新日期的列，再還原原本的排序。
+            return df.sort_values("Date").tail(EXCEL_MAX_ROWS_PER_SHEET).sort_index().reset_index(drop=True)
+        return df.tail(EXCEL_MAX_ROWS_PER_SHEET).reset_index(drop=True)
+
+    data_frames = {
+        sheet_key: _localize_frame(_truncate_for_excel(frame, sheet_key))
+        for sheet_key, frame in (
+            ("All_Data", all_data),
+            ("Long_Signals", long_signals),
+            ("Short_Signals", short_signals),
+            ("Latest_Summary_Long", latest_summary_long),
+            ("Latest_Summary_Short", latest_summary_short),
+        )
+    }
+
     workbook_frames = {
-        "All_Data": _localize_frame(all_data),
-        "Long_Signals": _localize_frame(long_signals),
-        "Short_Signals": _localize_frame(short_signals),
-        "Latest_Summary_Long": _localize_frame(latest_summary_long),
-        "Latest_Summary_Short": _localize_frame(latest_summary_short),
-        "Failed_Downloads": _failed_downloads_frame(failed_list, download_notes or []),
+        **data_frames,
+        "Failed_Downloads": _failed_downloads_frame(failed_list, notes),
         "Parameter_Settings": parameter_sheet,
     }
 
