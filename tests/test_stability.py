@@ -11,14 +11,18 @@ with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO
 from config import LATEST_SUMMARY_COLUMNS
 from data_loader import (
     _download_candidate,
+    _fetch_twse_investor_flow,
+    _locate_investor_net_columns,
     _select_isin_table,
     _to_int,
+    _validate_tpex_net_columns,
     download_investor_flow_data,
     download_stock_data,
     load_stock_list_from_upload,
     normalize_yfinance_data,
     resample_ohlcv,
 )
+from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
 from signal_engine import (
     attach_investor_flow_flags,
     build_direction_signals,
@@ -221,8 +225,11 @@ class StabilityTests(unittest.TestCase):
     def test_investor_integer_parser_tolerates_public_data_placeholders(self):
         self.assertEqual(_to_int("1,234"), 1234)
         self.assertEqual(_to_int("(1,234)"), -1234)
+        # Dash placeholders genuinely mean "no value reported" -> 0.
         self.assertEqual(_to_int("--"), 0)
-        self.assertEqual(_to_int("not-a-number"), 0)
+        # Unparseable garbage is a data anomaly -> None (logged upstream),
+        # not a silent zero that would break consecutive-day streaks.
+        self.assertIsNone(_to_int("not-a-number"))
 
     def test_bare_otc_code_falls_back_without_failed_result(self):
         fallback_raw = pd.DataFrame(
@@ -260,10 +267,53 @@ class StabilityTests(unittest.TestCase):
 
         self.assertEqual(result, ["2330.TW", "2317.TW"])
 
+    def test_sanitize_for_spreadsheet_escapes_formula_prefixes(self):
+        frame = pd.DataFrame(
+            {
+                "StockCode": ["=cmd|' /C calc'!A0", "2330.TW", "@SUM(1,2)"],
+                "Close": [100.5, 200.0, 300.0],
+            }
+        )
+
+        result = sanitize_for_spreadsheet(frame)
+
+        self.assertEqual(result.loc[0, "StockCode"], "'=cmd|' /C calc'!A0")
+        self.assertEqual(result.loc[1, "StockCode"], "2330.TW")
+        self.assertEqual(result.loc[2, "StockCode"], "'@SUM(1,2)")
+        # Numeric columns are untouched.
+        self.assertEqual(result.loc[0, "Close"], 100.5)
+
+    def test_booleans_to_chinese_skips_integer_columns(self):
+        frame = pd.DataFrame({"flag": [True, False], "count": [0, 1]})
+
+        result = booleans_to_chinese(frame)
+
+        self.assertEqual(result["flag"].tolist(), ["是", "否"])
+        self.assertEqual(result["count"].tolist(), [0, 1])
+
     def test_empty_latest_summary_keeps_export_schema(self):
         latest_summary = _compute_latest_summary(pd.DataFrame())
 
         self.assertEqual(latest_summary.columns.tolist(), LATEST_SUMMARY_COLUMNS)
+
+    def test_latest_summary_prefers_breakout_path_on_same_bar(self):
+        # Same stock, same date, two long paths: P1 must win regardless of
+        # the row order produced by the explode step.
+        signals = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-05", "2026-05-05"]),
+                "StockCode": ["2330.TW", "2330.TW"],
+                "signal_type": ["P2_NewLine_Hold", "P1_BreakUp_Hold"],
+                "direction": ["Long", "Long"],
+                "retest_line_type": ["Red Line", "Black Line"],
+                "retest_line_price": [100.0, 99.0],
+            }
+        )
+
+        summary = _compute_latest_summary(signals)
+
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary.loc[0, "SignalType"], "P1_BreakUp_Hold")
 
     def test_normalize_yfinance_data_tolerates_unexpected_shape(self):
         # yfinance schema drift must not raise; it should yield an empty frame.
@@ -297,6 +347,104 @@ class StabilityTests(unittest.TestCase):
         self.assertEqual(
             result.attrs.get("fetch_failures"), result.attrs.get("fetch_attempts")
         )
+
+    def test_investor_net_columns_located_by_field_name_not_position(self):
+        # An inserted column must not shift which values are read.
+        fields = [
+            "證券代號",
+            "證券名稱",
+            "新插入的欄位",
+            "外陸資買進股數(不含外資自營商)",
+            "外陸資賣出股數(不含外資自營商)",
+            "外陸資買賣超股數(不含外資自營商)",
+            "外資自營商買進股數",
+            "外資自營商賣出股數",
+            "外資自營商買賣超股數",
+            "投信買進股數",
+            "投信賣出股數",
+            "投信買賣超股數",
+        ]
+
+        foreign_index, trust_index = _locate_investor_net_columns(fields)
+
+        self.assertEqual(fields[foreign_index], "外陸資買賣超股數(不含外資自營商)")
+        self.assertEqual(fields[trust_index], "投信買賣超股數")
+
+    def test_investor_net_columns_missing_raises_clear_error(self):
+        # If the source renames the columns beyond recognition the fetch must
+        # fail loudly (counted as fetch failure) instead of reading index 4.
+        fields = ["證券代號", "證券名稱", "改名後的欄位A", "改名後的欄位B"]
+
+        with self.assertRaisesRegex(ValueError, "無法定位外資／投信買賣超欄位"):
+            _locate_investor_net_columns(fields)
+
+    def test_twse_investor_flow_reads_columns_named_in_payload(self):
+        payload = {
+            "stat": "OK",
+            "fields": [
+                "證券代號",
+                "證券名稱",
+                "外陸資買進股數(不含外資自營商)",
+                "外陸資賣出股數(不含外資自營商)",
+                "外資自營商買賣超股數",
+                "外陸資買賣超股數(不含外資自營商)",
+                "投信買進股數",
+                "投信賣出股數",
+                "投信買賣超股數",
+                "自營商買賣超股數",
+                "三大法人買賣超股數",
+            ],
+            "data": [
+                ["2330", "台積電", "100", "50", "999", "1,234", "30", "10", "(20)", "0", "0"],
+            ],
+        }
+
+        class _StubResponse:
+            def json(self):
+                return payload
+
+        with patch("data_loader._get_with_ssl_fallback", return_value=_StubResponse()):
+            result = _fetch_twse_investor_flow(pd.Timestamp("2026-05-05"))
+
+        # foreign_net comes from the named column (index 5), not legacy index 4.
+        self.assertEqual(result.loc[0, "foreign_net"], 1234)
+        self.assertEqual(result.loc[0, "trust_net"], -20)
+
+    @staticmethod
+    def _tpex_generic_fields() -> list:
+        return (
+            ["代號", "名稱"]
+            + ["買進股數", "賣出股數", "買賣超股數"] * 7
+            + ["三大法人買賣超股數合計"]
+        )
+
+    def test_tpex_generic_layout_validates_and_returns_known_indexes(self):
+        fields = self._tpex_generic_fields()
+        # foreign excl dealer net = 100-40=60 (col 4); trust net = 30-10=20 (col 13).
+        row = ["5483", "中美晶", "100", "40", "60", "0", "0", "0", "100", "40", "60",
+               "30", "10", "20", "0", "0", "0", "5", "1", "4", "5", "1", "4", "84"]
+        frame = pd.DataFrame([row])
+
+        foreign_index, trust_index = _validate_tpex_net_columns(fields, frame)
+
+        self.assertEqual((foreign_index, trust_index), (4, 13))
+
+    def test_tpex_shifted_columns_fail_arithmetic_validation(self):
+        fields = self._tpex_generic_fields()
+        # Shift values by one column: net != buy - sell everywhere.
+        row = ["5483", "中美晶", "999", "100", "40", "60", "0", "0", "0", "100", "40",
+               "60", "30", "10", "20", "0", "0", "0", "5", "1", "4", "5", "1", "84"]
+        frame = pd.DataFrame([row])
+
+        with self.assertRaisesRegex(ValueError, "買賣超＝買進－賣出"):
+            _validate_tpex_net_columns(fields, frame)
+
+    def test_tpex_unexpected_field_count_raises(self):
+        fields = self._tpex_generic_fields() + ["新增欄位"]
+        frame = pd.DataFrame([["5483"] + ["0"] * 24])
+
+        with self.assertRaisesRegex(ValueError, "欄位數改變"):
+            _validate_tpex_net_columns(fields, frame)
 
     def test_attach_investor_flags_degrade_when_merge_fails(self):
         bars = pd.DataFrame(

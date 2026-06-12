@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "2.0.0"
-APP_UPDATED = "2026-06-07"
+APP_VERSION = "2.1.0"
+APP_UPDATED = "2026-06-12"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (
@@ -45,10 +45,19 @@ TIMEFRAME_LABELS = {code: label for label, code in TIMEFRAME_OPTIONS.items()}
 # Direction routing (v2). The values double as the direction_filter选项 shown in the UI.
 DIRECTION_FILTER_OPTIONS = ["全部", "做多", "做空"]
 
+# 預設只抓最近一個月，避免全市場 × 長區間下載在雲端逾時。
+# 注意：日期必須在每次 rerun 時求值（見 default_date_range()），不能在模組
+# import 時固定，否則長駐的 Streamlit 行程會讓預設結束日期停在啟動當天。
+DEFAULT_DATE_SPAN_DAYS = 30
+
+
+def default_date_range() -> tuple[date, date]:
+    """Return today's default (start_date, end_date), evaluated at call time."""
+    today = date.today()
+    return today - timedelta(days=DEFAULT_DATE_SPAN_DAYS), today
+
+
 DEFAULT_PARAMETERS = {
-    # 預設只抓最近一個月，避免全市場 × 長區間下載在雲端逾時。
-    "start_date": date.today() - timedelta(days=30),
-    "end_date": date.today(),
     "analysis_timeframe": "Daily K",
     "lookback_bars": 10,
     # UI uses lots (張); internal calculations convert to shares.
