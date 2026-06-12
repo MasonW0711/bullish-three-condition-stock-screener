@@ -295,6 +295,44 @@ def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> 
     return output
 
 
+def _compute_investor_streak_flags(
+    investor: pd.DataFrame, consecutive_days: int, flag_columns: list[str]
+) -> pd.DataFrame:
+    """Compute N-consecutive-day buy/sell streak flags per stock.
+
+    The streak must run over *consecutive trading days*. The market-wide set of
+    observed dates is used as the trading calendar: each stock is reindexed onto
+    it so a day where this stock has no row — no institutional activity, or a
+    failed fetch — becomes a NaN that breaks the streak, instead of being
+    silently bridged. Genuine market holidays never appear in this calendar (no
+    stock has them), so they cannot cause a spurious break.
+    """
+    trading_days = pd.DatetimeIndex(sorted(pd.to_datetime(investor["Date"].unique())))
+
+    def _streaks_for_one(group: pd.DataFrame) -> pd.DataFrame:
+        reindexed = group.set_index("Date").reindex(trading_days)
+        foreign = reindexed["foreign_net"]
+        trust = reindexed["trust_net"]
+
+        def _streak(series: pd.Series, positive: bool) -> pd.Series:
+            hit = series.gt(0) if positive else series.lt(0)  # NaN → False, breaks the run
+            return hit.rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
+
+        flags = pd.DataFrame(index=trading_days)
+        flags["foreign_buy_streak_ok"] = _streak(foreign, True)
+        flags["foreign_sell_streak_ok"] = _streak(foreign, False)
+        flags["trust_buy_streak_ok"] = _streak(trust, True)
+        flags["trust_sell_streak_ok"] = _streak(trust, False)
+        flags["BaseCode"] = group["BaseCode"].iloc[0]
+        return flags.reset_index(names="Date")
+
+    frames = [_streaks_for_one(group) for _, group in investor.groupby("BaseCode", sort=False)]
+    combined = pd.concat(frames, ignore_index=True)
+    for col in flag_columns:
+        combined[col] = combined[col].fillna(False).astype(bool)
+    return combined[["Date", "BaseCode", *flag_columns]]
+
+
 def attach_investor_flow_flags(
     df: pd.DataFrame,
     investor_flow_df: pd.DataFrame,
@@ -324,69 +362,44 @@ def attach_investor_flow_flags(
         logger.warning("法人買賣超資料含 %d 筆無法解析的數值，相關日期的法人條件以未達成處理。", anomaly_count)
     investor["foreign_net"] = investor["foreign_net"].fillna(0)
     investor["trust_net"] = investor["trust_net"].fillna(0)
-    investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
+    investor = (
+        investor.dropna(subset=["Date"])
+        .drop_duplicates(subset=["BaseCode", "Date"], keep="last")
+        .sort_values(["BaseCode", "Date"])
+        .reset_index(drop=True)
+    )
+    if investor.empty:
+        for col in flag_columns:
+            output[col] = False
+        return output
 
-    investor["foreign_buy_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
-        lambda x: x.gt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
-    investor["foreign_sell_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
-        lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
-    investor["trust_buy_streak_ok"] = investor.groupby("BaseCode")["trust_net"].transform(
-        lambda x: x.gt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
-    investor["trust_sell_streak_ok"] = investor.groupby("BaseCode")["trust_net"].transform(
-        lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
+    investor_flags = _compute_investor_streak_flags(investor, consecutive_days, flag_columns)
 
-    # 先把法人表按 BaseCode 分組建索引，避免之後逐檔股票全表掃描
-    # （全市場 1800 檔時是 O(檔數 × 法人列數) 的劣化點）。
-    investor_groups: dict[str, pd.DataFrame] = {
-        str(key).strip(): group for key, group in investor.groupby("BaseCode", sort=False)
-    }
+    # 法人資料只到最後一個可得交易日；其後的 K 棒（merge_asof backward 會把
+    # 最後一筆旗標往後帶）狀態其實未知，保守視為未達成。
+    last_flow_date = investor_flags["Date"].max()
 
-    merged_groups: list[pd.DataFrame] = []
-    for base_code, stock_df in output.sort_values(["BaseCode", "Date"]).groupby("BaseCode", sort=False):
-        flow_group = investor_groups.get(str(base_code).strip())
-        flow_df = (
-            flow_group[["Date", *flag_columns]]
-            .drop_duplicates(subset=["Date"], keep="last")
-            .sort_values("Date")
-            .reset_index(drop=True)
-            if flow_group is not None
-            else pd.DataFrame(columns=["Date", *flag_columns])
+    try:
+        merged = pd.merge_asof(
+            output.sort_values("Date"),
+            investor_flags.sort_values("Date"),
+            on="Date",
+            by="BaseCode",
+            direction="backward",
         )
-        if flow_df.empty:
-            stock_output = stock_df.copy()
-            for col in flag_columns:
-                stock_output[col] = False
-        else:
-            try:
-                stock_output = (
-                    stock_df.drop(columns=[col for col in flag_columns if col in stock_df.columns])
-                    .sort_values("Date")
-                    .reset_index(drop=True)
-                )
-                last_flow_date = flow_df["Date"].max()
-                stock_output = pd.merge_asof(stock_output, flow_df, on="Date", direction="backward")
-                future_mask = stock_output["Date"] > last_flow_date
-                for col in flag_columns:
-                    stock_output[col] = pd.array(stock_output[col], dtype="boolean").fillna(False).astype(bool)
-                    if future_mask.any():
-                        stock_output.loc[future_mask, col] = False
-            except Exception as exc:
-                # merge_asof can raise on pandas version / dtype edge cases.
-                # Degrade this stock's investor flags to False instead of
-                # aborting the whole screening run — but never silently.
-                logger.warning("法人旗標合併失敗，%s 的法人條件降級為未達成：%s", base_code, exc)
-                stock_output = stock_df.copy()
-                for col in flag_columns:
-                    stock_output[col] = False
-        merged_groups.append(stock_output)
+        future_mask = merged["Date"] > last_flow_date
+        for col in flag_columns:
+            merged[col] = pd.array(merged[col], dtype="boolean").fillna(False).astype(bool)
+            if future_mask.any():
+                merged.loc[future_mask, col] = False
+    except Exception as exc:
+        # merge_asof can raise on pandas version / dtype edge cases. Degrade all
+        # investor flags to False instead of aborting the run — but never silently.
+        logger.warning("法人旗標合併失敗，全部法人條件降級為未達成：%s", exc)
+        merged = output.copy()
+        for col in flag_columns:
+            merged[col] = False
 
-    merged = pd.concat(merged_groups, ignore_index=True)
-    for col in flag_columns:
-        merged[col] = pd.array(merged[col], dtype="boolean").fillna(False).astype(bool)
     return merged.sort_values(["StockCode", "Date"]).reset_index(drop=True)
 
 

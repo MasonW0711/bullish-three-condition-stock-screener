@@ -1,5 +1,6 @@
 import contextlib
 import unittest
+from datetime import date, timedelta
 from io import BytesIO
 from io import StringIO
 from unittest.mock import patch
@@ -7,8 +8,8 @@ from unittest.mock import patch
 import pandas as pd
 
 with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
-    from app import _compute_latest_summary
-from config import LATEST_SUMMARY_COLUMNS
+    from app import _compute_latest_summary, _validate_date_span
+from config import LATEST_SUMMARY_COLUMNS, MAX_AUTO_UNIVERSE_DATE_SPAN_DAYS
 from data_loader import (
     _download_candidate,
     _fetch_twse_investor_flow,
@@ -97,6 +98,52 @@ class StabilityTests(unittest.TestCase):
 
         self.assertTrue(result.loc[0, "foreign_buy_streak_ok"])
         self.assertTrue(result.loc[0, "trust_buy_streak_ok"])
+
+    def test_investor_streak_breaks_on_missing_trading_day(self):
+        # 2330 缺了 05-06（抓取失敗），但 05-06 在全市場日曆中（2317 有）。
+        # 連續 3 日買超不應跨過這個缺口湊成立。
+        bars = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-07", "2026-05-07"]),
+                "StockCode": ["2330.TW", "2317.TW"],
+                "Open": [100, 50],
+                "High": [101, 51],
+                "Low": [99, 49],
+                "Close": [100, 50],
+                "Volume": [1000, 1000],
+            }
+        )
+        flow = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-04", "2026-05-05", "2026-05-07"]  # 2330：缺 05-06
+                    + ["2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]  # 2317：完整
+                ),
+                "BaseCode": ["2330"] * 3 + ["2317"] * 4,
+                "foreign_net": [1, 1, 1] + [1, 1, 1, 1],
+                "trust_net": [1, 1, 1] + [1, 1, 1, 1],
+            }
+        )
+
+        result = attach_investor_flow_flags(bars, flow, consecutive_days=3)
+        by_code = result.set_index("StockCode")
+
+        # 2330 有缺口 → 連續中斷；2317 完整 → 成立。
+        self.assertFalse(bool(by_code.loc["2330.TW", "foreign_buy_streak_ok"]))
+        self.assertTrue(bool(by_code.loc["2317.TW", "foreign_buy_streak_ok"]))
+
+    def test_validate_date_span_rejects_inverted_range(self):
+        msg = _validate_date_span(date(2026, 6, 10), date(2026, 6, 1), use_auto_universe=True)
+        self.assertIsNotNone(msg)
+        self.assertIn("開始日期", msg)
+
+    def test_validate_date_span_caps_auto_universe_only(self):
+        start = date(2026, 1, 1)
+        end = start + timedelta(days=MAX_AUTO_UNIVERSE_DATE_SPAN_DAYS + 1)
+        # 自動全市場模式超過上限應擋下。
+        self.assertIsNotNone(_validate_date_span(start, end, use_auto_universe=True))
+        # 手動少量股票模式不受上限限制。
+        self.assertIsNone(_validate_date_span(start, end, use_auto_universe=False))
 
     def test_investor_flags_stop_after_last_available_flow_date(self):
         bars = pd.DataFrame(

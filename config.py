@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 APP_UPDATED = "2026-06-12"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
@@ -52,6 +52,11 @@ DIRECTION_FILTER_OPTIONS = ["全部", "做多", "做空"]
 # 注意：日期必須在每次 rerun 時求值（見 default_date_range()），不能在模組
 # import 時固定，否則長駐的 Streamlit 行程會讓預設結束日期停在啟動當天。
 DEFAULT_DATE_SPAN_DAYS = 30
+
+# 自動全市場模式下的日期區間上限：全市場約 1900 檔 × 長區間會讓 yfinance
+# 分多批下載並產生數十萬列，在雲端容易逾時或記憶體不足。手動少量股票
+# 模式不受此限（清單小，長區間無妨）。
+MAX_AUTO_UNIVERSE_DATE_SPAN_DAYS = 180
 
 
 def default_date_range() -> tuple[date, date]:

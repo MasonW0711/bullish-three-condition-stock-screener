@@ -11,7 +11,8 @@ _BLACK_LINE_COLOR = "#16a34a"
 
 _LINE_STYLES = [
     ("red_line", "#dc2626", "紅線"),
-    ("black_line", _BLACK_LINE_COLOR, "黑線"),
+    # 圖例標註「（綠）」避免「黑線」術語與實際綠色線條造成誤解。
+    ("black_line", _BLACK_LINE_COLOR, "黑線（綠）"),
 ]
 
 _MARKER_STYLES = [

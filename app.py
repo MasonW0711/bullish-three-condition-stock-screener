@@ -110,6 +110,25 @@ def _build_params(
     }
 
 
+def _validate_date_span(start_date: date, end_date: date, use_auto_universe: bool) -> str | None:
+    """Return an error message if the requested span is unworkable, else None.
+
+    Auto whole-market mode caps the span (≈1900 stocks × long range overruns the
+    cloud runtime); manual small lists are unbounded. Pure function so the guard
+    is unit-testable without Streamlit.
+    """
+    if start_date > end_date:
+        return "開始日期必須早於或等於結束日期。"
+    span_days = (end_date - start_date).days
+    limit = app_config.MAX_AUTO_UNIVERSE_DATE_SPAN_DAYS
+    if use_auto_universe and span_days > limit:
+        return (
+            f"自動全市場模式下，日期區間請勿超過 {limit} 天（目前 {span_days} 天），"
+            "以免雲端下載逾時。請縮短日期區間，或改用手動股票清單。"
+        )
+    return None
+
+
 def _selected_investor_columns(params: dict) -> list[str]:
     return [
         col
@@ -551,8 +570,11 @@ def main():
     run_screening = sidebar["run_screening"]
     params = sidebar["params"]
 
-    if sidebar["start_date"] > sidebar["end_date"]:
-        st.error("開始日期必須早於或等於結束日期。")
+    date_span_error = _validate_date_span(
+        sidebar["start_date"], sidebar["end_date"], use_auto_universe
+    )
+    if date_span_error:
+        st.error(date_span_error)
         return
 
     if run_screening:
