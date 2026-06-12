@@ -13,12 +13,14 @@ from data_loader import (
     _download_candidate,
     _fetch_twse_investor_flow,
     _locate_investor_net_columns,
+    _parse_openapi_companies,
     _select_isin_table,
     _to_int,
     _validate_tpex_net_columns,
     download_investor_flow_data,
     download_stock_data,
     load_stock_list_from_upload,
+    load_taiwan_stock_universe,
     normalize_yfinance_data,
     resample_ohlcv,
 )
@@ -197,6 +199,64 @@ class StabilityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "公開股票清單表格格式異常"):
             _select_isin_table([bad_table])
+
+    def test_openapi_parser_handles_twse_and_tpex_layouts(self):
+        twse_payload = [
+            {"公司代號": "2330", "公司簡稱": "台積電", "產業別": "24"},
+            {"公司代號": "9104", "公司簡稱": "某TDR"},  # TDR 應排除
+            {"公司代號": "ABC", "公司簡稱": "非股票"},  # 非 4 位數代號應排除
+        ]
+        tpex_payload = [
+            {"SecuritiesCompanyCode": "5483", "CompanyAbbreviation": "中美晶"},
+        ]
+
+        twse_df = _parse_openapi_companies(twse_payload, ".TW", "上市", "公司代號", "公司簡稱")
+        tpex_df = _parse_openapi_companies(
+            tpex_payload, ".TWO", "上櫃", "SecuritiesCompanyCode", "CompanyAbbreviation"
+        )
+
+        self.assertEqual(twse_df["StockCode"].tolist(), ["2330.TW"])
+        self.assertEqual(twse_df.loc[0, "StockName"], "台積電")
+        self.assertEqual(tpex_df["StockCode"].tolist(), ["5483.TWO"])
+
+    def test_openapi_parser_rejects_unknown_layout(self):
+        with self.assertRaisesRegex(ValueError, "格式異常"):
+            _parse_openapi_companies(
+                [{"unexpected": "layout"}], ".TW", "上市", "公司代號", "公司簡稱"
+            )
+
+    def test_universe_falls_back_to_openapi_when_isin_blocked(self):
+        class _StubJsonResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        twse_payload = [{"公司代號": "2330", "公司簡稱": "台積電"}]
+        tpex_payload = [{"SecuritiesCompanyCode": "5483", "CompanyAbbreviation": "中美晶"}]
+
+        with patch(
+            "data_loader._fetch_isin_universe",
+            side_effect=ValueError("公開股票清單來源未返回任何表格。"),
+        ), patch(
+            "data_loader._get_with_ssl_fallback",
+            side_effect=[_StubJsonResponse(twse_payload), _StubJsonResponse(tpex_payload)],
+        ):
+            universe = load_taiwan_stock_universe()
+
+        self.assertEqual(sorted(universe["StockCode"]), ["2330.TW", "5483.TWO"])
+        self.assertEqual(sorted(universe["MarketLabel"].unique()), ["上市", "上櫃"])
+
+    def test_universe_error_reports_both_sources_when_fallback_fails(self):
+        with patch(
+            "data_loader._fetch_isin_universe", side_effect=ValueError("主來源被擋")
+        ), patch(
+            "data_loader._get_with_ssl_fallback",
+            side_effect=ValueError("備援也失敗"),
+        ):
+            with self.assertRaisesRegex(ValueError, "主來源.*備援"):
+                load_taiwan_stock_universe()
 
     def test_yfinance_multiindex_normalization_yields_ohlcv_columns(self):
         raw = pd.DataFrame(

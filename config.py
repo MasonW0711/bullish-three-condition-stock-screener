@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 APP_UPDATED = "2026-06-12"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
@@ -25,6 +25,9 @@ DEFAULT_TEXT_STOCK_LIST = "\n".join(DEFAULT_STOCK_LIST)
 
 TWSE_LISTED_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
 TWSE_OTC_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
+# ISIN 頁面在雲端 IP 偶爾被擋（回 200 但無表格），改用官方 OpenAPI 公司基本資料當備援。
+TWSE_OPENAPI_LISTED_COMPANY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_OPENAPI_OTC_COMPANY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 TAIWAN_COMMON_STOCK_CFICODE = "ESVUFR"
 YFINANCE_BATCH_SIZE = 75
 INVESTOR_LOOKBACK_DAYS = 20

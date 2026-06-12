@@ -22,7 +22,9 @@ from config import (
     REQUEST_TIMEOUT,
     REQUIRED_OHLCV_COLUMNS,
     TAIWAN_COMMON_STOCK_CFICODE,
+    TPEX_OPENAPI_OTC_COMPANY_URL,
     TWSE_LISTED_ISIN_URL,
+    TWSE_OPENAPI_LISTED_COMPANY_URL,
     TWSE_OTC_ISIN_URL,
     YFINANCE_BATCH_SIZE,
 )
@@ -149,7 +151,13 @@ def _fetch_isin_universe(url: str, suffix: str, market_label: str) -> pd.DataFra
         except Exception:
             continue
     if not tables:
-        raise ValueError("公開股票清單來源未返回任何表格。")
+        # 來源被擋（如 WAF 對雲端 IP 回擋頁）時仍是 HTTP 200，必須帶回應內容
+        # 線索，否則只看「未返回任何表格」無從判斷是格式變更還是被擋。
+        snippet = " ".join(response.text[:120].split())
+        raise ValueError(
+            f"公開股票清單來源未返回任何表格"
+            f"（HTTP {response.status_code}，回應 {len(response.text)} 字元，開頭：{snippet!r}）。"
+        )
 
     raw_df = _select_isin_table(tables)
     if raw_df.shape[1] != 7:
@@ -172,10 +180,82 @@ def _fetch_isin_universe(url: str, suffix: str, market_label: str) -> pd.DataFra
     )
 
 
+def _parse_openapi_companies(
+    payload: object, suffix: str, market_label: str, code_key: str, name_key: str
+) -> pd.DataFrame:
+    """Normalize a TWSE/TPEX OpenAPI company-list payload to the universe schema.
+
+    TWSE（t187ap03_L）使用中文欄名（公司代號／公司簡稱），TPEX（mopsfin_t187ap03_O）
+    使用英文欄名（SecuritiesCompanyCode／CompanyAbbreviation），故欄名由呼叫端指定。
+    """
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"{market_label}備援清單（OpenAPI）未返回任何資料。")
+
+    rows: list[dict] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        base_code = str(item.get(code_key) or "").strip()
+        stock_name = str(item.get(name_key) or "").strip()
+        if not re.fullmatch(r"\d{4}", base_code) or not stock_name:
+            continue
+        # 91xx 為台灣存託憑證（TDR），主來源以 CFICode=ESVUFR 過濾普通股時不含
+        # TDR，備援來源也比照排除，避免兩來源回傳的股票池不一致。
+        if base_code.startswith("91"):
+            continue
+        rows.append(
+            {
+                "StockCode": base_code + suffix,
+                "BaseCode": base_code,
+                "StockName": stock_name,
+                "MarketLabel": market_label,
+                "Industry": "未分類",
+            }
+        )
+
+    if not rows:
+        raise ValueError(f"{market_label}備援清單（OpenAPI）格式異常：找不到欄位 {code_key}／{name_key}。")
+    return pd.DataFrame(rows).drop_duplicates(subset=["StockCode"])
+
+
+def _fetch_openapi_universe(url: str, suffix: str, market_label: str, code_key: str, name_key: str) -> pd.DataFrame:
+    """Fetch one market's company list from the official open-data API."""
+    try:
+        response = _get_with_ssl_fallback(url)
+    except requests.RequestException as exc:
+        raise ValueError(f"{market_label}備援清單（OpenAPI）下載失敗：{exc}") from exc
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError(f"{market_label}備援清單（OpenAPI）返回非 JSON 內容。") from exc
+    return _parse_openapi_companies(payload, suffix, market_label, code_key, name_key)
+
+
 def load_taiwan_stock_universe() -> pd.DataFrame:
-    """Load all Taiwan listed and OTC common-stock symbols from public TWSE sources."""
-    listed_df = _fetch_isin_universe(TWSE_LISTED_ISIN_URL, ".TW", "上市")
-    otc_df = _fetch_isin_universe(TWSE_OTC_ISIN_URL, ".TWO", "上櫃")
+    """Load all Taiwan listed and OTC common-stock symbols from public sources.
+
+    主來源為 TWSE ISIN 頁面（含產業別與 CFICode 普通股過濾）。該頁面對雲端
+    IP 偶爾回擋頁（HTTP 200 但無表格），故失敗時自動改用 TWSE／TPEX 官方
+    OpenAPI 公司基本資料作備援；備援來源無產業別名稱（一律「未分類」）。
+    """
+    try:
+        listed_df = _fetch_isin_universe(TWSE_LISTED_ISIN_URL, ".TW", "上市")
+        otc_df = _fetch_isin_universe(TWSE_OTC_ISIN_URL, ".TWO", "上櫃")
+    except (ValueError, requests.RequestException) as primary_exc:
+        logger.warning("ISIN 主來源失敗，改用官方 OpenAPI 備援清單：%s", primary_exc)
+        try:
+            listed_df = _fetch_openapi_universe(
+                TWSE_OPENAPI_LISTED_COMPANY_URL, ".TW", "上市", "公司代號", "公司簡稱"
+            )
+            otc_df = _fetch_openapi_universe(
+                TPEX_OPENAPI_OTC_COMPANY_URL, ".TWO", "上櫃", "SecuritiesCompanyCode", "CompanyAbbreviation"
+            )
+        except (ValueError, requests.RequestException) as fallback_exc:
+            raise ValueError(
+                f"主來源（ISIN 清單）與備援來源（OpenAPI）皆失敗。"
+                f"主來源錯誤：{primary_exc}｜備援錯誤：{fallback_exc}"
+            ) from fallback_exc
+
     universe_df = pd.concat([listed_df, otc_df], ignore_index=True)
     universe_df = universe_df.sort_values(["MarketLabel", "BaseCode"]).reset_index(drop=True)
     return universe_df
