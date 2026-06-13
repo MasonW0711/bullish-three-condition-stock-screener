@@ -1,3 +1,14 @@
+# Runtime dependencies.
+#
+# Version strategy:
+# - These ranges keep the Streamlit Cloud install resilient (compatible-release
+#   bounds tuned against past Cloud breakages — see git history).
+# - For REPRODUCIBLE desktop release builds, the build workflow records the exact
+#   resolved versions of each platform's bundle as a lockfile artifact attached to
+#   the release (requirements-lock-<os>.txt). Treat that lockfile, not this file,
+#   as the source of truth for "what shipped".
+# - yfinance scrapes an undocumented endpoint and breaks often; pin it tightly and
+#   bump deliberately after re-testing download_stock_data against the live source.
 streamlit>=1.36,<2
 pandas>=2.2,<3
 numpy>=1.26,<3

@@ -127,15 +127,24 @@ def add_breakout_signals(df: pd.DataFrame) -> pd.DataFrame:
     previous_red_line = output.groupby("StockCode")["red_line"].shift(1)
     previous_black_line = output.groupby("StockCode")["black_line"].shift(1)
 
+    # A breakout must cross ONE stable line: the previous-close-vs-line test and
+    # the current-close-vs-line test have to refer to the same line level. On a
+    # bar that moves the line (a fresh attack success creates red_line at a NEW
+    # level while previous_red_line still holds the old level), the two halves
+    # compare different lines and fabricate a breakout (§3.4a). Require the line
+    # level to be unchanged this bar; a line re-created at the SAME level is still
+    # a single stable line, so an equal-level refresh stays eligible.
     output["break_red_line_daily"] = (
         previous_red_line.notna()
         & output["red_line"].notna()
+        & (previous_red_line == output["red_line"])
         & (previous_close <= previous_red_line)
         & (output["Close"] > output["red_line"])
     )
     output["break_black_line_daily"] = (
         previous_black_line.notna()
         & output["black_line"].notna()
+        & (previous_black_line == output["black_line"])
         & (previous_close <= previous_black_line)
         & (output["Close"] > output["black_line"])
     )
@@ -168,15 +177,21 @@ def add_breakdown_signals(df: pd.DataFrame) -> pd.DataFrame:
     previous_red_line = output.groupby("StockCode")["red_line"].shift(1)
     previous_black_line = output.groupby("StockCode")["black_line"].shift(1)
 
+    # Same single-stable-line requirement as add_breakout_signals: a bar that
+    # moves the line must not be read as a breakdown of it (the new level and the
+    # old level would be compared against). Require the line level to be unchanged
+    # this bar; an equal-level refresh stays eligible.
     output["break_down_red_line"] = (
         previous_red_line.notna()
         & output["red_line"].notna()
+        & (previous_red_line == output["red_line"])
         & (previous_close >= previous_red_line)
         & (output["Close"] < output["red_line"])
     )
     output["break_down_black_line"] = (
         previous_black_line.notna()
         & output["black_line"].notna()
+        & (previous_black_line == output["black_line"])
         & (previous_close >= previous_black_line)
         & (output["Close"] < output["black_line"])
     )
@@ -295,6 +310,67 @@ def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> 
     return output
 
 
+def _add_consecutive_streak_flags(investor: pd.DataFrame, consecutive_days: int) -> pd.DataFrame:
+    """Add the four N-day buy/sell streak flags, counting CALENDAR trading days.
+
+    The streak must be N *consecutive trading days*, not N consecutive rows. A
+    rolling window over rows silently bridges a day the stock has no record for
+    (it did not trade, or that day's fetch failed) and reports a fake streak
+    (§3.7 "最近 N 個交易日").
+
+    Every date present anywhere in the market-wide frame is treated as a trading
+    day in range; each stock is reindexed onto that axis, so a day it is missing
+    becomes a NaN net (neither >0 nor <0) that breaks both buy and sell streaks.
+    Holidays — absent from the whole market — are never invented. Only the dates
+    the stock actually reported are returned, so downstream date alignment is
+    unchanged.
+    """
+    flag_columns = _INVESTOR_FLAG_COLUMNS
+    if investor.empty:
+        for col in flag_columns:
+            investor[col] = pd.Series(dtype=bool)
+        return investor
+
+    trading_days = pd.DatetimeIndex(sorted(investor["Date"].unique()))
+    window = max(int(consecutive_days), 1)
+
+    def _streaks(group: pd.DataFrame) -> pd.DataFrame:
+        deduped = group.drop_duplicates("Date", keep="last")
+        indexed = deduped.set_index("Date").reindex(trading_days)
+        foreign = indexed["foreign_net"]
+        trust = indexed["trust_net"]
+
+        def _ok(series: pd.Series, positive: bool) -> pd.Series:
+            condition = series.gt(0) if positive else series.lt(0)
+            return condition.rolling(window, min_periods=window).sum().eq(window)
+
+        flags = pd.DataFrame(
+            {
+                "foreign_buy_streak_ok": _ok(foreign, True),
+                "trust_buy_streak_ok": _ok(trust, True),
+                "foreign_sell_streak_ok": _ok(foreign, False),
+                "trust_sell_streak_ok": _ok(trust, False),
+            },
+            index=trading_days,
+        )
+        # Keep only the dates this stock actually reported; reindexed gap rows
+        # were placeholders that must not become flow records of their own.
+        return flags.reindex(deduped["Date"])
+
+    flag_frames: list[pd.DataFrame] = []
+    for base_code, group in investor.groupby("BaseCode", sort=False):
+        flags = _streaks(group)
+        flags = flags.reset_index().rename(columns={"index": "Date"})
+        flags["BaseCode"] = base_code
+        flag_frames.append(flags)
+
+    flags_df = pd.concat(flag_frames, ignore_index=True)
+    merged = investor.merge(flags_df, on=["BaseCode", "Date"], how="left")
+    for col in flag_columns:
+        merged[col] = merged[col].fillna(False).astype(bool)
+    return merged
+
+
 def attach_investor_flow_flags(
     df: pd.DataFrame,
     investor_flow_df: pd.DataFrame,
@@ -325,19 +401,7 @@ def attach_investor_flow_flags(
     investor["foreign_net"] = investor["foreign_net"].fillna(0)
     investor["trust_net"] = investor["trust_net"].fillna(0)
     investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
-
-    investor["foreign_buy_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
-        lambda x: x.gt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
-    investor["foreign_sell_streak_ok"] = investor.groupby("BaseCode")["foreign_net"].transform(
-        lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
-    investor["trust_buy_streak_ok"] = investor.groupby("BaseCode")["trust_net"].transform(
-        lambda x: x.gt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
-    investor["trust_sell_streak_ok"] = investor.groupby("BaseCode")["trust_net"].transform(
-        lambda x: x.lt(0).rolling(consecutive_days, min_periods=consecutive_days).sum().eq(consecutive_days)
-    )
+    investor = _add_consecutive_streak_flags(investor, consecutive_days)
 
     # 先把法人表按 BaseCode 分組建索引，避免之後逐檔股票全表掃描
     # （全市場 1800 檔時是 O(檔數 × 法人列數) 的劣化點）。

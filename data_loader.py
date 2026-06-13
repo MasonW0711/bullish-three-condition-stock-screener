@@ -285,7 +285,12 @@ def _download_candidate(symbols: str | list[str], start_date, end_date) -> pd.Da
                 start=start_date,
                 end=end_exclusive.date(),
                 interval="1d",
-                auto_adjust=False,
+                # Split/dividend-adjusted prices. With raw prices a split or large
+                # ex-dividend gap makes Open << prev_close, which the attack logic
+                # would read as a fabricated "big black attack" (and create a phantom
+                # black line). Adjusted prices are continuous across corporate
+                # actions, so the red/black-line logic only reacts to real moves.
+                auto_adjust=True,
                 progress=False,
                 group_by="ticker",
                 threads=True,
@@ -664,24 +669,35 @@ def download_investor_flow_data(
 
     fetch_attempts = len(fetch_tasks)
     fetch_failures = sum(1 for _, exc in fetch_results if exc is not None)
+    # A failure is per-trade-date and market-wide (it affects every stock's streak
+    # on that date), so the actionable detail is WHICH dates are unreliable, not
+    # which stocks. Surface a bounded list for the UI / Excel diagnostics.
+    failed_dates = sorted(
+        {
+            task[0].date().isoformat()
+            for task, (_, exc) in zip(fetch_tasks, fetch_results)
+            if exc is not None
+        }
+    )
     frames: list[pd.DataFrame] = [
         frame for frame, exc in fetch_results if exc is None and frame is not None and not frame.empty
     ]
 
+    def _stamp(frame: pd.DataFrame) -> pd.DataFrame:
+        frame.attrs["fetch_attempts"] = fetch_attempts
+        frame.attrs["fetch_failures"] = fetch_failures
+        frame.attrs["fetch_failure_dates"] = failed_dates
+        return frame
+
     if not frames:
-        empty = _empty_investor_frame()
-        empty.attrs["fetch_attempts"] = fetch_attempts
-        empty.attrs["fetch_failures"] = fetch_failures
-        return empty
+        return _stamp(_empty_investor_frame())
 
     output = pd.concat(frames, ignore_index=True)
     if base_codes is not None:
         output = output[output["BaseCode"].isin(base_codes)].copy()
     output = output.drop_duplicates(subset=["Date", "BaseCode"]).sort_values(["BaseCode", "Date"])
     output = output.reset_index(drop=True)
-    output.attrs["fetch_attempts"] = fetch_attempts
-    output.attrs["fetch_failures"] = fetch_failures
-    return output
+    return _stamp(output)
 
 
 def _resample_single_stock(stock_df: pd.DataFrame, rule: str) -> pd.DataFrame:

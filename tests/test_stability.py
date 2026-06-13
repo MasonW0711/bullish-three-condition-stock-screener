@@ -23,6 +23,8 @@ from data_loader import (
     resample_ohlcv,
 )
 from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
+from export_engine import create_excel_bytes
+from config import EXCEL_SHEET_LABELS
 from signal_engine import (
     attach_investor_flow_flags,
     build_direction_signals,
@@ -95,6 +97,66 @@ class StabilityTests(unittest.TestCase):
 
         self.assertTrue(result.loc[0, "foreign_buy_streak_ok"])
         self.assertTrue(result.loc[0, "trust_buy_streak_ok"])
+
+    def test_investor_streak_does_not_bridge_a_missing_trading_day(self):
+        # 2026-05-06 is a trading day for other stocks but missing for 2330 (its
+        # fetch failed, or it did not trade). A 3-day streak must NOT be inferred
+        # from only the 05-04, 05-05, 05-07 rows: that bridges the 05-06 gap.
+        bars = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-07"]),
+                "StockCode": ["2330.TW"],
+                "Open": [100],
+                "High": [101],
+                "Low": [99],
+                "Close": [100],
+                "Volume": [1000],
+            }
+        )
+        flow = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "BaseCode": ["2330", "2330", "9999", "2330"],  # 05-06 belongs to another stock
+                "foreign_net": [1, 1, 1, 1],
+                "trust_net": [1, 1, 1, 1],
+            }
+        )
+
+        result = attach_investor_flow_flags(bars, flow, consecutive_days=3)
+
+        self.assertFalse(result.loc[0, "foreign_buy_streak_ok"])
+        self.assertFalse(result.loc[0, "trust_buy_streak_ok"])
+
+    def test_investor_streak_holds_across_full_consecutive_days(self):
+        # Sanity check the day-aware path still confirms a genuine 3-day streak
+        # when every trading day in range is present for the stock.
+        bars = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-06"]),
+                "StockCode": ["2330.TW"],
+                "Open": [100],
+                "High": [101],
+                "Low": [99],
+                "Close": [100],
+                "Volume": [1000],
+            }
+        )
+        flow = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-04", "2026-05-05", "2026-05-06"]),
+                "BaseCode": ["2330"] * 3,
+                "foreign_net": [1, 1, 1],
+                "trust_net": [-1, -1, -1],
+            }
+        )
+
+        result = attach_investor_flow_flags(bars, flow, consecutive_days=3)
+
+        self.assertTrue(result.loc[0, "foreign_buy_streak_ok"])
+        self.assertTrue(result.loc[0, "trust_sell_streak_ok"])
+        self.assertFalse(result.loc[0, "foreign_sell_streak_ok"])
 
     def test_investor_flags_stop_after_last_available_flow_date(self):
         bars = pd.DataFrame(
@@ -585,6 +647,58 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(bool((result["break_red_line_daily"] & result["break_down_red_line"]).any()))
         self.assertFalse(bool((result["break_black_line_daily"] & result["break_down_black_line"]).any()))
 
+    def test_new_lower_red_line_does_not_fake_a_breakout(self):
+        # A new red line forms BELOW the still-active old line on bar 4. The close
+        # sits between the two lines (above the new line, below the old one). That
+        # must NOT be reported as a breakout: prev-close-vs-old-line and
+        # close-vs-new-line would otherwise compare two different lines (§3.4a).
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["X"] * 5,
+                "Open": [100, 101, 99, 97, 98.5],
+                "High": [101, 104, 100, 99, 100],
+                "Low": [99, 100, 96, 96, 97],
+                "Close": [100, 103, 98, 97.5, 99.5],
+                "Volume": [1000] * 5,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        # Bar 4 creates a new red line at 97.5; close 99.5 is still below the old
+        # line (100), so no genuine breakout occurred.
+        self.assertTrue(result.loc[4, "red_attack_success"])
+        self.assertFalse(result.loc[4, "break_red_line_daily"])
+
+    def test_new_higher_black_line_does_not_fake_a_breakdown(self):
+        # Mirror of the breakout case. An old black line sits at 100; price rises,
+        # then bar 3 forms a NEW black line at 105 (a higher level). Its close
+        # (103) is below the new line only because the line just moved up — it is
+        # still above the old line, so this is not a genuine breakdown (§3.4b).
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]
+                ),
+                "StockCode": ["X"] * 4,
+                "Open": [100, 98, 99, 104],
+                "High": [101, 99, 106, 106],
+                "Low": [99, 95, 98, 102],
+                "Close": [100, 96, 105, 103],
+                "Volume": [1000] * 4,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        # Bar 3 moves the black line up to 105 (a fresh black attack success).
+        self.assertTrue(result.loc[3, "black_attack_success"])
+        self.assertEqual(result.loc[3, "black_line"], 105)
+        self.assertFalse(result.loc[3, "break_down_black_line"])
+
     def test_direction_signals_explode_into_multiple_rows(self):
         # bar2 satisfies both P3 (break-down reject) and P4 (new-line reject):
         # two short rows, no long rows, and no cross-direction dedup.
@@ -655,6 +769,115 @@ class StabilityTests(unittest.TestCase):
         # ...but the short P3 survives because no sell filter was selected.
         self.assertEqual(len(bundle["short_signals"]), 1)
         self.assertEqual(bundle["short_signals"].loc[0, "signal_type"], "P3_BreakDown_Reject")
+
+
+    def test_weekly_resample_then_pipeline_detects_weekly_attack(self):
+        # End-to-end: daily -> weekly resample -> signal pipeline. The signal
+        # logic must run on the WEEKLY bars (never on daily then resampled).
+        # Week 1 closes at 100; week 2 opens above 100 and closes above 100 ->
+        # a weekly big-red-attack success that creates a red line at 100.
+        daily = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    [
+                        # Week 1 (ends Fri 2026-05-08)
+                        "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07", "2026-05-08",
+                        # Week 2 (ends Fri 2026-05-15)
+                        "2026-05-11", "2026-05-12", "2026-05-13", "2026-05-14", "2026-05-15",
+                    ]
+                ),
+                "StockCode": ["2330.TW"] * 10,
+                "Open": [98, 99, 100, 99, 98, 105, 106, 107, 108, 109],
+                "High": [99, 101, 101, 100, 101, 112, 113, 114, 115, 116],
+                "Low": [97, 98, 99, 98, 97, 104, 105, 106, 107, 108],
+                "Close": [99, 100, 100, 99, 100, 108, 109, 110, 111, 112],
+                "Volume": [1000] * 10,
+            }
+        )
+
+        weekly = resample_ohlcv(daily, "W")
+        result = run_signal_pipeline(weekly, {"lookback_bars": 10, "min_volume": 0})
+
+        # Two weekly bars; week 2 is the red attack success at prev weekly close 100.
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result.loc[1, "prev_close"], 100)
+        self.assertTrue(result.loc[1, "red_attack_success"])
+        self.assertEqual(result.loc[1, "red_line"], 100)
+
+    def test_create_excel_bytes_has_all_localized_sheets(self):
+        signals = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-05"]),
+                "Timeframe": ["D"],
+                "StockCode": ["2330.TW"],
+                "StockName": ["台積電"],
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.5],
+                "Volume": [1000],
+                "prev_close": [99.5],
+                "direction": ["Long"],
+                "signal_type": ["P1_BreakUp_Hold"],
+                "retest_line_type": ["Red Line"],
+                "retest_line_price": [100.0],
+                "foreign_buy_streak_ok": [True],
+                "trust_buy_streak_ok": [False],
+                "foreign_sell_streak_ok": [False],
+                "trust_sell_streak_ok": [False],
+            }
+        )
+        params = {
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-29",
+            "analysis_timeframe": "Daily K",
+            "direction_filter": "全部",
+            "min_volume": 2000,
+            "lookback_bars": 10,
+        }
+
+        data = create_excel_bytes(
+            all_data=signals,
+            long_signals=signals,
+            short_signals=pd.DataFrame(),
+            latest_summary_long=pd.DataFrame(),
+            latest_summary_short=pd.DataFrame(),
+            failed_list=["1234.TW"],
+            params=params,
+            download_notes=["第 1 批下載失敗：timeout"],
+        )
+
+        self.assertTrue(data.startswith(b"PK"))  # valid xlsx (zip) container
+        sheets = pd.read_excel(BytesIO(data), sheet_name=None)
+        for label in EXCEL_SHEET_LABELS.values():
+            self.assertIn(label, sheets)
+        # The failed-downloads sheet carries both the code and the batch note.
+        failed_sheet = sheets[EXCEL_SHEET_LABELS["Failed_Downloads"]]
+        self.assertIn("1234.TW", failed_sheet.to_string())
+        self.assertIn("timeout", failed_sheet.to_string())
+
+    def test_create_excel_bytes_handles_all_empty_frames(self):
+        # A run with no signals must still produce a valid workbook with every
+        # sheet, not raise.
+        params = {
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-29",
+            "analysis_timeframe": "Weekly K",
+            "min_volume": 0,
+            "lookback_bars": 5,
+        }
+        data = create_excel_bytes(
+            all_data=pd.DataFrame(),
+            long_signals=pd.DataFrame(),
+            short_signals=pd.DataFrame(),
+            latest_summary_long=pd.DataFrame(),
+            latest_summary_short=pd.DataFrame(),
+            failed_list=[],
+            params=params,
+        )
+        sheets = pd.read_excel(BytesIO(data), sheet_name=None)
+        for label in EXCEL_SHEET_LABELS.values():
+            self.assertIn(label, sheets)
 
 
 if __name__ == "__main__":

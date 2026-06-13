@@ -236,6 +236,9 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             end_date=params["end_date"],
             _progress_callback=download_progress_callback,
         )
+        # The cached call returns the stored objects; copy the mutable diagnostics
+        # list before appending investor-fetch notes so we never mutate the cache.
+        download_errors = list(download_errors)
     except Exception as exc:
         messages.append({"level": "error", "text": f"股票資料下載失敗：{exc}"})
         return _empty_result(universe_df, messages=messages, used_auto_universe=use_auto_universe)
@@ -309,13 +312,21 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             investor_flow_df = pd.DataFrame()
         fetch_failures = int(investor_flow_df.attrs.get("fetch_failures", 0))
         fetch_attempts = int(investor_flow_df.attrs.get("fetch_attempts", 0))
+        failed_dates = list(investor_flow_df.attrs.get("fetch_failure_dates", []))
         if investor_flow_df.empty:
             messages.append({"level": "warning", "text": "目前無法取得最新法人買賣超資料，法人條件已視為未達成。"})
         elif fetch_failures > 0:
-            messages.append({
-                "level": "warning",
-                "text": f"法人買賣超資料有 {fetch_failures}/{fetch_attempts} 次抓取失敗（網路或來源異常），受影響日期的法人條件可能不準確。",
-            })
+            date_sample = "、".join(failed_dates[:5])
+            date_more = f" 等共 {len(failed_dates)} 日" if len(failed_dates) > 5 else ""
+            date_detail = f"，受影響日期：{date_sample}{date_more}" if failed_dates else ""
+            warning_text = (
+                f"法人買賣超資料有 {fetch_failures}/{fetch_attempts} 次抓取失敗（網路或來源異常），"
+                f"這些日期的法人連續買賣超條件可能不準確{date_detail}。"
+            )
+            messages.append({"level": "warning", "text": warning_text})
+            # Also record it in the batch-level diagnostics so it appears in the
+            # Excel「下載失敗清單」alongside the stock download errors.
+            download_errors.append(warning_text)
 
     processed = attach_investor_flow_flags(
         processed,
@@ -635,9 +646,18 @@ def main():
         c2.metric("失敗檔數", len(failed_list))
 
     if failed_list:
-        preview = ", ".join(failed_list[:50])
-        suffix = " ..." if len(failed_list) > 50 else ""
-        st.warning("下載失敗股票：" + preview + suffix)
+        if used_auto_universe:
+            # Whole-market mode always has hundreds of symbols with no recent data
+            # (delisted / illiquid / newly listed). Listing them is noise, not a
+            # failure — summarize the count and keep the full list in the Excel.
+            st.caption(
+                f"全市場模式下有 {len(failed_list)} 個代號在此區間無可用資料"
+                "（多為下市、流動性不足或新上市），完整清單見 Excel「下載失敗清單」。"
+            )
+        else:
+            preview = ", ".join(failed_list[:50])
+            suffix = " ..." if len(failed_list) > 50 else ""
+            st.warning("下載失敗股票：" + preview + suffix)
     else:
         st.success("所有要求的股票代號都已成功下載。")
 

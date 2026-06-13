@@ -30,6 +30,7 @@ hiddenimports = sorted(
         "chart_engine",
         "config",
         "data_loader",
+        "display_utils",
         "export_engine",
         "openpyxl",
         "signal_engine",

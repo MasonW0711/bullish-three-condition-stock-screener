@@ -178,7 +178,7 @@
 - `Short_Signals`（做空：P3 + P4）
 - `Latest_Summary_Long`
 - `Latest_Summary_Short`
-- `Failed_Downloads`（含 `FailedStockCode` 失敗代號欄，以及 `DiagnosticNote` 批次層級的網路 / 來源錯誤診斷欄）
+- `Failed_Downloads`（工作表名稱「下載失敗清單」；含「失敗股票代號」欄，以及「診斷訊息」批次層級的網路 / 來源錯誤診斷欄）
 - `Parameter_Settings`
 
 ### 4.4 UI 分頁
