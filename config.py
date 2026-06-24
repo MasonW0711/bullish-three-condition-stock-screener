@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "2.2.0"
-APP_UPDATED = "2026-06-13"
+APP_VERSION = "2.3.0"
+APP_UPDATED = "2026-06-24"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (
@@ -42,7 +42,7 @@ TIMEFRAME_OPTIONS = {
 }
 TIMEFRAME_LABELS = {code: label for label, code in TIMEFRAME_OPTIONS.items()}
 
-# Direction routing (v2). The values double as the direction_filter选项 shown in the UI.
+# Direction routing (v2). The values double as the direction_filter 選項 shown in the UI.
 DIRECTION_FILTER_OPTIONS = ["全部", "做多", "做空"]
 
 # 預設只抓最近一個月，避免全市場 × 長區間下載在雲端逾時。
@@ -87,61 +87,6 @@ INVESTOR_FLAG_COLUMNS = [
     "trust_buy_streak_ok",
     "foreign_sell_streak_ok",
     "trust_sell_streak_ok",
-]
-
-RESULT_COLUMNS = [
-    "Date",
-    "Timeframe",
-    "StockCode",
-    "StockName",
-    "Open",
-    "High",
-    "Low",
-    "Close",
-    "Volume",
-    "prev_close",
-    "red_attack_success",
-    "red_attack_failed",
-    "black_attack_success",
-    "black_attack_failed",
-    "attack_type",
-    "attack_result",
-    "signal_summary",
-    "red_line",
-    "black_line",
-    "new_line_appeared",
-    "new_line_type",
-    "new_line_price",
-    "break_red_line_daily",
-    "break_black_line_daily",
-    "breakout_line_type",
-    "breakout_line_price",
-    "break_down_red_line",
-    "break_down_black_line",
-    "breakdown_line_type",
-    "breakdown_line_price",
-    "active_breakout_line_type",
-    "active_breakout_line_price",
-    "active_breakdown_line_type",
-    "active_breakdown_line_price",
-    "bars_since_new_line",
-    "active_new_line_type",
-    "active_new_line_price",
-    "new_line_window_valid",
-    "retest_hold_daily",
-    "retest_reject_daily",
-    "p1_break_up_hold",
-    "p2_new_line_hold",
-    "p3_break_down_reject",
-    "p4_new_line_reject",
-    *INVESTOR_FLAG_COLUMNS,
-    "volume_pass",
-    "lookback_rank",
-    "p1_final",
-    "p2_final",
-    "p3_final",
-    "p4_final",
-    "final_signal",
 ]
 
 # Unified schema for the exploded Long_Signals / Short_Signals frames (§3.8).
@@ -250,11 +195,8 @@ DISPLAY_COLUMN_LABELS = {
     "LatestLow": "最低",
     "LatestClose": "收盤",
     "LatestVolume": "成交量",
-    "SignalSummary": "訊號摘要",
     "foreign_net": "外資買賣超",
     "trust_net": "投信買賣超",
-    "red_line_raw": "紅線（原始）",
-    "black_line_raw": "黑線（原始）",
 }
 
 # Excel 匯出用：工作表名稱中文化

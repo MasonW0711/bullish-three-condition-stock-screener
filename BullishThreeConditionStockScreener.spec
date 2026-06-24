@@ -64,7 +64,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX can corrupt native extensions (numpy/pandas/lxml) and trigger AV false
+    # positives; the marginal size win is not worth that risk for a desktop app.
+    upx=False,
     console=sys.platform == "win32",
     disable_windowed_traceback=False,
 )
@@ -74,7 +76,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name=APP_NAME,
 )

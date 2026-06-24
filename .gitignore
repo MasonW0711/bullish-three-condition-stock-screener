@@ -5,3 +5,7 @@ __pycache__/
 .claude/
 build/
 dist/
+.coverage
+htmlcov/
+.ruff_cache/
+requirements-lock-*.txt

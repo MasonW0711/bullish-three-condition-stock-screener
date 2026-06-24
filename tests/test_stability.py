@@ -229,7 +229,11 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[3, "p3_break_down_reject"])
         self.assertTrue(result.loc[3, "final_signal"])
 
-    def test_retest_failure_is_not_final_signal(self):
+    def test_long_retest_failure_is_not_a_long_signal(self):
+        # bar2 breaks UP through the black line at 100; bar3 closes back below it
+        # (97 < 100). The long P1 hold fails (close below the line), so there is
+        # no LONG signal — but closing back below a line you broke above is a
+        # genuine P3 breakdown-reject (short), so the bar IS a short final signal.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
@@ -247,12 +251,15 @@ class StabilityTests(unittest.TestCase):
         # The long P1 hold genuinely fails (close below the breakout line).
         self.assertFalse(result.loc[3, "retest_hold_daily"])
         self.assertFalse(result.loc[3, "p1_break_up_hold"])
-        # Bar 3 is itself a fresh new-line appearance (bars_since == 0), so the
-        # appearance-bar-excluded window keeps P4 from firing; the bar matches
-        # no path and final_signal stays False.
+        self.assertFalse(result.loc[3, "p1_final"])
+        # Bar 3 is itself a fresh new-line appearance (bars_since == 0), so P4 is
+        # excluded on the appearance bar.
         self.assertEqual(result.loc[3, "bars_since_new_line"], 0)
         self.assertFalse(result.loc[3, "p4_new_line_reject"])
-        self.assertFalse(result.loc[3, "final_signal"])
+        # It IS a genuine P3 breakdown-reject of the black line at 100.
+        self.assertTrue(result.loc[3, "break_down_black_line"])
+        self.assertTrue(result.loc[3, "p3_break_down_reject"])
+        self.assertTrue(result.loc[3, "final_signal"])
 
     def test_invalid_universe_table_shape_raises_clear_error(self):
         bad_table = pd.DataFrame([["2330 台積電", "TW0002330008", "2020/01/01"]])
@@ -856,6 +863,37 @@ class StabilityTests(unittest.TestCase):
         self.assertIn("1234.TW", failed_sheet.to_string())
         self.assertIn("timeout", failed_sheet.to_string())
 
+    def test_failed_downloads_sheet_escapes_formula_injection(self):
+        # A user-supplied "stock code" that is a spreadsheet formula must be
+        # neutralized in the Failed_Downloads sheet, not just the signal sheets.
+        params = {
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-29",
+            "analysis_timeframe": "Daily K",
+            "min_volume": 0,
+            "lookback_bars": 5,
+        }
+        data = create_excel_bytes(
+            all_data=pd.DataFrame(),
+            long_signals=pd.DataFrame(),
+            short_signals=pd.DataFrame(),
+            latest_summary_long=pd.DataFrame(),
+            latest_summary_short=pd.DataFrame(),
+            failed_list=["=cmd|'/c calc'!A1", "@SUM(1,2)", "2330.TW"],
+            params=params,
+            download_notes=["=HYPERLINK('http://evil','x')"],
+        )
+        failed_sheet = pd.read_excel(
+            BytesIO(data), sheet_name=EXCEL_SHEET_LABELS["Failed_Downloads"], dtype=str
+        )
+        cells = failed_sheet.fillna("").to_numpy().ravel().tolist()
+        # Every formula-leading cell is prefixed with ' (rendered as plain text).
+        self.assertIn("'=cmd|'/c calc'!A1", cells)
+        self.assertIn("'@SUM(1,2)", cells)
+        self.assertIn("'=HYPERLINK('http://evil','x')", cells)
+        # A benign code is untouched.
+        self.assertIn("2330.TW", cells)
+
     def test_create_excel_bytes_handles_all_empty_frames(self):
         # A run with no signals must still produce a valid workbook with every
         # sheet, not raise.
@@ -878,6 +916,159 @@ class StabilityTests(unittest.TestCase):
         sheets = pd.read_excel(BytesIO(data), sheet_name=None)
         for label in EXCEL_SHEET_LABELS.values():
             self.assertIn(label, sheets)
+
+    def test_upward_gap_breakout_on_attack_success_fires_p1(self):
+        # Regression: a genuine breakout of a stable line (100) that ALSO is a
+        # red-attack-success on the same bar (which moves red_line below 100)
+        # must still register as a breakout and seed the P1 retest-hold path.
+        # The old line-equality guard wrongly dropped it.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 101, 104, 102, 105],
+                "High": [101, 104, 105, 111, 106],
+                "Low": [99, 100, 97, 99, 99],
+                "Close": [100, 103, 98, 110, 104],
+                "Volume": [1000, 1000, 1000, 3000, 3000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 5, "min_volume": 2000})
+
+        # bar3 is a red-attack-success that moves red_line to 98 (below the old line)...
+        self.assertTrue(result.loc[3, "red_attack_success"])
+        self.assertEqual(result.loc[3, "red_line"], 98)
+        # ...yet close 110 clears the OLD line at 100: a genuine breakout against it.
+        self.assertTrue(result.loc[3, "break_red_line_daily"])
+        self.assertEqual(result.loc[3, "active_breakout_line_price"], 100)
+        # bar4 holds above the broken line -> P1 final signal.
+        self.assertTrue(result.loc[4, "retest_hold_daily"])
+        self.assertTrue(result.loc[4, "p1_break_up_hold"])
+        self.assertTrue(result.loc[4, "final_signal"])
+
+    def test_downward_gap_breakdown_on_attack_success_fires_p3(self):
+        # Mirror of the breakout case: a genuine breakdown of a stable black line
+        # (100) that ALSO is a black-attack-success (which moves black_line above
+        # 100) must still register as a breakdown and seed the P3 reject path.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 99, 96, 99, 95],
+                "High": [101, 100, 102, 100, 101],
+                "Low": [99, 96, 95, 91, 98],
+                "Close": [100, 97, 101, 92, 99],
+                "Volume": [1000, 1000, 1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        self.assertTrue(result.loc[3, "black_attack_success"])
+        self.assertEqual(result.loc[3, "black_line"], 101)
+        self.assertTrue(result.loc[3, "break_down_black_line"])
+        self.assertEqual(result.loc[3, "active_breakdown_line_price"], 100)
+        self.assertTrue(result.loc[4, "retest_reject_daily"])
+        self.assertTrue(result.loc[4, "p3_break_down_reject"])
+        self.assertTrue(result.loc[4, "final_signal"])
+
+    def test_investor_streak_single_stock_uses_market_trading_day_axis(self):
+        # A single screened stock is missing 2026-05-06, which IS a market trading
+        # day (passed via market_trading_days). The 3-day streak must break across
+        # that gap even though no other stock is present to keep the day on the
+        # axis — otherwise a small screen silently bridges gaps (false streak).
+        bars = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-07"]),
+                "StockCode": ["2330.TW"],
+                "Open": [100],
+                "High": [101],
+                "Low": [99],
+                "Close": [100],
+                "Volume": [1000],
+            }
+        )
+        flow = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-04", "2026-05-05", "2026-05-07"]),
+                "BaseCode": ["2330"] * 3,
+                "foreign_net": [1, 1, 1],
+                "trust_net": [1, 1, 1],
+            }
+        )
+        market_days = pd.to_datetime(
+            ["2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+        )
+
+        result = attach_investor_flow_flags(
+            bars, flow, consecutive_days=3, market_trading_days=market_days
+        )
+
+        self.assertFalse(result.loc[0, "foreign_buy_streak_ok"])
+        self.assertFalse(result.loc[0, "trust_buy_streak_ok"])
+
+    def test_direction_filter_short_only_suppresses_long_side(self):
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
+                "StockCode": ["2330.TW"] * 3,
+                "Open": [100, 101, 104],
+                "High": [101, 104, 104],
+                "Low": [99, 100, 96],
+                "Close": [100, 103, 98],
+                "Volume": [1000, 1000, 1000],
+            }
+        )
+        processed = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+        processed = attach_investor_flow_flags(processed, pd.DataFrame(), consecutive_days=3)
+
+        bundle = build_direction_signals(processed, {"direction_filter": "做空"})
+
+        self.assertTrue(bundle["long_signals"].empty)
+        self.assertFalse(bundle["short_signals"].empty)
+
+    def test_direction_filter_long_only_suppresses_short_side(self):
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 95, 99, 101],
+                "High": [101, 97, 106, 103],
+                "Low": [99, 94, 98, 99],
+                "Close": [100, 96, 105, 102],
+                "Volume": [1000, 1000, 3000, 3000],
+            }
+        )
+        processed = run_signal_pipeline(frame, {"lookback_bars": 3, "min_volume": 2000})
+        processed = attach_investor_flow_flags(processed, pd.DataFrame(), consecutive_days=3)
+
+        bundle = build_direction_signals(processed, {"direction_filter": "做多"})
+
+        self.assertFalse(bundle["long_signals"].empty)
+        self.assertTrue(bundle["short_signals"].empty)
+
+    def test_latest_summary_prefers_breakdown_path_on_same_bar_short(self):
+        # Short mirror of the P1>P2 tie-break: on the same bar P3 must win over P4.
+        signals = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-05", "2026-05-05"]),
+                "StockCode": ["2330.TW", "2330.TW"],
+                "signal_type": ["P4_NewLine_Reject", "P3_BreakDown_Reject"],
+                "direction": ["Short", "Short"],
+                "retest_line_type": ["Red Line", "Black Line"],
+                "retest_line_price": [100.0, 99.0],
+            }
+        )
+
+        summary = _compute_latest_summary(signals)
+
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary.loc[0, "SignalType"], "P3_BreakDown_Reject")
 
 
 if __name__ == "__main__":

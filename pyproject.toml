@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+# Conservative gate: pyflakes (F) catches unused imports/variables and undefined
+# names; E9 catches syntax errors. This surfaces real bugs (e.g. dead imports,
+# typo'd names) without bikeshedding style that a formatter should own.
+select = ["F", "E9"]

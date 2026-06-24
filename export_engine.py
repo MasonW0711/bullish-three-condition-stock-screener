@@ -135,5 +135,9 @@ def create_excel_bytes(
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_key, frame in workbook_frames.items():
             sheet_name = EXCEL_SHEET_LABELS.get(sheet_key, sheet_key)
-            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            # Sanitize EVERY sheet (idempotent on the already-localized data
+            # frames). Failed_Downloads carries user-supplied stock codes and
+            # Parameter_Settings echoes user input, so neither may bypass the
+            # formula-injection escaping.
+            sanitize_for_spreadsheet(frame).to_excel(writer, sheet_name=sheet_name, index=False)
     return output.getvalue()

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 from io import StringIO
 from typing import Iterable
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -33,6 +35,21 @@ logger = logging.getLogger(__name__)
 
 _YFINANCE_LOGGER_NAMES = ("yfinance", "peewee")
 
+# _download_candidate mutates process-global logger levels and redirects
+# stdout/stderr; serialize that critical section so concurrent Streamlit
+# sessions can't leave a logger stuck at CRITICAL or swallow another thread's
+# output (the save/restore is otherwise a lost-update race).
+_DOWNLOAD_LOG_LOCK = threading.Lock()
+
+# Only known TWSE/TPEX hosts may fall back to an unverified TLS connection on a
+# certificate error; never silently downgrade TLS for an unexpected host.
+_INSECURE_TLS_FALLBACK_HOSTS = frozenset(
+    {"isin.twse.com.tw", "www.twse.com.tw", "www.tpex.org.tw"}
+)
+
+# Transient HTTP statuses worth a bounded retry (rate limit / gateway / busy).
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 
 def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
     seen: set[str] = set()
@@ -53,15 +70,28 @@ def _chunk_list(items: list[str], chunk_size: int) -> list[list[str]]:
 
 
 def _request_once(url: str, headers: dict) -> requests.Response:
-    """Single GET attempt with an automatic insecure retry on SSL failure."""
+    """Single GET attempt with an automatic insecure retry on SSL failure.
+
+    The verify=False downgrade is scoped to known TWSE/TPEX hosts only; any
+    other host re-raises the original SSLError instead of silently trusting an
+    unverified certificate.
+    """
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
         response.raise_for_status()
         return response
     except requests.exceptions.SSLError as exc:
+        host = (urlparse(url).hostname or "").lower()
+        if host not in _INSECURE_TLS_FALLBACK_HOSTS:
+            # Unexpected host: do NOT downgrade TLS — fail closed.
+            raise
         # 降級為不驗證憑證屬於安全性讓步（可能遭中間人竄改資料），
-        # 必須留下紀錄，不可無聲發生。
-        logger.warning("SSL 憑證驗證失敗，改以不驗證憑證方式重試：%s（%s）", url, exc)
+        # 僅限已知的 TWSE/TPEX 來源，且必須留下紀錄，不可無聲發生。
+        logger.warning(
+            "SSL 憑證驗證失敗，改以不驗證憑證方式重試（僅限已知 TWSE/TPEX 來源）：%s（%s）",
+            url,
+            exc,
+        )
         response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers, verify=False)
         response.raise_for_status()
         return response
@@ -70,9 +100,11 @@ def _request_once(url: str, headers: dict) -> requests.Response:
 def _get_with_ssl_fallback(url: str) -> requests.Response:
     """GET a URL with bounded retries for transient timeouts/connection errors.
 
-    SSL certificate problems fall back to an insecure request (TWSE/TPEX still
-    serve valid data). Timeouts and connection drops — common on the Streamlit
-    Cloud runtime — are retried; other HTTP errors fail immediately.
+    SSL certificate problems fall back to an insecure request for known
+    TWSE/TPEX hosts (which still serve valid data). Timeouts, connection drops,
+    and transient HTTP statuses (429 rate-limit / 5xx) — common on the Streamlit
+    Cloud runtime and during market peaks — are retried with exponential
+    backoff; other HTTP errors fail immediately.
     """
     headers = {"User-Agent": "Mozilla/5.0"}
     last_exc: Exception | None = None
@@ -83,9 +115,20 @@ def _get_with_ssl_fallback(url: str) -> requests.Response:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             last_exc = exc
             logger.warning("請求逾時或連線中斷（第 %d 次嘗試）：%s", attempt + 1, url)
-            # 指數退避：立即重試對限流中的來源只會雪上加霜。
-            if attempt + 1 < total_attempts:
-                time.sleep(min(2 ** attempt, 8))
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status not in _RETRYABLE_STATUS_CODES:
+                raise
+            last_exc = exc
+            logger.warning(
+                "來源回應 HTTP %s（第 %d 次嘗試，可能限流或暫時無法服務）：%s",
+                status,
+                attempt + 1,
+                url,
+            )
+        # 指數退避：立即重試對限流中的來源只會雪上加霜。
+        if attempt + 1 < total_attempts:
+            time.sleep(min(2 ** attempt, 8))
     raise last_exc if last_exc is not None else RuntimeError(f"請求失敗：{url}")
 
 
@@ -96,7 +139,9 @@ def normalize_symbol(stock_code: str) -> list[str]:
         return []
     if normalized.endswith(".TW") or normalized.endswith(".TWO"):
         return [normalized]
-    if re.fullmatch(r"\d{4}", normalized):
+    # 4-digit common stocks plus 5-/6-digit instruments (e.g. ETFs such as
+    # 00878) — try both boards so a bare numeric code is not silently dropped.
+    if re.fullmatch(r"\d{4,6}", normalized):
         return [f"{normalized}.TW", f"{normalized}.TWO"]
     return [normalized]
 
@@ -115,14 +160,26 @@ def parse_stock_list(text: str) -> list[str]:
 
 
 def _select_isin_table(tables: list[pd.DataFrame]) -> pd.DataFrame:
-    """Select the actual TWSE ISIN stock table from read_html() results."""
+    """Select the actual TWSE ISIN stock table from read_html() results.
+
+    Picks the 7-column table with the MOST ``\\d{4} 名稱`` rows rather than the
+    first one that contains any single code. A stray legend/header block parsed
+    as 7 columns with one stray code can no longer win over the real stock table
+    (which has hundreds of matching rows).
+    """
+    best_table: pd.DataFrame | None = None
+    best_match_count = 0
     for table in tables:
         if table.shape[1] != 7:
             continue
         first_col = table.iloc[:, 0].astype(str).str.strip()
         parsed = first_col.str.extract(r"^(?P<BaseCode>\d{4})[　\s]+(?P<StockName>.+)$")
-        if parsed["BaseCode"].notna().any():
-            return table.copy()
+        match_count = int(parsed["BaseCode"].notna().sum())
+        if match_count > best_match_count:
+            best_match_count = match_count
+            best_table = table
+    if best_table is not None:
+        return best_table.copy()
     raise ValueError("公開股票清單表格格式異常：找不到 7 欄且含股票代號名稱的資料表。")
 
 
@@ -253,9 +310,18 @@ def normalize_yfinance_data(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
             return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
 
         normalized = normalized[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
-        normalized["Date"] = pd.to_datetime(
-            normalized["Date"], errors="coerce", utc=True
-        ).dt.tz_localize(None)
+        # Preserve the Taiwan trading calendar day regardless of whether yfinance
+        # returns tz-naive (today) or tz-aware Asia/Taipei timestamps. A bare
+        # utc=True + tz_localize(None) would shift a tz-aware Taipei midnight back
+        # to the previous UTC day (16:00), corrupting monthly resample buckets and
+        # investor-flow date alignment. Convert to Taipei wall-clock, drop the tz,
+        # then normalize to midnight so the date is a clean calendar day.
+        normalized["Date"] = (
+            pd.to_datetime(normalized["Date"], errors="coerce", utc=True)
+            .dt.tz_convert("Asia/Taipei")
+            .dt.tz_localize(None)
+            .dt.normalize()
+        )
 
         for column in ["Open", "High", "Low", "Close", "Volume"]:
             normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
@@ -274,31 +340,35 @@ def _download_candidate(symbols: str | list[str], start_date, end_date) -> pd.Da
     # yfinance treats `end` as exclusive; users expect the selected end date to
     # be included when that trading day has data.
     end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
-    loggers = [logging.getLogger(name) for name in _YFINANCE_LOGGER_NAMES]
-    previous_levels = [logger.level for logger in loggers]
-    for logger in loggers:
-        logger.setLevel(logging.CRITICAL)
-    try:
-        with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
-            return yf.download(
-                symbols,
-                start=start_date,
-                end=end_exclusive.date(),
-                interval="1d",
-                # Split/dividend-adjusted prices. With raw prices a split or large
-                # ex-dividend gap makes Open << prev_close, which the attack logic
-                # would read as a fabricated "big black attack" (and create a phantom
-                # black line). Adjusted prices are continuous across corporate
-                # actions, so the red/black-line logic only reacts to real moves.
-                auto_adjust=True,
-                progress=False,
-                group_by="ticker",
-                threads=True,
-                multi_level_index=True,
-            )
-    finally:
-        for logger, level in zip(loggers, previous_levels):
-            logger.setLevel(level)
+    # The level mutation and stdout/stderr redirect below are process-global, so
+    # serialize them: two concurrent Streamlit sessions could otherwise interleave
+    # save/restore and leave a logger permanently at CRITICAL.
+    with _DOWNLOAD_LOG_LOCK:
+        loggers = [logging.getLogger(name) for name in _YFINANCE_LOGGER_NAMES]
+        previous_levels = [yf_logger.level for yf_logger in loggers]
+        for yf_logger in loggers:
+            yf_logger.setLevel(logging.CRITICAL)
+        try:
+            with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
+                return yf.download(
+                    symbols,
+                    start=start_date,
+                    end=end_exclusive.date(),
+                    interval="1d",
+                    # Split/dividend-adjusted prices. With raw prices a split or large
+                    # ex-dividend gap makes Open << prev_close, which the attack logic
+                    # would read as a fabricated "big black attack" (and create a phantom
+                    # black line). Adjusted prices are continuous across corporate
+                    # actions, so the red/black-line logic only reacts to real moves.
+                    auto_adjust=True,
+                    progress=False,
+                    group_by="ticker",
+                    threads=True,
+                    multi_level_index=True,
+                )
+        finally:
+            for yf_logger, level in zip(loggers, previous_levels):
+                yf_logger.setLevel(level)
 
 
 def download_stock_data(
@@ -700,37 +770,6 @@ def download_investor_flow_data(
     return _stamp(output)
 
 
-def _resample_single_stock(stock_df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    stock_df = stock_df.sort_values("Date").copy()
-    stock_df["TradeDate"] = stock_df["Date"]
-
-    resampled = (
-        stock_df.set_index("Date")
-        .resample(rule, label="right", closed="right")
-        .agg(
-            {
-                "TradeDate": "max",
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-        )
-        .reset_index(drop=True)
-    )
-
-    resampled = resampled.dropna(subset=["Open", "High", "Low", "Close"], how="all")
-    if resampled.empty:
-        return pd.DataFrame(columns=REQUIRED_OHLCV_COLUMNS)
-
-    resampled = resampled.rename(columns={"TradeDate": "Date"})
-    resampled["StockCode"] = stock_df["StockCode"].iloc[0]
-    resampled = resampled[REQUIRED_OHLCV_COLUMNS].copy()
-    resampled["Date"] = pd.to_datetime(resampled["Date"], errors="coerce")
-    return resampled.dropna(subset=["Date"]).reset_index(drop=True)
-
-
 def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
     Convert daily OHLCV data into the selected timeframe:
@@ -738,8 +777,11 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     - W: Weekly K
     - M: Monthly K
 
-    Each stock is resampled separately, and the result keeps the actual last
-    trading day inside each resampled period as the Date column.
+    Each stock is resampled separately (grouped by StockCode), and the result
+    keeps the actual last trading day inside each resampled period as the Date
+    column (§5). Implemented as a single grouped Grouper aggregation rather than
+    a per-stock Python loop — verified byte-identical to the loop, including the
+    TradeDate=max last-trading-day semantics and per-stock holiday gaps.
     """
     if df is None or df.empty:
         return pd.DataFrame(columns=[*REQUIRED_OHLCV_COLUMNS, "Timeframe"])
@@ -763,16 +805,36 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         return daily.reset_index(drop=True)
 
     resample_rule = {"W": "W-FRI", "M": pd.offsets.MonthEnd()}[timeframe]
-    frames: list[pd.DataFrame] = []
-    for _, stock_df in prepared.groupby("StockCode", sort=False):
-        stock_resampled = _resample_single_stock(stock_df, resample_rule)
-        if not stock_resampled.empty:
-            frames.append(stock_resampled)
-
-    if not frames:
+    prepared["TradeDate"] = prepared["Date"]
+    grouped = (
+        prepared.groupby(
+            ["StockCode", pd.Grouper(key="Date", freq=resample_rule, label="right", closed="right")],
+            sort=True,
+        )
+        .agg(
+            {
+                "TradeDate": "max",
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        .reset_index()
+    )
+    # Drop empty period bins (no trading that period -> all-NaN OHLC / no TradeDate).
+    grouped = grouped.dropna(subset=["Open", "High", "Low", "Close"], how="all").dropna(
+        subset=["TradeDate"]
+    )
+    if grouped.empty:
         return pd.DataFrame(columns=[*REQUIRED_OHLCV_COLUMNS, "Timeframe"])
 
-    output = pd.concat(frames, ignore_index=True)
+    # The bar Date is the actual last trading day in the period, not the bin edge.
+    output = grouped.drop(columns=["Date"]).rename(columns={"TradeDate": "Date"})
+    output["Date"] = pd.to_datetime(output["Date"], errors="coerce")
+    output = output.dropna(subset=["Date"])
+    output = output[REQUIRED_OHLCV_COLUMNS].copy()
     output["Timeframe"] = timeframe
     output = output.sort_values(["StockCode", "Date"]).reset_index(drop=True)
     return output

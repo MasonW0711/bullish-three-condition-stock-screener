@@ -19,7 +19,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from config import SIGNAL_COLUMNS
+from config import INVESTOR_FLAG_COLUMNS as _INVESTOR_FLAG_COLUMNS, SIGNAL_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +29,6 @@ _PATH_SPECS = [
     ("p2_final", "Long", "P2_NewLine_Hold", "active_new_line_type", "active_new_line_price", "long"),
     ("p3_final", "Short", "P3_BreakDown_Reject", "active_breakdown_line_type", "active_breakdown_line_price", "short"),
     ("p4_final", "Short", "P4_NewLine_Reject", "active_new_line_type", "active_new_line_price", "short"),
-]
-
-_INVESTOR_FLAG_COLUMNS = [
-    "foreign_buy_streak_ok",
-    "trust_buy_streak_ok",
-    "foreign_sell_streak_ok",
-    "trust_sell_streak_ok",
 ]
 
 
@@ -119,37 +112,56 @@ def add_attack_lines(df: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
+def _crosses_line(
+    previous_close: pd.Series,
+    previous_line: pd.Series,
+    current_close: pd.Series,
+    *,
+    upward: bool,
+) -> pd.Series:
+    """Detect a strict close-cross of the PREVIOUS bar's line level (§3.4).
+
+    Both halves of the test reference ``previous_line`` (the line that was in
+    force on the prior bar). A bar that itself moves the line this period — a
+    fresh attack success resets the line to this bar's prev_close, a DIFFERENT
+    level — is therefore still judged against the level that was actually
+    crossed. This keeps a genuine breakout/breakdown that coincides with a
+    new-line bar (the over-suppression bug of v2.2.0), while still rejecting the
+    "close lands between the old and new line" fake of §3.4a/§3.4b: that fake
+    close never clears the OLD level, so it fails this test. Equality of the
+    previous close to the line counts as a breakout (``<=``), never a breakdown
+    (``>=`` + strict ``<``), so the two can never both fire on one line/bar.
+    """
+    if upward:
+        return (
+            previous_line.notna()
+            & (previous_close <= previous_line)
+            & (current_close > previous_line)
+        )
+    return (
+        previous_line.notna()
+        & (previous_close >= previous_line)
+        & (current_close < previous_line)
+    )
+
+
 def add_breakout_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """Detect strict closes above the latest red_line or black_line (P1 trigger)."""
+    """Detect strict closes above the previous red_line or black_line (P1 trigger)."""
     output = df.copy()
 
     previous_close = output.groupby("StockCode")["Close"].shift(1)
     previous_red_line = output.groupby("StockCode")["red_line"].shift(1)
     previous_black_line = output.groupby("StockCode")["black_line"].shift(1)
 
-    # A breakout must cross ONE stable line: the previous-close-vs-line test and
-    # the current-close-vs-line test have to refer to the same line level. On a
-    # bar that moves the line (a fresh attack success creates red_line at a NEW
-    # level while previous_red_line still holds the old level), the two halves
-    # compare different lines and fabricate a breakout (§3.4a). Require the line
-    # level to be unchanged this bar; a line re-created at the SAME level is still
-    # a single stable line, so an equal-level refresh stays eligible.
-    output["break_red_line_daily"] = (
-        previous_red_line.notna()
-        & output["red_line"].notna()
-        & (previous_red_line == output["red_line"])
-        & (previous_close <= previous_red_line)
-        & (output["Close"] > output["red_line"])
+    output["break_red_line_daily"] = _crosses_line(
+        previous_close, previous_red_line, output["Close"], upward=True
     )
-    output["break_black_line_daily"] = (
-        previous_black_line.notna()
-        & output["black_line"].notna()
-        & (previous_black_line == output["black_line"])
-        & (previous_close <= previous_black_line)
-        & (output["Close"] > output["black_line"])
+    output["break_black_line_daily"] = _crosses_line(
+        previous_close, previous_black_line, output["Close"], upward=True
     )
 
-    # Black line takes display priority on upward breaks.
+    # Black line takes display priority on upward breaks. The broken line is the
+    # PREVIOUS (in-force) level, so the retest baseline is previous_*_line.
     output["breakout_line_type"] = np.select(
         [output["break_black_line_daily"], output["break_red_line_daily"]],
         ["Black Line", "Red Line"],
@@ -157,19 +169,16 @@ def add_breakout_signals(df: pd.DataFrame) -> pd.DataFrame:
     )
     output["breakout_line_price"] = np.select(
         [output["break_black_line_daily"], output["break_red_line_daily"]],
-        [output["black_line"], output["red_line"]],
+        [previous_black_line, previous_red_line],
         default=np.nan,
     )
     return output
 
 
 def add_breakdown_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """Detect strict closes below the latest red_line or black_line (P3 trigger).
+    """Detect strict closes below the previous red_line or black_line (P3 trigger).
 
-    Mirror of add_breakout_signals. Strict ``<`` so a bar where the previous
-    close sits exactly on the line is still resolved by the current close
-    (``>`` breakout vs ``<`` breakdown); equality is therefore classified as a
-    breakout, never a breakdown (§3.4b).
+    Mirror of add_breakout_signals via _crosses_line(upward=False).
     """
     output = df.copy()
 
@@ -177,23 +186,11 @@ def add_breakdown_signals(df: pd.DataFrame) -> pd.DataFrame:
     previous_red_line = output.groupby("StockCode")["red_line"].shift(1)
     previous_black_line = output.groupby("StockCode")["black_line"].shift(1)
 
-    # Same single-stable-line requirement as add_breakout_signals: a bar that
-    # moves the line must not be read as a breakdown of it (the new level and the
-    # old level would be compared against). Require the line level to be unchanged
-    # this bar; an equal-level refresh stays eligible.
-    output["break_down_red_line"] = (
-        previous_red_line.notna()
-        & output["red_line"].notna()
-        & (previous_red_line == output["red_line"])
-        & (previous_close >= previous_red_line)
-        & (output["Close"] < output["red_line"])
+    output["break_down_red_line"] = _crosses_line(
+        previous_close, previous_red_line, output["Close"], upward=False
     )
-    output["break_down_black_line"] = (
-        previous_black_line.notna()
-        & output["black_line"].notna()
-        & (previous_black_line == output["black_line"])
-        & (previous_close >= previous_black_line)
-        & (output["Close"] < output["black_line"])
+    output["break_down_black_line"] = _crosses_line(
+        previous_close, previous_black_line, output["Close"], upward=False
     )
 
     # Red line takes display priority on downward breaks (opposite of breakout).
@@ -204,7 +201,7 @@ def add_breakdown_signals(df: pd.DataFrame) -> pd.DataFrame:
     )
     output["breakdown_line_price"] = np.select(
         [output["break_down_red_line"], output["break_down_black_line"]],
-        [output["red_line"], output["black_line"]],
+        [previous_red_line, previous_black_line],
         default=np.nan,
     )
     return output
@@ -310,7 +307,11 @@ def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> 
     return output
 
 
-def _add_consecutive_streak_flags(investor: pd.DataFrame, consecutive_days: int) -> pd.DataFrame:
+def _add_consecutive_streak_flags(
+    investor: pd.DataFrame,
+    consecutive_days: int,
+    market_trading_days=None,
+) -> pd.DataFrame:
     """Add the four N-day buy/sell streak flags, counting CALENDAR trading days.
 
     The streak must be N *consecutive trading days*, not N consecutive rows. A
@@ -318,12 +319,17 @@ def _add_consecutive_streak_flags(investor: pd.DataFrame, consecutive_days: int)
     (it did not trade, or that day's fetch failed) and reports a fake streak
     (§3.7 "最近 N 個交易日").
 
-    Every date present anywhere in the market-wide frame is treated as a trading
-    day in range; each stock is reindexed onto that axis, so a day it is missing
-    becomes a NaN net (neither >0 nor <0) that breaks both buy and sell streaks.
-    Holidays — absent from the whole market — are never invented. Only the dates
-    the stock actually reported are returned, so downstream date alignment is
-    unchanged.
+    The trading-day axis must be STOCK-INDEPENDENT. ``market_trading_days`` is
+    the whole-market set of real trading days in range (passed from the caller
+    BEFORE the flow frame is narrowed to the screened symbols). Deriving the
+    axis from this already-filtered frame instead would shrink it to the dates
+    the screened stocks happen to report, so in a single-/few-stock screen a day
+    that stock is missing would silently drop off the axis and the gap would be
+    bridged — a data-dependent fake streak. Each stock is reindexed onto the
+    shared axis, so a day it is missing becomes a NaN net (neither >0 nor <0)
+    that breaks both buy and sell streaks; holidays — absent from the whole
+    market — are never invented. Only the dates the stock actually reported are
+    returned, so downstream date alignment is unchanged.
     """
     flag_columns = _INVESTOR_FLAG_COLUMNS
     if investor.empty:
@@ -331,7 +337,14 @@ def _add_consecutive_streak_flags(investor: pd.DataFrame, consecutive_days: int)
             investor[col] = pd.Series(dtype=bool)
         return investor
 
-    trading_days = pd.DatetimeIndex(sorted(investor["Date"].unique()))
+    own_days = pd.DatetimeIndex(investor["Date"].unique())
+    if market_trading_days is not None and len(market_trading_days) > 0:
+        market_days = pd.DatetimeIndex(pd.to_datetime(pd.unique(market_trading_days)))
+        # Union guards the (impossible-by-construction but cheap to defend) case
+        # of a stock date absent from the market set, so no reported row is lost.
+        trading_days = own_days.union(market_days).sort_values()
+    else:
+        trading_days = own_days.sort_values()
     window = max(int(consecutive_days), 1)
 
     def _streaks(group: pd.DataFrame) -> pd.DataFrame:
@@ -375,8 +388,15 @@ def attach_investor_flow_flags(
     df: pd.DataFrame,
     investor_flow_df: pd.DataFrame,
     consecutive_days: int = 3,
+    market_trading_days=None,
 ) -> pd.DataFrame:
-    """Attach recent N-day institutional buy/sell flags to bars by stock and date."""
+    """Attach recent N-day institutional buy/sell flags to bars by stock and date.
+
+    ``market_trading_days`` is the whole-market trading-day axis (before the flow
+    frame was filtered to screened symbols); it is threaded into the streak
+    computation so the consecutive-day test does not silently bridge gaps in a
+    small screen (§3.7). See _add_consecutive_streak_flags.
+    """
     output = df.copy()
     output["Date"] = pd.to_datetime(output["Date"], errors="coerce")
     output = output.dropna(subset=["Date"]).copy()
@@ -401,7 +421,7 @@ def attach_investor_flow_flags(
     investor["foreign_net"] = investor["foreign_net"].fillna(0)
     investor["trust_net"] = investor["trust_net"].fillna(0)
     investor = investor.dropna(subset=["Date"]).sort_values(["BaseCode", "Date"]).reset_index(drop=True)
-    investor = _add_consecutive_streak_flags(investor, consecutive_days)
+    investor = _add_consecutive_streak_flags(investor, consecutive_days, market_trading_days)
 
     # 先把法人表按 BaseCode 分組建索引，避免之後逐檔股票全表掃描
     # （全市場 1800 檔時是 O(檔數 × 法人列數) 的劣化點）。
