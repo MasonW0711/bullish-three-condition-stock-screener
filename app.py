@@ -34,9 +34,7 @@ DEFAULT_PARAMETERS = app_config.DEFAULT_PARAMETERS
 DEFAULT_TEXT_STOCK_LIST = app_config.DEFAULT_TEXT_STOCK_LIST
 DIRECTION_FILTER_OPTIONS = app_config.DIRECTION_FILTER_OPTIONS
 DISPLAY_COLUMN_LABELS = app_config.DISPLAY_COLUMN_LABELS
-INVESTOR_FLAG_COLUMNS = app_config.INVESTOR_FLAG_COLUMNS
 LATEST_SUMMARY_COLUMNS = app_config.LATEST_SUMMARY_COLUMNS
-RESULT_COLUMNS = app_config.RESULT_COLUMNS
 SIGNAL_COLUMNS = app_config.SIGNAL_COLUMNS
 TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
 TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
@@ -287,18 +285,49 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
 
     investor_filters_enabled = bool(_selected_investor_columns(params))
     investor_flow_df = pd.DataFrame()
+    investor_market_trading_days = None
     if investor_filters_enabled:
         if progress_callback is not None:
             progress_callback(0.88, "正在下載法人買賣超資料...")
+        # Size the fetch window in TRADING days tied to BOTH the streak length N
+        # and the lookback window, then convert to calendar days (~5/7) with a
+        # holiday pad. The streak must be evaluable across the whole lookback
+        # window, not only the most recent bar, or older qualifying signals get
+        # silently dropped when N is large.
+        needed_trading_days = int(params.get("investor_consecutive_days", 3)) + int(
+            params.get("lookback_bars", 10)
+        )
+        investor_lookback_days = max(
+            int(app_config.INVESTOR_LOOKBACK_DAYS),
+            int(needed_trading_days * 1.6) + 14,
+        )
+        market_wide_flow_empty = True
         try:
             investor_flow_df = _download_investor_flow_data_cached(
                 end_date=params["end_date"],
-                lookback_days=max(
-                    int(app_config.INVESTOR_LOOKBACK_DAYS),
-                    int(params.get("investor_consecutive_days", 3)) + 10,
-                ),
+                lookback_days=investor_lookback_days,
             )
+            market_wide_flow_empty = investor_flow_df.empty
             if not investor_flow_df.empty:
+                # Capture the whole-market trading-day axis BEFORE narrowing the
+                # frame to screened symbols, so the consecutive-day streak does
+                # not bridge gaps in a small/single-stock screen (§3.7). Union in
+                # the attempted-but-failed dates (a date where BOTH TWSE and TPEX
+                # fetches errored has no rows, so it would otherwise drop off the
+                # axis and be bridged); those dates were real attempts, so a NaN
+                # gap there correctly breaks the streak. Holidays return empty
+                # (not an error) and never enter fetch_failure_dates, so they are
+                # not injected.
+                observed_days = pd.DatetimeIndex(
+                    pd.to_datetime(investor_flow_df["Date"], errors="coerce").dropna().unique()
+                )
+                failed_days = pd.DatetimeIndex(
+                    pd.to_datetime(
+                        pd.Index(investor_flow_df.attrs.get("fetch_failure_dates", [])),
+                        errors="coerce",
+                    ).dropna()
+                )
+                investor_market_trading_days = observed_days.union(failed_days)
                 screened_base_codes = {
                     str(code).split(".")[0].strip() for code in success_list
                 }
@@ -314,7 +343,10 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         fetch_attempts = int(investor_flow_df.attrs.get("fetch_attempts", 0))
         failed_dates = list(investor_flow_df.attrs.get("fetch_failure_dates", []))
         if investor_flow_df.empty:
-            messages.append({"level": "warning", "text": "目前無法取得最新法人買賣超資料，法人條件已視為未達成。"})
+            if market_wide_flow_empty:
+                messages.append({"level": "warning", "text": "目前無法取得最新法人買賣超資料，法人條件已視為未達成。"})
+            else:
+                messages.append({"level": "info", "text": "已取得法人買賣超資料，但本次篩選的股票在此期間沒有對應的法人買賣超紀錄，法人條件視為未達成。"})
         elif fetch_failures > 0:
             date_sample = "、".join(failed_dates[:5])
             date_more = f" 等共 {len(failed_dates)} 日" if len(failed_dates) > 5 else ""
@@ -332,6 +364,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         processed,
         investor_flow_df,
         consecutive_days=params.get("investor_consecutive_days", 3),
+        market_trading_days=investor_market_trading_days,
     )
 
     if not universe_df.empty and "StockName" in universe_df.columns:
@@ -755,9 +788,10 @@ def main():
     if excel_error:
         st.error(excel_error)
 
+    csv_direction_label = {"做多": "做多", "做空": "做空"}.get(direction_filter, "做多＋做空")
     download_col1, download_col2 = st.columns(2)
     download_col1.download_button(
-        label="下載 CSV 結果（做多＋做空）",
+        label=f"下載 CSV 結果（{csv_direction_label}）",
         data=csv_bytes,
         file_name=f"signals_{timeframe_code}.csv",
         mime="text/csv",

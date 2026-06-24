@@ -89,7 +89,15 @@ def _start_idle_shutdown_monitor(server, idle_timeout_seconds: float) -> None:
         last_connected_at = time.monotonic()
 
         while True:
-            browser_connected = bool(server.browser_is_connected)
+            try:
+                browser_connected = bool(server.browser_is_connected)
+            except Exception:
+                # Reading the connection state failed: the server has torn down
+                # its internals (it stopped on its own), or a future Streamlit
+                # renamed the attribute. Either way there is nothing left to
+                # monitor — exit cleanly instead of dying with an unhandled
+                # exception on this daemon thread or spinning forever.
+                return
             if browser_connected:
                 has_seen_browser_connection = True
                 last_connected_at = time.monotonic()
