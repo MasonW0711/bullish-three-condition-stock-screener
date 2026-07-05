@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "2.3.0"
-APP_UPDATED = "2026-06-24"
+APP_VERSION = "3.0.0"
+APP_UPDATED = "2026-07-05"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (
@@ -66,6 +66,8 @@ DEFAULT_PARAMETERS = {
     # v2 additions.
     "new_line_window": 5,
     "direction_filter": "全部",
+    # v3 addition: P1/P3 breakout-retest window (bars after the event).
+    "retest_window": 5,
     "foreign_buy_streak": False,
     "trust_buy_streak": False,
     "foreign_sell_streak": False,
@@ -164,6 +166,10 @@ DISPLAY_COLUMN_LABELS = {
     "active_new_line_type": "目前新線類型",
     "active_new_line_price": "目前新線價格",
     "new_line_window_valid": "新線窗格有效",
+    "bars_since_breakout": "突破後第幾根",
+    "bars_since_breakdown": "跌破後第幾根",
+    "breakout_window_valid": "突破回測窗有效",
+    "breakdown_window_valid": "跌破回測窗有效",
     "retest_hold_daily": "回測守住",
     "retest_reject_daily": "回測壓回",
     "p1_break_up_hold": "P1突破守住",
@@ -218,7 +224,8 @@ EXCEL_PARAMETER_LABELS = {
     "direction_filter": "方向過濾",
     "min_volume": "最小成交量（張）",
     "lookback_bars": "回看 K 棒數",
-    "new_line_window": "新線回測窗格（交易日）",
+    "new_line_window": "新線回測窗格（K 棒數）",
+    "retest_window": "突破回測窗格（K 棒數）",
     "investor_consecutive_days": "法人連續買賣超天數",
     "foreign_buy_streak": "外資連續買超條件（做多）",
     "trust_buy_streak": "投信連續買超條件（做多）",

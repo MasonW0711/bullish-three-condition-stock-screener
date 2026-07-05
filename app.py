@@ -85,6 +85,7 @@ def _build_params(
     lookback_bars: int,
     min_volume: int,
     new_line_window: int,
+    retest_window: int,
     direction_filter: str,
     investor_consecutive_days: int,
     foreign_buy_streak: bool,
@@ -99,6 +100,7 @@ def _build_params(
         "lookback_bars": int(lookback_bars),
         "min_volume": int(min_volume),
         "new_line_window": max(int(new_line_window), 1),
+        "retest_window": max(int(retest_window), 1),
         "direction_filter": direction_filter,
         "investor_consecutive_days": max(int(investor_consecutive_days), 1),
         "foreign_buy_streak": bool(foreign_buy_streak),
@@ -519,11 +521,21 @@ def _render_sidebar() -> dict:
             step=1,
         )
         new_line_window = st.number_input(
-            "新線回測窗格（交易日）",
+            "新線回測窗格（K 棒數）",
             min_value=1,
             value=DEFAULT_PARAMETERS["new_line_window"],
             step=1,
-            help="新紅／黑線出現後幾個交易日內，仍可作為 P2／P4 新線回測的基準線（不含出現當根）。",
+            help="新紅／黑線出現後幾根 K 棒內，仍可作為 P2／P4 新線回測的基準線（不含出現當根，以所選週期計）。",
+        )
+        retest_window = st.number_input(
+            "突破回測窗格（K 棒數）",
+            min_value=1,
+            value=DEFAULT_PARAMETERS["retest_window"],
+            step=1,
+            help=(
+                "向上突破／向下跌破後幾根 K 棒內，仍可作為 P1／P3 回測的基準線"
+                "（不含突破當根，以所選週期計）。窗格內收盤穿回基準線即提前失效。"
+            ),
         )
         direction_filter = st.selectbox(
             "方向過濾",
@@ -573,6 +585,7 @@ def _render_sidebar() -> dict:
             lookback_bars=lookback_bars,
             min_volume=min_volume,
             new_line_window=new_line_window,
+            retest_window=retest_window,
             direction_filter=direction_filter,
             investor_consecutive_days=investor_consecutive_days,
             foreign_buy_streak=foreign_buy_streak,
@@ -822,7 +835,8 @@ def main():
         f"目前分析週期：{saved_params['analysis_timeframe']}　"
         f"方向過濾：{direction_filter}　"
         f"回看 {saved_params['lookback_bars']} 根 K 棒　"
-        f"新線窗格 {saved_params.get('new_line_window', 5)} 日　"
+        f"新線窗格 {saved_params.get('new_line_window', 5)} 根　"
+        f"突破回測窗格 {saved_params.get('retest_window', 5)} 根　"
         f"最小成交量 {saved_params['min_volume']} 張　"
         f"法人條件：{'、'.join(active_investor_filters) if active_investor_filters else '無'}"
     )

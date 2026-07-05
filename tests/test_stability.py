@@ -224,16 +224,23 @@ class StabilityTests(unittest.TestCase):
         self.assertTrue(result.loc[2, "break_black_line_daily"])
         self.assertEqual(result.loc[2, "active_breakout_line_type"], "Black Line")
         self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
+        # v3: the breakout bar itself never self-counts as its own retest
+        # (bars_since_breakout == 0 is excluded from the window, §3.5a).
+        self.assertEqual(result.loc[2, "bars_since_breakout"], 0)
+        self.assertFalse(result.loc[2, "retest_hold_daily"])
+        # bar3 is the first post-breakout bar: a 由上往下 hold at the line -> P1.
         self.assertTrue(result.loc[3, "retest_hold_daily"])
         self.assertTrue(result.loc[3, "p1_break_up_hold"])
+        self.assertEqual(result.loc[3, "bars_since_breakout"], 1)
         self.assertFalse(result.loc[3, "p3_break_down_reject"])
         self.assertTrue(result.loc[3, "final_signal"])
 
     def test_long_retest_failure_is_not_a_long_signal(self):
         # bar2 breaks UP through the black line at 100; bar3 closes back below it
         # (97 < 100). The long P1 hold fails (close below the line), so there is
-        # no LONG signal — but closing back below a line you broke above is a
-        # genuine P3 breakdown-reject (short), so the bar IS a short final signal.
+        # no LONG signal. Bar3 is ALSO a downward break of that line, but in v3 a
+        # breakdown never self-counts as its own retest (bars_since_breakdown==0),
+        # so P3 does not fire on the event bar either -> no signal at all.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
@@ -256,10 +263,13 @@ class StabilityTests(unittest.TestCase):
         # excluded on the appearance bar.
         self.assertEqual(result.loc[3, "bars_since_new_line"], 0)
         self.assertFalse(result.loc[3, "p4_new_line_reject"])
-        # It IS a genuine P3 breakdown-reject of the black line at 100.
+        # Bar3 IS a genuine downward break of the black line at 100, but as the
+        # breakdown event bar (bars_since_breakdown == 0) it does NOT self-count
+        # as a P3 reject in v3 -> no short signal, no final signal.
         self.assertTrue(result.loc[3, "break_down_black_line"])
-        self.assertTrue(result.loc[3, "p3_break_down_reject"])
-        self.assertTrue(result.loc[3, "final_signal"])
+        self.assertEqual(result.loc[3, "bars_since_breakdown"], 0)
+        self.assertFalse(result.loc[3, "p3_break_down_reject"])
+        self.assertFalse(result.loc[3, "final_signal"])
 
     def test_invalid_universe_table_shape_raises_clear_error(self):
         bad_table = pd.DataFrame([["2330 台積電", "TW0002330008", "2020/01/01"]])
@@ -537,27 +547,36 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(bool(result["foreign_buy_streak_ok"].any()))
 
     def test_breakdown_sets_active_line_and_p3_reject(self):
-        # Red line at 100 (bar1 red success); bar2 closes below it -> P3 reject.
+        # Red line at 100 (bar1 red success); bar2 breaks DOWN through it (the
+        # breakdown event). In v3 the event bar does NOT self-count as a reject
+        # (bars_since_breakdown == 0); bar3 is the 由下往上 retest that rejects
+        # at/below the line -> P3 fires on bar3, not bar2.
         frame = pd.DataFrame(
             {
-                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
-                "StockCode": ["2330.TW"] * 3,
-                "Open": [100, 101, 104],
-                "High": [101, 104, 104],
-                "Low": [99, 100, 96],
-                "Close": [100, 103, 98],
-                "Volume": [1000, 1000, 1000],
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 104, 98],
+                "High": [101, 104, 104, 101],
+                "Low": [99, 100, 96, 97],
+                "Close": [100, 103, 98, 99],
+                "Volume": [1000, 1000, 1000, 1000],
             }
         )
 
         result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
 
+        # bar2 is the breakdown event: line detected, but no P3 on the event bar.
         self.assertTrue(result.loc[2, "break_down_red_line"])
         self.assertFalse(result.loc[2, "break_red_line_daily"])
         self.assertEqual(result.loc[2, "active_breakdown_line_type"], "Red Line")
         self.assertEqual(result.loc[2, "active_breakdown_line_price"], 100)
-        self.assertTrue(result.loc[2, "retest_reject_daily"])
-        self.assertTrue(result.loc[2, "p3_break_down_reject"])
+        self.assertEqual(result.loc[2, "bars_since_breakdown"], 0)
+        self.assertFalse(result.loc[2, "retest_reject_daily"])
+        # bar3 is the first post-breakdown bar and rejects below the line -> P3.
+        self.assertEqual(result.loc[3, "bars_since_breakdown"], 1)
+        self.assertEqual(result.loc[3, "active_breakdown_line_price"], 100)
+        self.assertTrue(result.loc[3, "retest_reject_daily"])
+        self.assertTrue(result.loc[3, "p3_break_down_reject"])
 
     def test_p3_reject_failure_when_close_above_line(self):
         # bar2 breaks the red line down (active breakdown line = 100); bar3 closes
@@ -707,17 +726,19 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[3, "break_down_black_line"])
 
     def test_direction_signals_explode_into_multiple_rows(self):
-        # bar2 satisfies both P3 (break-down reject) and P4 (new-line reject):
-        # two short rows, no long rows, and no cross-direction dedup.
+        # bar2 breaks down the red line at 100 (event); bar3 is the retest bar and
+        # satisfies BOTH P3 (break-down reject of the broken line, bars_since==1)
+        # and P4 (new-line reject within the new-line window): two short rows, no
+        # long rows, and no cross-direction dedup.
         frame = pd.DataFrame(
             {
-                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
-                "StockCode": ["2330.TW"] * 3,
-                "Open": [100, 101, 104],
-                "High": [101, 104, 104],
-                "Low": [99, 100, 96],
-                "Close": [100, 103, 98],
-                "Volume": [1000, 1000, 1000],
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 104, 98],
+                "High": [101, 104, 105, 101],
+                "Low": [99, 100, 96, 97],
+                "Close": [100, 103, 98, 99],
+                "Volume": [1000, 1000, 1000, 1000],
             }
         )
         processed = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
@@ -1013,15 +1034,16 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[0, "trust_buy_streak_ok"])
 
     def test_direction_filter_short_only_suppresses_long_side(self):
+        # bar2 breaks the red line down; bar3 rejects below it (P3) within window.
         frame = pd.DataFrame(
             {
-                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
-                "StockCode": ["2330.TW"] * 3,
-                "Open": [100, 101, 104],
-                "High": [101, 104, 104],
-                "Low": [99, 100, 96],
-                "Close": [100, 103, 98],
-                "Volume": [1000, 1000, 1000],
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 104, 98],
+                "High": [101, 104, 105, 101],
+                "Low": [99, 100, 96, 97],
+                "Close": [100, 103, 98, 99],
+                "Volume": [1000, 1000, 1000, 1000],
             }
         )
         processed = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
@@ -1069,6 +1091,353 @@ class StabilityTests(unittest.TestCase):
 
         self.assertEqual(len(summary), 1)
         self.assertEqual(summary.loc[0, "SignalType"], "P3_BreakDown_Reject")
+
+    # --- v3 retest-directionality regression tests (§3.4/§3.5) ---
+
+    def test_p1_retest_expires_after_retest_window(self):
+        # Black line 100 in force (bar1); bar2 breaks up (L=100, event). bars 3
+        # and 4 (bars_since 1,2) are valid retests within window=2; bar5
+        # (bars_since 3) satisfies every retest condition but is beyond the
+        # window -> no P1 (§3.5a). No attacks occur between bars, so the breakout
+        # group is never reset.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07", "2026-05-08"]
+                ),
+                "StockCode": ["2330.TW"] * 6,
+                "Open": [100, 99, 98.5, 103, 101, 102],
+                "High": [101, 100, 105, 104, 104, 104],
+                "Low": [99, 96, 97, 99, 99, 99],
+                "Close": [100, 98, 103, 101, 102, 101],
+                "Volume": [1000] * 6,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 2})
+
+        self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
+        self.assertTrue(result.loc[3, "retest_hold_daily"])   # bars_since 1
+        self.assertTrue(result.loc[4, "retest_hold_daily"])   # bars_since 2
+        self.assertEqual(result.loc[5, "bars_since_breakout"], 3)
+        self.assertFalse(result.loc[5, "breakout_window_valid"])
+        self.assertFalse(result.loc[5, "retest_hold_daily"])  # beyond window
+
+    def test_p1_requires_previous_bar_closed_on_line_side(self):
+        # A bar that touches and closes above the line is NOT a P1 unless the
+        # PREVIOUS bar closed on/above the line (由上往下 precondition, §3.5a).
+        # Here bar3 closes below the line, so bar4 (prev close below) cannot be a
+        # long retest even though it holds the line itself.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 99, 98.5, 101, 99],
+                "High": [101, 100, 105, 102, 101],
+                "Low": [99, 96, 97, 99, 99],
+                "Close": [100, 98, 103, 99, 100.5],
+                "Volume": [1000] * 5,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        # bar2 breaks up to L=100; bar3 closes 99 < 100 (window killed early).
+        self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
+        self.assertLess(result.loc[3, "Close"], 100)
+        # bar4 holds the line (Low<=100, Close>=100) but its previous bar (bar3)
+        # closed below the line -> not a valid 由上往下 retest.
+        self.assertLessEqual(result.loc[4, "Low"], 100)
+        self.assertGreaterEqual(result.loc[4, "Close"], 100)
+        self.assertFalse(result.loc[4, "retest_hold_daily"])
+
+    def test_p1_window_invalidated_by_close_through_line(self):
+        # Spec §3.5e case 2: the line moves via a fresh attack success inside the
+        # window, then a bar closes below the frozen L (breach). A later bar that
+        # meets every retest condition must still NOT fire P1 because the window
+        # was invalidated by the breach — the reclaim is not a fresh breakout, so
+        # the window is never re-armed.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08", "2026-05-11", "2026-05-12"]
+                ),
+                "StockCode": ["2330.TW"] * 8,
+                "Open": [100, 101, 104, 97, 104, 106, 98, 102],
+                "High": [101, 104, 105, 104, 106, 107, 102, 103],
+                "Low": [99, 100, 97, 96, 103, 98, 97, 99.5],
+                "Close": [100, 103, 98, 103, 105, 99, 101, 100.5],
+                "Volume": [1000] * 8,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        # bar3 is the breakout of L=100; bar5 closes 99 < 100 (breach).
+        self.assertEqual(result.loc[3, "active_breakout_line_price"], 100)
+        self.assertLess(result.loc[5, "Close"], 100)
+        # bar7 meets every retest condition against L=100 and is still inside the
+        # raw window (bars_since 4 <= 5), but the breach invalidated it -> no P1.
+        self.assertEqual(result.loc[7, "bars_since_breakout"], 4)
+        self.assertGreaterEqual(result.loc[7, "prev_close"], 100)
+        self.assertLessEqual(result.loc[7, "Low"], 100)
+        self.assertGreaterEqual(result.loc[7, "Close"], 100)
+        self.assertFalse(result.loc[7, "breakout_window_valid"])
+        self.assertFalse(result.loc[7, "retest_hold_daily"])
+
+    def test_dual_break_uses_higher_line_for_long_retest(self):
+        # A red line (100) and a black line (98) are both in force; bar5 breaks up
+        # through BOTH on one bar. The long retest baseline must be the HIGHER
+        # line (100), not the display-priority black line (98). bar6 pulls back
+        # to 100 and holds -> P1; had the engine picked 98, Low 99.6 > 98 would
+        # miss the line and drop the signal (§3.4).
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08", "2026-05-11"]
+                ),
+                "StockCode": ["2330.TW"] * 7,
+                "Open": [100, 101, 103, 97, 96, 97, 101],
+                "High": [101, 104, 104, 99, 98, 102, 103],
+                "Low": [99, 100, 97, 95, 95, 96, 99.6],
+                "Close": [100, 103, 98, 96, 97, 101, 100.4],
+                "Volume": [1000] * 7,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        self.assertEqual(result.loc[1, "red_line"], 100)
+        self.assertEqual(result.loc[3, "black_line"], 98)
+        # bar5 breaks both lines up; baseline is the higher line (100).
+        self.assertTrue(result.loc[5, "break_red_line_daily"])
+        self.assertTrue(result.loc[5, "break_black_line_daily"])
+        self.assertEqual(result.loc[5, "active_breakout_line_price"], 100)
+        self.assertEqual(result.loc[5, "active_breakout_line_type"], "Red Line")
+        # bar6 retests the higher line at 100 and holds -> P1.
+        self.assertTrue(result.loc[6, "retest_hold_daily"])
+
+    def test_gap_through_bar_still_counts_as_retest(self):
+        # §3.5d: the direction precondition is close-to-close only. A bar that
+        # gaps open BELOW the line but closes back on it is still a valid long
+        # retest, because the PREVIOUS bar closed above the line.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 99, 98.5, 100.5, 97],
+                "High": [101, 100, 105, 101, 101],
+                "Low": [99, 96, 97, 100, 96.5],
+                "Close": [100, 98, 103, 100.5, 100.0],
+                "Volume": [1000] * 5,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        # bar4 opens 97 (below L=100), trades down to 96.5, closes back at 100.
+        self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
+        self.assertLess(result.loc[4, "Open"], 100)
+        self.assertTrue(result.loc[4, "retest_hold_daily"])
+
+    def test_heterochromatic_first_window_bar_cannot_be_p2(self):
+        # §3.5d: a black line's appearance bar closes below the line, so the first
+        # window bar's previous close is below L and P2 (long hold) is impossible
+        # there even if that bar itself holds the line. It becomes possible only
+        # from the second window bar, once a prior bar has closed above L.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 99, 96, 101],
+                "High": [101, 100, 105, 105],
+                "Low": [99, 96, 99, 99],
+                "Close": [100, 97, 101, 102],
+                "Volume": [1000] * 4,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5})
+
+        # Black line 100 appears at bar1 (close 97 < 100).
+        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
+        # bar2 (window bar 1) holds the line but its prev close (97) is below L.
+        self.assertEqual(result.loc[2, "bars_since_new_line"], 1)
+        self.assertLessEqual(result.loc[2, "Low"], 100)
+        self.assertGreaterEqual(result.loc[2, "Close"], 100)
+        self.assertFalse(result.loc[2, "p2_new_line_hold"])
+        # bar3 (window bar 2) now has a prior close (101) above L -> P2 holds.
+        self.assertEqual(result.loc[3, "bars_since_new_line"], 2)
+        self.assertTrue(result.loc[3, "p2_new_line_hold"])
+
+    def test_p2_and_p4_can_fire_on_same_bar_both_directions(self):
+        # §3.8 degenerate co-occurrence: a single new line L=100, a bar whose
+        # previous close == L and whose own close == L (touching both High>=L and
+        # Low<=L) satisfies BOTH P2 (long) and P4 (short) -> one long row and one
+        # short row for that bar, no cross-direction dedup.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 99, 98, 100],
+                "High": [101, 100, 101, 101],
+                "Low": [99, 96, 97, 99],
+                "Close": [100, 98, 100, 100],
+                "Volume": [1000] * 4,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5})
+        self.assertTrue(result.loc[3, "p2_new_line_hold"])
+        self.assertTrue(result.loc[3, "p4_new_line_reject"])
+
+        processed = attach_investor_flow_flags(result, pd.DataFrame(), consecutive_days=3)
+        bundle = build_direction_signals(processed, {"direction_filter": "全部"})
+        bar3 = pd.Timestamp("2026-05-06")
+        long_bar3 = bundle["long_signals"][bundle["long_signals"]["Date"] == bar3]
+        short_bar3 = bundle["short_signals"][bundle["short_signals"]["Date"] == bar3]
+        self.assertEqual(list(long_bar3["signal_type"]), ["P2_NewLine_Hold"])
+        self.assertIn("P4_NewLine_Reject", set(short_bar3["signal_type"]))
+
+    def test_p3_window_invalidated_by_close_through_line(self):
+        # Short mirror of test_p1_window_invalidated_by_close_through_line: after a
+        # breakdown freezes L=100, a bar closes ABOVE L (breach, trend reclaimed).
+        # A later bar meeting every P3 reject condition and still inside the raw
+        # window must NOT fire P3 because the breach invalidated the window.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08", "2026-05-11", "2026-05-12"]
+                ),
+                "StockCode": ["2330.TW"] * 8,
+                "Open": [100, 99, 96, 103, 96, 94, 102, 98],
+                "High": [101, 100, 103, 104, 97, 102, 103, 100.5],
+                "Low": [99, 96, 95, 96, 94, 93, 98, 97],
+                "Close": [100, 97, 102, 97, 95, 101, 99, 99.5],
+                "Volume": [1000] * 8,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        # bar3 is the breakdown event (L=100); bar5 closes 101 > 100 (breach).
+        self.assertTrue(result.loc[3, "break_down_black_line"])
+        self.assertEqual(result.loc[3, "active_breakdown_line_price"], 100)
+        self.assertGreater(result.loc[5, "Close"], 100)
+        # bar7 meets every P3 reject condition and is inside the raw window
+        # (bars_since 4 <= 5), but the breach invalidated it -> no P3.
+        self.assertEqual(result.loc[7, "bars_since_breakdown"], 4)
+        self.assertLessEqual(result.loc[7, "prev_close"], 100)
+        self.assertGreaterEqual(result.loc[7, "High"], 100)
+        self.assertLessEqual(result.loc[7, "Close"], 100)
+        self.assertFalse(result.loc[7, "breakdown_window_valid"])
+        self.assertFalse(result.loc[7, "retest_reject_daily"])
+        self.assertFalse(result.loc[7, "p3_break_down_reject"])
+
+    def test_dual_break_down_uses_lower_line_for_short_retest(self):
+        # Short mirror of test_dual_break_uses_higher_line_for_long_retest: a red
+        # line (100) and a black line (110) are both in force; bar5 breaks DOWN
+        # through both on one bar. The short retest baseline must be the LOWER
+        # line (100). bar6 bounces to 100 and rejects -> P3; had the engine picked
+        # the higher line 110, High 100.2 < 110 would miss and drop the signal.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08", "2026-05-11"]
+                ),
+                "StockCode": ["2330.TW"] * 7,
+                "Open": [100, 101, 103, 108, 105, 111, 95],
+                "High": [101, 104, 111, 109, 112, 111, 100.2],
+                "Low": [99, 100, 103, 104, 105, 94, 94],
+                "Close": [100, 103, 110, 105, 111, 95, 99],
+                "Volume": [1000] * 7,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        self.assertEqual(result.loc[1, "red_line"], 100)
+        self.assertEqual(result.loc[3, "black_line"], 110)
+        # bar5 breaks both lines down; baseline is the lower line (100).
+        self.assertTrue(result.loc[5, "break_down_red_line"])
+        self.assertTrue(result.loc[5, "break_down_black_line"])
+        self.assertEqual(result.loc[5, "active_breakdown_line_price"], 100)
+        self.assertEqual(result.loc[5, "active_breakdown_line_type"], "Red Line")
+        # bar6 rejects at the lower line 100 -> P3.
+        self.assertEqual(result.loc[6, "bars_since_breakdown"], 1)
+        self.assertTrue(result.loc[6, "retest_reject_daily"])
+        self.assertTrue(result.loc[6, "p3_break_down_reject"])
+
+    def test_retest_window_boundary_respects_parameter(self):
+        # Pin the retest_window parameter's lower boundary: the same data run with
+        # window=1 vs window=2 must differ at bars_since==2. window=1 -> only the
+        # first post-breakout bar is valid; window=2 -> two bars are valid.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07", "2026-05-08"]
+                ),
+                "StockCode": ["2330.TW"] * 6,
+                "Open": [100, 99, 98.5, 103, 101, 102],
+                "High": [101, 100, 105, 104, 104, 104],
+                "Low": [99, 96, 97, 99, 99, 99],
+                "Close": [100, 98, 103, 101, 102, 101],
+                "Volume": [1000] * 6,
+            }
+        )
+
+        r1 = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 1})
+        r2 = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 2})
+
+        # bars_since == 1 (bar3) is valid under both windows.
+        self.assertTrue(r1.loc[3, "retest_hold_daily"])
+        self.assertTrue(r2.loc[3, "retest_hold_daily"])
+        # bars_since == 2 (bar4) is valid only when window >= 2.
+        self.assertFalse(r1.loc[4, "breakout_window_valid"])
+        self.assertFalse(r1.loc[4, "retest_hold_daily"])
+        self.assertTrue(r2.loc[4, "breakout_window_valid"])
+        self.assertTrue(r2.loc[4, "retest_hold_daily"])
+
+    def test_second_breakout_resets_window_without_breach_leak(self):
+        # Two separate breakouts of the same line (100) in one stock. The first
+        # window is invalidated by a breach (bar4 closes below 100); a fresh
+        # breakout at bar6 must reset bars_since to 0 and open a clean window —
+        # the earlier group's breach must NOT leak into the new group.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08", "2026-05-11", "2026-05-12"]
+                ),
+                "StockCode": ["2330.TW"] * 8,
+                "Open": [100, 99, 98.5, 103, 101, 97, 96, 103],
+                "High": [101, 100, 105, 104, 102, 98, 105, 104],
+                "Low": [99, 96, 97, 99, 96, 95, 96, 99],
+                "Close": [100, 98, 103, 101, 97, 96, 103, 101],
+                "Volume": [1000] * 8,
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+
+        # First breakout group works: bar3 holds the line.
+        self.assertEqual(result.loc[2, "bars_since_breakout"], 0)
+        self.assertTrue(result.loc[3, "retest_hold_daily"])
+        # bar4 closes below 100 (breach that killed the first window).
+        self.assertLess(result.loc[4, "Close"], 100)
+        # Second breakout at bar6 resets the counter and opens a clean window.
+        self.assertEqual(result.loc[6, "bars_since_breakout"], 0)
+        self.assertEqual(result.loc[7, "bars_since_breakout"], 1)
+        self.assertTrue(result.loc[7, "breakout_window_valid"])
+        self.assertTrue(result.loc[7, "retest_hold_daily"])
 
 
 if __name__ == "__main__":

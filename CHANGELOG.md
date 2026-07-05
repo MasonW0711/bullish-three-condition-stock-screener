@@ -2,6 +2,39 @@
 
 本檔記錄各版本的重要變更。日期為當地時間。
 
+## v3.0.0 — 2026-07-05
+
+回測方向性重設計。v2 的回測判定只有「觸線＋收盤守住／壓回」，沒有方向前提，突破棒本身經常被算成回測。v3 把「做多＝由下往上突破、由上往下回測」「做空＝完全相反」寫進引擎。
+
+### 正確性 / 領域規則（影響訊號結果）
+
+- **回測加入方向前提。** 做多回測棒要求**前一根收盤 ≥ 基準線**（由上往下），做空要求**前一根收盤 ≤ 基準線**（由下往上）。方向前提是收盤對收盤的近似：只比對前一根收盤，不看回測棒自身的開盤與盤中路徑（跳空穿線後收回仍算）。
+  - 檔案：`signal_engine.py`（`add_retest_hold_signals` 重寫、`add_new_line_window_signals` 加前提）。
+  - 回歸測試：`test_p1_requires_previous_bar_closed_on_line_side`、`test_gap_through_bar_still_counts_as_retest`。
+- **事件當根不再自算回測，且回測有窗格。** 突破／跌破棒本身（`bars_since == 0`）不計為回測；回測須在事件後 `retest_window` 根（新參數，預設 5，不含事件當根）內發生，過期失效。
+  - 回歸測試：`test_p1_retest_expires_after_retest_window`；並更新 `test_breakout_and_retest_hold_are_final_signal`。
+- **提前失效。** 突破後窗格內任一根收盤穿回基準線（做多 `Close < L`、做空 `Close > L`）即代表突破失敗，該回測窗自該根之後作廢，直到新的突破棒重啟窗格。守住（`Close >= L`）與失效互為補集，`Close == L` 恆歸守住側。
+  - 回歸測試：`test_p1_window_invalidated_by_close_through_line`（spec §3.5e 線價中途移動案例）。
+- **同根同向雙突破改依價位選基準線。** 一根同時向上突破紅、黑兩線時，回測基準取**較高**線（拉回先觸到的支撐）；同根雙跌破取**較低**線。不再沿用僅供顯示的顏色優先序（沿用會漏掉回測較高／較低那條線的正當訊號）。
+  - 檔案：`signal_engine.py`（`add_breakout_signals` / `add_breakdown_signals`）。
+  - 回歸測試：`test_dual_break_uses_higher_line_for_long_retest`。
+
+### 行為變更（訊號數會顯著縮水，屬預期）
+
+- P1／P3 不再發在突破／跌破當根；v2「跌破當根即壓回」的經典做空樣態一律消失，須事件後窗格內再度觸線且前一根收在正確一側才成立。做空側訊號數尤其明顯縮水。
+  - 更新的既有測試：`test_long_retest_failure_is_not_a_long_signal`、`test_breakdown_sets_active_line_and_p3_reject`、`test_direction_signals_explode_into_multiple_rows`、`test_direction_filter_short_only_suppresses_long_side`。
+- 黑線的 P2 於新線窗格第 1 根、紅線的 P4 於第 1 根，數學上不可能成立（出現當根收盤必在線的另一側）；異色首根樣態消失，最早於窗格第 2 根成立。
+  - 回歸測試：`test_heterochromatic_first_window_bar_cannot_be_p2`。
+- 週／月線上「突破與回測於同一根內完成」不再產生訊號（突破當根不計回測），此為高時框的常見型態。
+
+### 參數 / UI / 匯出
+
+- 新增參數 `retest_window`（預設 5）：側邊欄、`config.DEFAULT_PARAMETERS`、Excel `Parameter_Settings` 三處同步。
+- 窗格單位統一為「K 棒（根）」：修正 `new_line_window` 舊標籤「（交易日）」為「（K 棒數）」，UI help、結果摘要字串與 spec §3.4c/§3.5c/§6 一併更正（引擎一直是數根，v2 標籤誤寫）。
+- `All_Data` 新增欄位 `bars_since_breakout`、`bars_since_breakdown`、`breakout_window_valid`、`breakdown_window_valid`，並補上 `DISPLAY_COLUMN_LABELS` 中文標籤。
+- spec §6 補列一直生效卻漏列的 `min_volume`。
+- 回歸測試：`test_p2_and_p4_can_fire_on_same_bar_both_directions`（§3.8 同根多空並發）。
+
 ## v2.3.0 — 2026-06-24
 
 第二輪深度審查後的正確性、資料可靠性、安全與封裝強化。
