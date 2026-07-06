@@ -134,9 +134,12 @@ def _crosses_line(
     crossed. This keeps a genuine breakout/breakdown that coincides with a
     new-line bar (the over-suppression bug of v2.2.0), while still rejecting the
     "close lands between the old and new line" fake of §3.4a/§3.4b: that fake
-    close never clears the OLD level, so it fails this test. Equality of the
-    previous close to the line counts as a breakout (``<=``), never a breakdown
-    (``>=`` + strict ``<``), so the two can never both fire on one line/bar.
+    close never clears the OLD level, so it fails this test. A previous close
+    sitting exactly ON the line is eligible in BOTH directions (both
+    preconditions admit equality); the strict comparison on the CURRENT close
+    then decides which side fires, so the two can never both fire on one
+    line/bar. Keep the equality handling symmetric — assigning it to one side
+    only would break the long/short mirror.
     """
     if upward:
         return (

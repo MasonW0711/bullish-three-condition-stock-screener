@@ -651,8 +651,9 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[2, "p3_break_down_reject"])
 
     def test_prev_close_equal_to_line_is_breakout_not_breakdown(self):
-        # bar3 has prev_close == prev red_line (both 100); a close above must be a
-        # breakout, never a breakdown (§3.4 equality rule).
+        # bar3 has prev_close == prev red_line (both 100). Equality is
+        # direction-neutral (§3.4): the CURRENT close decides which side fires —
+        # here it closes above, so only the breakout side fires.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
@@ -669,6 +670,33 @@ class StabilityTests(unittest.TestCase):
 
         self.assertTrue(result.loc[3, "break_red_line_daily"])
         self.assertFalse(result.loc[3, "break_down_red_line"])
+        # Up-break and down-break can never both fire on the same line/bar.
+        self.assertFalse(bool((result["break_red_line_daily"] & result["break_down_red_line"]).any()))
+        self.assertFalse(bool((result["break_black_line_daily"] & result["break_down_black_line"]).any()))
+
+    def test_prev_close_equal_to_line_then_close_below_is_breakdown(self):
+        # Mirror of the previous test: bar3 has prev_close == prev red_line (both
+        # 100) and closes BELOW, so only the breakdown side fires. Pins the
+        # symmetric §3.4 equality rule — assigning equality to the breakout side
+        # only would silently kill this short trigger and break the long/short
+        # mirror.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 99, 99],
+                "High": [101, 104, 104, 99.5],
+                "Low": [99, 100, 99, 95],
+                "Close": [100, 103, 100, 96],
+                "Volume": [1000, 1000, 1000, 1000],
+            }
+        )
+
+        result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+
+        self.assertTrue(result.loc[3, "break_down_red_line"])
+        self.assertFalse(result.loc[3, "break_red_line_daily"])
+        self.assertEqual(result.loc[3, "breakdown_line_price"], 100)
         # Up-break and down-break can never both fire on the same line/bar.
         self.assertFalse(bool((result["break_red_line_daily"] & result["break_down_red_line"]).any()))
         self.assertFalse(bool((result["break_black_line_daily"] & result["break_down_black_line"]).any()))

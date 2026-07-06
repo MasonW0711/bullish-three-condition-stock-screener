@@ -21,7 +21,7 @@
 
 ### 行為變更（訊號數會顯著縮水，屬預期）
 
-- P1／P3 不再發在突破／跌破當根；v2「跌破當根即壓回」的經典做空樣態一律消失，須事件後窗格內再度觸線且前一根收在正確一側才成立。做空側訊號數尤其明顯縮水。
+- P1／P3 不再發在突破／跌破當根；v2「跌破當根即壓回」的經典做空樣態一律消失，須事件後窗格內再度觸線且前一根收在正確一側才成立。多空兩側訊號數都大幅縮水（同資料實測約砍半至三分之二），**相對比例**則依行情而定：偏空行情下做多側常縮得更多，升級後做空「佔比」可能反而上升，屬預期、並非做空側放寬。（2026-07-06 補記：原句「做空側訊號數尤其明顯縮水」經同資料實測修正。）
   - 更新的既有測試：`test_long_retest_failure_is_not_a_long_signal`、`test_breakdown_sets_active_line_and_p3_reject`、`test_direction_signals_explode_into_multiple_rows`、`test_direction_filter_short_only_suppresses_long_side`。
 - 黑線的 P2 於新線窗格第 1 根、紅線的 P4 於第 1 根，數學上不可能成立（出現當根收盤必在線的另一側）；異色首根樣態消失，最早於窗格第 2 根成立。
   - 回歸測試：`test_heterochromatic_first_window_bar_cannot_be_p2`。
