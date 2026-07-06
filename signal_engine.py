@@ -1,15 +1,21 @@
 """Signal calculation engine for the multi-direction (long/short) screener.
 
-v2 detects four signal paths and routes them by direction:
-- P1 BreakUp_Hold   (Long)  : upward breakout of red/black line, then hold above.
-- P2 NewLine_Hold   (Long)  : a freshly-appeared line, then hold above (within window).
-- P3 BreakDown_Reject (Short): downward break of red/black line, then reject below.
-- P4 NewLine_Reject (Short) : a freshly-appeared line, then reject below (within window).
+v3 detects four signal paths and routes them by direction:
+- P1 BreakUp_Hold   (Long)  : upward breakout of red/black line, then within the
+  retest window a 由上往下 retest that holds at/above the broken line.
+- P2 NewLine_Hold   (Long)  : a freshly-appeared line, then a 由上往下 hold within
+  the new-line window.
+- P3 BreakDown_Reject (Short): downward break, then within the window a 由下往上
+  retest rejected at/below the broken line.
+- P4 NewLine_Reject (Short) : a freshly-appeared line, then a 由下往上 reject.
 
-The long/up side keeps every v1 column name (break_red_line_daily,
-break_black_line_daily, breakout_line_type/price, active_breakout_line_*,
-retest_hold_daily) so existing consumers (charts, tests) keep working; the
-short/down and new-line columns are additive.
+v3 (vs v2) adds to every retest a direction precondition (the previous bar closed
+on the approach side of the line), a post-event retest window (retest_window;
+the event bar itself never self-counts), and early invalidation (a bar closing
+through the frozen line kills that window). Existing column names
+(break_*_line_daily, breakout_line_type/price, active_breakout_line_*,
+retest_hold_daily, retest_reject_daily) are preserved; bars_since_breakout/-down
+and breakout/breakdown_window_valid are additive.
 """
 
 from __future__ import annotations
@@ -160,16 +166,21 @@ def add_breakout_signals(df: pd.DataFrame) -> pd.DataFrame:
         previous_close, previous_black_line, output["Close"], upward=True
     )
 
-    # Black line takes display priority on upward breaks. The broken line is the
-    # PREVIOUS (in-force) level, so the retest baseline is previous_*_line.
+    # Retest baseline L is the PREVIOUS (in-force) level that was crossed. When a
+    # single line breaks, L is that line. When BOTH lines break on one bar, the
+    # retest baseline is the HIGHER line — on a pullback that is the level price
+    # touches first (§3.4). This is a signal rule, not the display priority
+    # (which stays black-first and only tints the chart marker).
+    both = output["break_red_line_daily"] & output["break_black_line_daily"]
+    red_higher = previous_red_line >= previous_black_line
     output["breakout_line_type"] = np.select(
-        [output["break_black_line_daily"], output["break_red_line_daily"]],
-        ["Black Line", "Red Line"],
+        [both & red_higher, both, output["break_red_line_daily"], output["break_black_line_daily"]],
+        ["Red Line", "Black Line", "Red Line", "Black Line"],
         default="None",
     )
     output["breakout_line_price"] = np.select(
-        [output["break_black_line_daily"], output["break_red_line_daily"]],
-        [previous_black_line, previous_red_line],
+        [both & red_higher, both, output["break_red_line_daily"], output["break_black_line_daily"]],
+        [previous_red_line, previous_black_line, previous_red_line, previous_black_line],
         default=np.nan,
     )
     return output
@@ -193,46 +204,139 @@ def add_breakdown_signals(df: pd.DataFrame) -> pd.DataFrame:
         previous_close, previous_black_line, output["Close"], upward=False
     )
 
-    # Red line takes display priority on downward breaks (opposite of breakout).
+    # Mirror of add_breakout_signals: when BOTH lines break down on one bar, the
+    # retest baseline is the LOWER line — on a bounce that is the level price
+    # touches first (§3.4). Display priority (red-first) is separate.
+    both_down = output["break_down_red_line"] & output["break_down_black_line"]
+    red_lower = previous_red_line <= previous_black_line
     output["breakdown_line_type"] = np.select(
-        [output["break_down_red_line"], output["break_down_black_line"]],
-        ["Red Line", "Black Line"],
+        [both_down & red_lower, both_down, output["break_down_red_line"], output["break_down_black_line"]],
+        ["Red Line", "Black Line", "Red Line", "Black Line"],
         default="None",
     )
     output["breakdown_line_price"] = np.select(
-        [output["break_down_red_line"], output["break_down_black_line"]],
-        [previous_red_line, previous_black_line],
+        [both_down & red_lower, both_down, output["break_down_red_line"], output["break_down_black_line"]],
+        [previous_red_line, previous_black_line, previous_red_line, previous_black_line],
         default=np.nan,
     )
     return output
 
 
-def add_retest_hold_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """Forward-fill the latest broken / broken-down line and flag retests.
+def _windowed_retest(
+    output: pd.DataFrame,
+    *,
+    event_price_col: str,
+    event_type_col: str,
+    upward: bool,
+    window: int,
+    active_price_out: str,
+    active_type_out: str,
+    bars_out: str,
+    valid_out: str,
+    retest_out: str,
+) -> None:
+    """Freeze L per breakout/breakdown event, window the retest, invalidate early.
 
-    Long hold (P1): Low <= line and Close >= line, against the broken line.
-    Short reject (P3): High >= line and Close <= line, against the broken-down line.
+    Vectorized, per (StockCode, event-group), no lookahead (§3.5a/b):
+    - event group = cumsum of the event flag, so each group starts at its event
+      bar; L = the event's line price, ffilled within the group. Before the first
+      event the group is 0 and L is NaN (bars_since is masked to NaN there, §4.4).
+    - bars_since = cumcount within the group (event bar = 0, excluded from the
+      window so a breakout never self-counts as its own retest, §3.5a).
+    - early invalidation: any bar in the group closing on the wrong side of L
+      (long: Close < L; short: Close > L) kills the window for every LATER bar in
+      that group. cumsum→shift(1) is taken WITHIN the group so the flag never
+      leaks across groups/stocks.
+    - direction precondition: the bar BEFORE the retest bar closed on/above L
+      (long) or on/below L (short) — the 由上往下 / 由下往上 approach (§3.5a/b).
     """
-    output = df.copy()
+    stock = output["StockCode"]
+    prev_close = output["prev_close"]
 
-    active_type = output["breakout_line_type"].where(output["breakout_line_type"] != "None")
-    active_price = output["breakout_line_price"].where(output["breakout_line_price"].notna())
-    output["active_breakout_line_type"] = active_type.groupby(output["StockCode"]).ffill()
-    output["active_breakout_line_price"] = active_price.groupby(output["StockCode"]).ffill()
-    output["retest_hold_daily"] = (
-        output["active_breakout_line_price"].notna()
-        & (output["Low"] <= output["active_breakout_line_price"])
-        & (output["Close"] >= output["active_breakout_line_price"])
+    event = output[event_price_col].notna()
+    group = event.groupby(stock).cumsum()
+    keys = [stock, group]
+
+    bars_since = output.groupby(keys).cumcount()
+    active_price = output[event_price_col].groupby(keys).ffill()
+    active_type = (
+        output[event_type_col]
+        .where(output[event_type_col] != "None")
+        .groupby(keys)
+        .ffill()
     )
 
-    active_down_type = output["breakdown_line_type"].where(output["breakdown_line_type"] != "None")
-    active_down_price = output["breakdown_line_price"].where(output["breakdown_line_price"].notna())
-    output["active_breakdown_line_type"] = active_down_type.groupby(output["StockCode"]).ffill()
-    output["active_breakdown_line_price"] = active_down_price.groupby(output["StockCode"]).ffill()
-    output["retest_reject_daily"] = (
-        output["active_breakdown_line_price"].notna()
-        & (output["High"] >= output["active_breakdown_line_price"])
-        & (output["Close"] <= output["active_breakdown_line_price"])
+    if upward:
+        breach = active_price.notna() & (output["Close"] < active_price)
+    else:
+        breach = active_price.notna() & (output["Close"] > active_price)
+    breach_before = (
+        breach.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
+    )
+
+    window_valid = (
+        active_price.notna()
+        & (bars_since >= 1)
+        & (bars_since <= window)
+        & ~breach_before
+    )
+    if upward:
+        retest = (
+            window_valid
+            & (prev_close >= active_price)
+            & (output["Low"] <= active_price)
+            & (output["Close"] >= active_price)
+        )
+    else:
+        retest = (
+            window_valid
+            & (prev_close <= active_price)
+            & (output["High"] >= active_price)
+            & (output["Close"] <= active_price)
+        )
+
+    output[active_price_out] = active_price
+    output[active_type_out] = active_type
+    output[bars_out] = bars_since.where(group >= 1)
+    output[valid_out] = window_valid.fillna(False).astype(bool)
+    output[retest_out] = retest.fillna(False).astype(bool)
+
+
+def add_retest_hold_signals(df: pd.DataFrame, retest_window: int) -> pd.DataFrame:
+    """Directional, windowed retest of the broken / broken-down line (§3.5a/b).
+
+    P1 long hold: within ``retest_window`` bars AFTER an upward breakout (the
+    breakout bar itself excluded), the previous bar closed on/above the frozen
+    line L (由上往下 precondition), this bar's Low touches L and Close holds
+    at/above L; the window dies early if any bar in it closes strictly below L.
+    P3 short reject is the exact mirror. See _windowed_retest.
+    """
+    output = df.copy()
+    window = max(int(retest_window), 1)
+
+    _windowed_retest(
+        output,
+        event_price_col="breakout_line_price",
+        event_type_col="breakout_line_type",
+        upward=True,
+        window=window,
+        active_price_out="active_breakout_line_price",
+        active_type_out="active_breakout_line_type",
+        bars_out="bars_since_breakout",
+        valid_out="breakout_window_valid",
+        retest_out="retest_hold_daily",
+    )
+    _windowed_retest(
+        output,
+        event_price_col="breakdown_line_price",
+        event_type_col="breakdown_line_type",
+        upward=False,
+        window=window,
+        active_price_out="active_breakdown_line_price",
+        active_type_out="active_breakdown_line_type",
+        bars_out="bars_since_breakdown",
+        valid_out="breakdown_window_valid",
+        retest_out="retest_reject_daily",
     )
     return output
 
@@ -264,13 +368,21 @@ def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.Da
         & (output["bars_since_new_line"] <= window)
     )
     output["new_line_window_valid"] = window_valid
+    # Directional precondition (§3.5c): the previous bar must have closed on the
+    # side the retest approaches from — above L for a long hold, below L for a
+    # short reject. A consequence (§3.5d): a black line's first window bar can
+    # never be P2 (its appearance bar closes below L) and a red line's first
+    # window bar can never be P4, so the heterochromatic first-bar case vanishes.
+    prev_close = output["prev_close"]
     output["p2_new_line_hold"] = (
         window_valid
+        & (prev_close >= output["active_new_line_price"])
         & (output["Low"] <= output["active_new_line_price"])
         & (output["Close"] >= output["active_new_line_price"])
     )
     output["p4_new_line_reject"] = (
         window_valid
+        & (prev_close <= output["active_new_line_price"])
         & (output["High"] >= output["active_new_line_price"])
         & (output["Close"] <= output["active_new_line_price"])
     )
@@ -547,7 +659,7 @@ def run_signal_pipeline(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     output = add_attack_lines(output)
     output = add_breakout_signals(output)
     output = add_breakdown_signals(output)
-    output = add_retest_hold_signals(output)
+    output = add_retest_hold_signals(output, retest_window=int(params.get("retest_window", 5)))
     output = add_new_line_window_signals(output, new_line_window=int(params.get("new_line_window", 5)))
     output = add_path_signals(output)
     output = add_final_filters(
