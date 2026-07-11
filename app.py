@@ -250,6 +250,13 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             "level": "warning",
             "text": f"部分股票批次下載失敗，可能是網路逾時或來源限流：{sample}{more}",
         })
+        # Transient batch failures (rate-limit / network timeouts) must not stay
+        # cached: st.cache_data would otherwise re-serve this partial result for
+        # the whole TTL with no retry, so re-clicking「開始篩選」would silently
+        # return the same holey data. Evict so an identical re-run re-downloads.
+        # Per-stock no-data failures (failed_list) do NOT trigger eviction — those
+        # are usually permanent (delisted / illiquid) and safe to cache.
+        _download_stock_data_cached.clear()
 
     if daily_data.empty:
         messages.append({"level": "warning", "text": "下載完成，但沒有取得任何可用股價資料。"})
@@ -361,6 +368,10 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             # Also record it in the batch-level diagnostics so it appears in the
             # Excel「下載失敗清單」alongside the stock download errors.
             download_errors.append(warning_text)
+            # Same reasoning as the stock-download cache: a partial investor-flow
+            # fetch (some dates errored) must not be re-served for the TTL, or the
+            # streak flags stay silently wrong. Evict so a re-run retries.
+            _download_investor_flow_data_cached.clear()
 
     processed = attach_investor_flow_flags(
         processed,

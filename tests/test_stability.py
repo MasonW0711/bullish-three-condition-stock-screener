@@ -1469,6 +1469,30 @@ class StabilityTests(unittest.TestCase):
         self.assertTrue(result.loc[7, "retest_hold_daily"])
 
 
+class PipelinePurityTests(unittest.TestCase):
+    def test_run_signal_pipeline_does_not_mutate_input(self):
+        # v3.2.0 memory optimization: the pipeline copies once at entry
+        # (add_prev_close) and mutates that owned frame in place through the
+        # later stages. The caller's frame must remain untouched — no new
+        # columns, no reordering, identical values.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 101, 103, 106, 108],
+                "High": [101, 104, 106, 109, 110],
+                "Low": [99, 100, 102, 105, 107],
+                "Close": [100, 103, 105, 108, 109],
+                "Volume": [5000] * 5,
+            }
+        )
+        before = frame.copy(deep=True)
+        run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+        pd.testing.assert_frame_equal(frame, before)
+
+
 class ChartEngineTests(unittest.TestCase):
     def _chart_frame(self, with_name: bool = False) -> pd.DataFrame:
         # Two attack successes so the red line changes level: 100 -> 105. This

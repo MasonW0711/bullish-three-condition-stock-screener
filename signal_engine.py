@@ -40,14 +40,17 @@ _PATH_SPECS = [
 
 def add_prev_close(df: pd.DataFrame) -> pd.DataFrame:
     """Add grouped prev_close = previous K-bar close, per StockCode."""
-    output = df.sort_values(["StockCode", "Date"]).copy()
+    # sort_values already returns a fresh, independent frame, so this is the
+    # single defensive copy that shields the caller's input; the later pipeline
+    # stages then mutate this owned frame in place (no further per-stage copies).
+    output = df.sort_values(["StockCode", "Date"])
     output["prev_close"] = output.groupby("StockCode")["Close"].shift(1)
     return output
 
 
 def add_attack_signals(df: pd.DataFrame) -> pd.DataFrame:
     """Detect Big Red / Big Black attacks with independent boolean masks."""
-    output = df.copy()
+    output = df  # pipeline stage: mutates the frame add_prev_close already owns
 
     has_prev = output["prev_close"].notna()
     red_attack_attempt = has_prev & (output["Open"] > output["prev_close"])
@@ -96,7 +99,7 @@ def add_attack_lines(df: pd.DataFrame) -> pd.DataFrame:
     Open<prev_close), so red_line_raw and black_line_raw can never both be
     non-null on the same bar — the new-line appearance is unambiguous (§3.3).
     """
-    output = df.copy()
+    output = df  # pipeline stage: mutates the owned frame in place
     red_line_raw = output["prev_close"].where(output["red_attack_success"])
     black_line_raw = output["prev_close"].where(output["black_attack_success"])
     output["red_line"] = red_line_raw.groupby(output["StockCode"]).ffill()
@@ -156,7 +159,7 @@ def _crosses_line(
 
 def add_breakout_signals(df: pd.DataFrame) -> pd.DataFrame:
     """Detect strict closes above the previous red_line or black_line (P1 trigger)."""
-    output = df.copy()
+    output = df  # pipeline stage: mutates the owned frame in place
 
     previous_close = output.groupby("StockCode")["Close"].shift(1)
     previous_red_line = output.groupby("StockCode")["red_line"].shift(1)
@@ -194,7 +197,7 @@ def add_breakdown_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     Mirror of add_breakout_signals via _crosses_line(upward=False).
     """
-    output = df.copy()
+    output = df  # pipeline stage: mutates the owned frame in place
 
     previous_close = output.groupby("StockCode")["Close"].shift(1)
     previous_red_line = output.groupby("StockCode")["red_line"].shift(1)
@@ -260,8 +263,11 @@ def _windowed_retest(
     group = event.groupby(stock).cumsum()
     keys = [stock, group]
 
-    bars_since = output.groupby(keys).cumcount()
-    active_price = output[event_price_col].groupby(keys).ffill()
+    # Build the (StockCode, event-group) grouping once and reuse it for every
+    # per-group op below instead of re-factorizing the same keys five times.
+    grouped = output.groupby(keys)
+    bars_since = grouped.cumcount()
+    active_price = grouped[event_price_col].ffill()
     active_type = (
         output[event_type_col]
         .where(output[event_type_col] != "None")
@@ -314,7 +320,7 @@ def add_retest_hold_signals(df: pd.DataFrame, retest_window: int) -> pd.DataFram
     at/above L; the window dies early if any bar in it closes strictly below L.
     P3 short reject is the exact mirror. See _windowed_retest.
     """
-    output = df.copy()
+    output = df  # pipeline stage: mutates the owned frame in place
     window = max(int(retest_window), 1)
 
     _windowed_retest(
@@ -352,7 +358,7 @@ def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.Da
     close is, by construction, on one side of the line, which would otherwise
     produce a degenerate signal identical to the attack (§3.5c).
     """
-    output = df.copy()
+    output = df  # pipeline stage: mutates the owned frame in place
     window = max(int(new_line_window), 1)
     appeared = output["new_line_appeared"].fillna(False).astype(bool)
 
@@ -394,7 +400,7 @@ def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.Da
 
 def add_path_signals(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize the four per-bar path booleans (pre volume / lookback gating)."""
-    output = df.copy()
+    output = df  # pipeline stage: mutates the owned frame in place
     output["p1_break_up_hold"] = output["retest_hold_daily"].fillna(False).astype(bool)
     output["p2_new_line_hold"] = output["p2_new_line_hold"].fillna(False).astype(bool)
     output["p3_break_down_reject"] = output["retest_reject_daily"].fillna(False).astype(bool)
@@ -404,7 +410,9 @@ def add_path_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> pd.DataFrame:
     """Apply direction-agnostic volume + lookback gating to each of the four paths."""
-    output = df.sort_values(["StockCode", "Date"]).copy()
+    # sort_values already returns a fresh frame; the produced final columns make
+    # this the pipeline's output frame, independent of the entry data.
+    output = df.sort_values(["StockCode", "Date"])
     group_sizes = output.groupby("StockCode")["Date"].transform("size")
     row_number = output.groupby("StockCode").cumcount()
 
