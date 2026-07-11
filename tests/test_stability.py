@@ -22,6 +22,7 @@ from data_loader import (
     normalize_yfinance_data,
     resample_ohlcv,
 )
+from chart_engine import create_stock_chart
 from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
 from export_engine import create_excel_bytes
 from config import EXCEL_SHEET_LABELS
@@ -1466,6 +1467,65 @@ class StabilityTests(unittest.TestCase):
         self.assertEqual(result.loc[7, "bars_since_breakout"], 1)
         self.assertTrue(result.loc[7, "breakout_window_valid"])
         self.assertTrue(result.loc[7, "retest_hold_daily"])
+
+
+class ChartEngineTests(unittest.TestCase):
+    def _chart_frame(self, with_name: bool = False) -> pd.DataFrame:
+        # Two attack successes so the red line changes level: 100 -> 105. This
+        # exercises the step-vs-diagonal rendering.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 101, 103, 106, 108],
+                "High": [101, 104, 106, 109, 110],
+                "Low": [99, 100, 102, 105, 107],
+                "Close": [100, 103, 105, 108, 109],
+                "Volume": [1000] * 5,
+            }
+        )
+        processed = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+        if with_name:
+            processed["StockName"] = "台積電"
+        return processed
+
+    def test_red_line_uses_step_shape_not_diagonal(self):
+        # The ffilled red/black lines are step functions; they must be drawn with
+        # line_shape="hv" so a level change renders as a horizontal step, not a
+        # diagonal ramp through prices that were never the line.
+        fig, message = create_stock_chart(self._chart_frame(), "日 K")
+        self.assertIsNone(message)
+        line_traces = [t for t in fig.data if getattr(t, "name", None) in {"紅線", "黑線"}]
+        self.assertTrue(line_traces, "expected at least one red/black line trace")
+        for trace in line_traces:
+            self.assertEqual(trace.line.shape, "hv")
+
+    def test_candles_use_taiwan_colors(self):
+        # Taiwan convention: up = red, down = green (opposite of the US/plotly
+        # default). Guard against a silent revert to the default palette.
+        fig, _ = create_stock_chart(self._chart_frame(), "日 K")
+        candles = [t for t in fig.data if t.type == "candlestick"]
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].increasing.fillcolor, "#dc2626")
+        self.assertEqual(candles[0].decreasing.fillcolor, "#16a34a")
+
+    def test_title_includes_stock_name_from_column(self):
+        fig, _ = create_stock_chart(self._chart_frame(with_name=True), "日 K")
+        self.assertIn("2330.TW", fig.layout.title.text)
+        self.assertIn("台積電", fig.layout.title.text)
+
+    def test_title_includes_stock_name_from_argument(self):
+        fig, _ = create_stock_chart(self._chart_frame(), "日 K", stock_name="鴻海")
+        self.assertIn("鴻海", fig.layout.title.text)
+
+    def test_chart_works_without_stock_name(self):
+        # StockName is optional; a frame without it (older callers/tests) still
+        # renders and the title falls back to the code alone.
+        fig, message = create_stock_chart(self._chart_frame(), "日 K")
+        self.assertIsNone(message)
+        self.assertIn("2330.TW", fig.layout.title.text)
 
 
 if __name__ == "__main__":

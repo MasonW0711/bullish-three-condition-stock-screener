@@ -376,6 +376,14 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
     else:
         processed["StockName"] = processed["StockCode"]
 
+    # The join appends StockName last; move it next to StockCode so the Excel
+    # All_Data sheet reads code-then-name like the signal/summary sheets do.
+    ordered_cols = processed.columns.tolist()
+    ordered_cols.remove("StockName")
+    insert_at = ordered_cols.index("StockCode") + 1 if "StockCode" in ordered_cols else 0
+    ordered_cols.insert(insert_at, "StockName")
+    processed = processed[ordered_cols]
+
     direction_bundle = build_direction_signals(processed, params)
     long_signals = direction_bundle["long_signals"]
     short_signals = direction_bundle["short_signals"]
@@ -443,9 +451,19 @@ def _render_direction_results(
         st.info(f"目前沒有可供選擇的{direction_label}股票。")
         return
 
+    name_lookup: dict[str, str] = {}
+    if signals_df is not None and not signals_df.empty and "StockName" in signals_df.columns:
+        for code, name in zip(signals_df["StockCode"].astype(str), signals_df["StockName"].astype(str)):
+            name_lookup.setdefault(code, name)
+
+    def _format_stock(code: str) -> str:
+        name = name_lookup.get(code, "")
+        return f"{code} {name}".strip() if name and name != code else code
+
     selected_stock = st.selectbox(
         "選擇股票",
         options=signal_stock_codes,
+        format_func=_format_stock,
         key=f"{key_prefix}_chart_select",
     )
     selected_df = all_data[all_data["StockCode"] == selected_stock].copy()
@@ -454,6 +472,7 @@ def _render_direction_results(
             selected_df,
             timeframe_label=saved_params["analysis_timeframe"],
             direction=direction_label,
+            stock_name=name_lookup.get(str(selected_stock)),
         )
     except Exception as exc:
         figure, chart_message = None, f"建立圖表時發生錯誤：{exc}"
