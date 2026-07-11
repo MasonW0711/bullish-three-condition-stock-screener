@@ -781,8 +781,9 @@ def main():
     st.subheader("結果下載")
     timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
 
-    # 匯出內容只在新一次篩選後改變；以 run_id 快取，避免每次 UI 互動
-    # （例如切換 K 線圖股票）都對全量資料重建 Excel。
+    # CSV（僅訊號列，很小）在每次新篩選後即時建立並以 run_id 快取；Excel 因含
+    # All_Data 全量工作表、對全市場執行時建構成本高（openpyxl 數十萬列），改為
+    # 延遲到使用者按下「準備 Excel」才建，避免從未下載時白白耗費 CPU／記憶體。
     run_id = st.session_state.get("screening_run_id", 0)
     export_cache = st.session_state.get("export_cache")
     if export_cache is None or export_cache.get("run_id") != run_id:
@@ -798,38 +799,20 @@ def main():
             if not display_combined.empty
             else b""
         )
-
-        excel_bytes = b""
-        excel_error = None
-        try:
-            excel_bytes = create_excel_bytes(
-                all_data=all_data,
-                long_signals=long_signals,
-                short_signals=short_signals,
-                latest_summary_long=latest_summary_long,
-                latest_summary_short=latest_summary_short,
-                failed_list=failed_list,
-                params=saved_params,
-                download_notes=results.get("download_errors", []),
-            )
-        except Exception as exc:
-            excel_error = f"建立 Excel 匯出檔時發生錯誤：{exc}"
-
         export_cache = {
             "run_id": run_id,
             "csv_bytes": csv_bytes,
             "csv_empty": display_combined.empty,
-            "excel_bytes": excel_bytes,
-            "excel_error": excel_error,
         }
         st.session_state["export_cache"] = export_cache
 
     csv_bytes = export_cache["csv_bytes"]
-    excel_bytes = export_cache["excel_bytes"]
-    excel_error = export_cache["excel_error"]
 
-    if excel_error:
-        st.error(excel_error)
+    # Lazily-built Excel, cached in session by run_id.
+    excel_state = st.session_state.get("excel_export")
+    if excel_state is None or excel_state.get("run_id") != run_id:
+        excel_state = {"run_id": run_id, "bytes": None, "error": None}
+        st.session_state["excel_export"] = excel_state
 
     csv_direction_label = {"做多": "做多", "做空": "做空"}.get(direction_filter, "做多＋做空")
     download_col1, download_col2 = st.columns(2)
@@ -841,14 +824,42 @@ def main():
         disabled=bool(export_cache["csv_empty"]),
         width="stretch",
     )
-    download_col2.download_button(
-        label="下載 Excel 結果",
-        data=excel_bytes,
-        file_name=f"signals_{timeframe_code}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=all_data.empty or bool(excel_error),
-        width="stretch",
-    )
+    with download_col2:
+        if excel_state["bytes"] is None and excel_state["error"] is None:
+            if st.button(
+                "準備 Excel 匯出檔",
+                disabled=all_data.empty,
+                width="stretch",
+                key="prepare_excel",
+                help="Excel 含 All_Data 全量資料，建構較久，按此開始建立。",
+            ):
+                with st.spinner("正在建立 Excel 匯出檔（含 All_Data 全量資料）..."):
+                    try:
+                        excel_state["bytes"] = create_excel_bytes(
+                            all_data=all_data,
+                            long_signals=long_signals,
+                            short_signals=short_signals,
+                            latest_summary_long=latest_summary_long,
+                            latest_summary_short=latest_summary_short,
+                            failed_list=failed_list,
+                            params=saved_params,
+                            download_notes=results.get("download_errors", []),
+                        )
+                    except Exception as exc:
+                        excel_state["error"] = f"建立 Excel 匯出檔時發生錯誤：{exc}"
+                st.session_state["excel_export"] = excel_state
+                st.rerun()
+        if excel_state["error"]:
+            st.error(excel_state["error"])
+        elif excel_state["bytes"] is not None:
+            st.download_button(
+                label="下載 Excel 結果",
+                data=excel_state["bytes"],
+                file_name=f"signals_{timeframe_code}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+                key="download_excel",
+            )
 
     days = saved_params.get("investor_consecutive_days", 3)
     active_investor_filters = [
