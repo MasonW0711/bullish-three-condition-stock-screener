@@ -1,11 +1,15 @@
 import contextlib
+import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from io import StringIO
 from unittest.mock import Mock, patch
 
 import pandas as pd
+
+import data_loader
+from price_cache import load_snapshot, save_snapshot
 
 with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
     from app import _compute_latest_summary, _run_screening
@@ -1493,6 +1497,103 @@ class PipelinePurityTests(unittest.TestCase):
         before = frame.copy(deep=True)
         run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
         pd.testing.assert_frame_equal(frame, before)
+
+
+class PriceCacheTests(unittest.TestCase):
+    def _daily(self):
+        return pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07"]),
+                "StockCode": "2330.TW",
+                "Open": [100.0, 101.0, 102.0],
+                "High": [101.0, 102.0, 103.0],
+                "Low": [99.0, 100.0, 101.0],
+                "Close": [100.5, 101.5, 102.5],
+                "Volume": [1_000_000.0, 1_100_000.0, 1_200_000.0],
+            }
+        )
+
+    def test_snapshot_round_trip(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = (self._daily(), ["2330.TW"], ["9999.TW"], [])
+            save_snapshot(cache_dir, ["2330.TW", "9999.TW"], date(2026, 1, 1), date(2026, 1, 8), result)
+            loaded = load_snapshot(cache_dir, ["2330.TW", "9999.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            self.assertIsNotNone(loaded)
+            pd.testing.assert_frame_equal(loaded[0].reset_index(drop=True), result[0].reset_index(drop=True))
+            self.assertEqual(loaded[1], ["2330.TW"])
+            self.assertEqual(loaded[2], ["9999.TW"])
+
+    def test_historical_window_reused_then_expires(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            captured = datetime(2026, 7, 1, 10, 0, 0)
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                          (self._daily(), ["2330.TW"], [], []), now=captured)
+            # Window ends in the past → reusable for a few days …
+            self.assertIsNotNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                              now=captured + timedelta(days=3))
+            )
+            # … but not past HISTORICAL_MAX_AGE_DAYS (7).
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                              now=captured + timedelta(days=8))
+            )
+
+    def test_current_day_window_uses_short_ttl(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            captured = datetime(2026, 7, 1, 10, 0, 0)
+            # end == the run day → the last bar still evolves, so short TTL only.
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                          (self._daily(), ["2330.TW"], [], []), now=captured)
+            self.assertIsNotNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                              now=captured + timedelta(minutes=10))
+            )
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                              now=captured + timedelta(minutes=40))
+            )
+
+    def test_corrupt_snapshot_falls_back_to_none(self):
+        import glob
+        import os
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                          (self._daily(), ["2330.TW"], [], []))
+            for meta in glob.glob(os.path.join(cache_dir, "*.json")):
+                with open(meta, "w", encoding="utf-8") as handle:
+                    handle.write("{ not valid json")
+            self.assertIsNone(load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1)))
+
+    def test_download_stock_data_serves_second_call_from_disk(self):
+        daily = self._daily()
+        calls = []
+
+        def fake_uncached(codes, start, end, progress_callback=None):
+            calls.append(list(codes))
+            return daily.copy(), list(codes), [], []
+
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+            data_loader, "_download_stock_data_uncached", side_effect=fake_uncached
+        ):
+            first = data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+            second = data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+        self.assertEqual(len(calls), 1)  # second call served from disk snapshot
+        pd.testing.assert_frame_equal(first[0].reset_index(drop=True), second[0].reset_index(drop=True))
+
+    def test_download_stock_data_does_not_cache_batch_errors(self):
+        daily = self._daily()
+
+        def fake_uncached(codes, start, end, progress_callback=None):
+            return daily.copy(), list(codes), [], ["第 1 批下載失敗（網路或來源異常）：Timeout"]
+
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+            data_loader, "_download_stock_data_uncached", side_effect=fake_uncached
+        ):
+            data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+            # A batch-errored result must not be persisted.
+            self.assertIsNone(load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8)))
 
 
 class ScreeningServiceTests(unittest.TestCase):

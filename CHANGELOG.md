@@ -2,6 +2,29 @@
 
 本檔記錄各版本的重要變更。日期為當地時間。
 
+## v3.2.0 — 2026-07-11
+
+效能、可靠性與可測性強化。訊號邏輯（引擎輸出）逐格 byte-identical，未改變任何篩選結果；差分測試（合成資料＋真實台股）驗證。
+
+### 效能
+
+- **訊號 pipeline 記憶體：9 次 `df.copy()` → 單次 owned copy。** `run_signal_pipeline` 過去每階段都複製整個成長中的大 frame；現在 `add_prev_close` 的排序產生唯一 owned frame，後續階段就地寫入。`_windowed_retest` 的 `(StockCode, event-group)` 分組改為建立一次重用。（`signal_engine.py`）
+  - 回歸測試：`test_run_signal_pipeline_does_not_mutate_input`＋差分 byte-identical 驗證。
+- **法人流程兩個 per-stock 迴圈向量化。** `_add_consecutive_streak_flags` 改為 pivot 成（交易日 × 股票）矩陣、沿日期軸一次 rolling；`attach_investor_flow_flags` 改用單一 `pd.merge_asof(by="BaseCode")`。1800 檔約 190ms。（`signal_engine.py`）
+- **股價下載本機快照快取（`price_cache.py`）。** 因下載採 `auto_adjust=True`（除息／分割會回溯調整整段歷史），不可做增量續抓（會混用調整基準、製造假突破）；改為以「整份結果」為單位的磁碟快照，鍵為 (代號, 起訖)，含新鮮度守則（歷史區間 7 天、含當日的區間 30 分），fail-open。桌面版閒置 15 秒即關閉、每次開啟都是冷啟動，此快取讓「近期已下載過的相同條件」由數分鐘變數秒（實測 523ms→29ms）。
+  - 回歸測試：`PriceCacheTests`（round-trip、新鮮度、fail-open、磁碟命中、批次錯誤不入快取）。
+- **Excel 匯出改為延遲建構。** 含 All_Data 全量工作表的 Excel 只在使用者按「準備 Excel」時才建，避免從未下載時白白耗費 CPU／記憶體。CSV（僅訊號）維持即時。
+
+### 可靠性 / 可測性
+
+- **暫時性下載失敗不再污染快取。** 股價批次的限流／逾時（`download_errors`）會清除 `st.cache_data`，避免殘缺結果被整個 TTL 重複回傳；per-stock 無資料失敗（多為下市）則保留。法人部分抓取失敗同理。
+- **`_run_screening` 依賴注入化。** 資料存取與快取清除改為可注入，整個編排流程可用假資料單元測試。（`ScreeningServiceTests`）
+
+### 封裝 / CI
+
+- `build-desktop-executables.yml` 加 `timeout-minutes: 30`（直接上限化過去 v2.2/v2.3 卡到 24 小時的 build）與 `cache: pip`。
+- `requirements.txt` 新增 `pyarrow`（price_cache 的 parquet 引擎）。
+
 ## v3.1.0 — 2026-07-07
 
 K 線圖繪製修正與股票名稱顯示。引擎（訊號邏輯）零變更；本版僅改圖表層與 UI。

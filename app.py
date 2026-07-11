@@ -19,6 +19,7 @@ from data_loader import (
     resample_ohlcv,
 )
 from export_engine import create_excel_bytes
+from price_cache import default_cache_dir
 from signal_engine import (
     attach_investor_flow_flags,
     build_direction_signals,
@@ -73,6 +74,7 @@ def _download_stock_data_cached(
         start_date=start_date,
         end_date=end_date,
         progress_callback=_progress_callback,
+        cache_dir=default_cache_dir(),
     )
 
 
