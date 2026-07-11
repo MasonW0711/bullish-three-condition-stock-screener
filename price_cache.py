@@ -41,7 +41,12 @@ _SNAPSHOT_RESULT = tuple  # (daily_data: DataFrame, success: list, failed: list,
 
 
 def default_cache_dir() -> Path:
-    """Per-user cache directory (mirrors desktop_launcher's runtime-dir choice)."""
+    """Per-user cache directory.
+
+    Uses the platform cache location: ``%LOCALAPPDATA%`` on Windows, otherwise
+    ``$XDG_CACHE_HOME`` or ``~/.cache``. (desktop_launcher writes LOGS to a
+    different per-platform dir; this is a cache, so it lives under the cache root.)
+    """
     home = Path.home()
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
@@ -51,7 +56,9 @@ def default_cache_dir() -> Path:
 
 
 def _snapshot_key(codes, start_date, end_date) -> str:
-    payload = "|".join(sorted(str(code) for code in codes)) + f"@{start_date}~{end_date}"
+    # Sorted + deduped: the downloaded frame is order-independent and each symbol
+    # appears once, so [A, A, B] and [B, A] must map to the same snapshot.
+    payload = "|".join(sorted({str(code) for code in codes})) + f"@{start_date}~{end_date}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -78,18 +85,25 @@ def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[
         tmp_path = parquet_path.with_suffix(".parquet.tmp")
         daily_data.to_parquet(tmp_path, index=False)
         os.replace(tmp_path, parquet_path)
-        meta_path.write_text(
-            json.dumps(
-                {
-                    "captured_at": now.isoformat(),
-                    "end": str(end_date),
-                    "success_list": list(success_list),
-                    "failed_list": list(failed_list),
-                    "download_errors": list(download_errors),
-                }
-            ),
-            encoding="utf-8",
+        meta_payload = json.dumps(
+            {
+                "captured_at": now.isoformat(),
+                "end": str(end_date),
+                # Whether the window still included the (evolving, possibly partial)
+                # current day AT CAPTURE. This is fixed here, not recomputed at load,
+                # so a snapshot taken intraday keeps its short TTL even after the
+                # calendar rolls the end_date into the past.
+                "end_was_current": _as_date(end_date) >= now.date(),
+                "success_list": list(success_list),
+                "failed_list": list(failed_list),
+                "download_errors": list(download_errors),
+            }
         )
+        # Atomic sidecar write too, so a crash can never pair a new parquet with a
+        # torn/old metadata file.
+        meta_tmp = meta_path.with_suffix(".json.tmp")
+        meta_tmp.write_text(meta_payload, encoding="utf-8")
+        os.replace(meta_tmp, meta_path)
     except Exception as exc:  # noqa: BLE001 - cache is best-effort
         logger.warning("價格快照寫入失敗（略過快取）：%s", exc)
 
@@ -110,8 +124,14 @@ def load_snapshot(cache_dir, codes, start_date, end_date, now: Optional[datetime
         age_seconds = (now - captured_at).total_seconds()
         if age_seconds < 0:
             return None  # clock moved backwards; distrust the snapshot
-        if _as_date(end_date) >= now.date():
-            # Window includes the still-evolving current day: short TTL only.
+        # Use the capture-time classification (fall back to a load-time estimate
+        # for snapshots written before this field existed). A window that was
+        # current at capture has a possibly-partial last bar forever, so it must
+        # never be promoted to the long historical TTL once the date rolls over.
+        end_was_current = info.get("end_was_current")
+        if end_was_current is None:
+            end_was_current = _as_date(end_date) >= now.date()
+        if end_was_current:
             if age_seconds > RECENT_END_TTL_SECONDS:
                 return None
         elif age_seconds > HISTORICAL_MAX_AGE_DAYS * 86400:

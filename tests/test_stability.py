@@ -1554,6 +1554,19 @@ class PriceCacheTests(unittest.TestCase):
                               now=captured + timedelta(minutes=40))
             )
 
+    def test_intraday_snapshot_not_promoted_after_date_rollover(self):
+        # A snapshot captured intraday (end == the capture day, partial last bar)
+        # must stay on the short TTL even after the calendar rolls its end_date
+        # into the past — it must NOT be reclassified as a final historical window.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            captured = datetime(2026, 7, 1, 11, 0, 0)
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                          (self._daily(), ["2330.TW"], [], []), now=captured)
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                              now=datetime(2026, 7, 3, 11, 0, 0))
+            )
+
     def test_corrupt_snapshot_falls_back_to_none(self):
         import glob
         import os
