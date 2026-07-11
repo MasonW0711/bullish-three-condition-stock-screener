@@ -1,13 +1,15 @@
 import contextlib
 import unittest
+from datetime import date
 from io import BytesIO
 from io import StringIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
-    from app import _compute_latest_summary
+    from app import _compute_latest_summary, _run_screening
+from config import DEFAULT_PARAMETERS
 from config import LATEST_SUMMARY_COLUMNS
 from data_loader import (
     _download_candidate,
@@ -1491,6 +1493,103 @@ class PipelinePurityTests(unittest.TestCase):
         before = frame.copy(deep=True)
         run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
         pd.testing.assert_frame_equal(frame, before)
+
+
+class ScreeningServiceTests(unittest.TestCase):
+    """Cover the injected _run_screening orchestration + the fix-② cache eviction."""
+
+    def _params(self, **overrides):
+        params = dict(DEFAULT_PARAMETERS)
+        params["start_date"] = date(2026, 1, 1)
+        params["end_date"] = date(2026, 3, 1)
+        params["min_volume"] = 0
+        params.update(overrides)
+        return params
+
+    def _universe(self):
+        return pd.DataFrame(
+            {
+                "StockCode": ["2330.TW", "2317.TW"],
+                "BaseCode": ["2330", "2317"],
+                "StockName": ["台積電", "鴻海"],
+                "MarketLabel": ["上市", "上市"],
+                "Industry": ["半導體", "電子"],
+            }
+        )
+
+    def _daily(self, codes):
+        dates = pd.bdate_range("2026-01-01", periods=40)
+        frames = []
+        for i, code in enumerate(codes):
+            close = 100 + pd.Series(range(40)) * 0.3 + i
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "Date": dates,
+                        "StockCode": code,
+                        "Open": close - 0.5,
+                        "High": close + 1.0,
+                        "Low": close - 1.0,
+                        "Close": close,
+                        "Volume": 5_000_000,
+                    }
+                )
+            )
+        return pd.concat(frames, ignore_index=True)
+
+    def _run(self, download_stock, download_investor=None, on_stock_download_error=None, **pkw):
+        return _run_screening(
+            self._params(**pkw),
+            use_auto_universe=True,
+            manual_codes=[],
+            load_universe=self._universe,
+            download_stock=download_stock,
+            download_investor=download_investor or (lambda end_date, lookback_days: pd.DataFrame()),
+            on_stock_download_error=on_stock_download_error or Mock(),
+            on_investor_fetch_failure=Mock(),
+        )
+
+    def test_run_screening_happy_path(self):
+        result = self._run(lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []))
+        self.assertFalse(result["all_data"].empty)
+        self.assertEqual(sorted(result["success_list"]), ["2317.TW", "2330.TW"])
+        self.assertTrue(result["used_auto_universe"])
+        # StockName joined and moved next to StockCode.
+        self.assertIn("StockName", result["all_data"].columns)
+
+    def test_evicts_cache_on_transient_download_error(self):
+        evict = Mock()
+        self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], ["第 1 批下載失敗（網路或來源異常）：Timeout"]),
+            on_stock_download_error=evict,
+        )
+        evict.assert_called_once()
+
+    def test_no_eviction_on_perstock_no_data_failure(self):
+        evict = Mock()
+        # First code returns data, second is a per-stock failure but NO batch error.
+        self._run(
+            lambda codes, s, e, cb: (self._daily([list(codes)[0]]), [list(codes)[0]], [list(codes)[1]], []),
+            on_stock_download_error=evict,
+        )
+        evict.assert_not_called()
+
+    def test_investor_lookback_covers_streak_and_window(self):
+        captured = {}
+
+        def fake_investor(end_date, lookback_days):
+            captured["lookback_days"] = lookback_days
+            return pd.DataFrame()
+
+        self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []),
+            download_investor=fake_investor,
+            investor_consecutive_days=8,
+            lookback_bars=20,
+            foreign_buy_streak=True,
+        )
+        # needed_trading_days = N(8) + lookback(20) = 28; the fetch window must cover it.
+        self.assertGreaterEqual(captured["lookback_days"], 28)
 
 
 class ChartEngineTests(unittest.TestCase):

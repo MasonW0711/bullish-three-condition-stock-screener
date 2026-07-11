@@ -192,19 +192,49 @@ def _empty_result(
     }
 
 
-def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str], progress_callback=None) -> dict:
+def _run_screening(
+    params: dict,
+    use_auto_universe: bool,
+    manual_codes: list[str],
+    progress_callback=None,
+    *,
+    load_universe=None,
+    download_stock=None,
+    download_investor=None,
+    on_stock_download_error=None,
+    on_investor_fetch_failure=None,
+) -> dict:
+    """Pure screening orchestration (no direct Streamlit calls).
+
+    Data access and cache eviction are injected so the whole flow — message
+    assembly, investor-lookback sizing, partial-failure handling — is unit
+    testable with fakes. Production defaults wire in the Streamlit-cached
+    downloaders and their ``.clear`` eviction (used on transient failures).
+    """
+    load_universe = load_universe or _load_taiwan_stock_universe_cached
+    if download_stock is None:
+        def download_stock(codes, start, end, callback):
+            return _download_stock_data_cached(
+                stock_codes=tuple(codes), start_date=start, end_date=end, _progress_callback=callback
+            )
+    if download_investor is None:
+        def download_investor(end_date, lookback_days):
+            return _download_investor_flow_data_cached(end_date=end_date, lookback_days=lookback_days)
+    on_stock_download_error = on_stock_download_error or _download_stock_data_cached.clear
+    on_investor_fetch_failure = on_investor_fetch_failure or _download_investor_flow_data_cached.clear
+
     timeframe_code = TIMEFRAME_OPTIONS[params["analysis_timeframe"]]
     min_volume_shares = params["min_volume"] * 1000
     messages: list[dict[str, str]] = []
 
     universe_df = pd.DataFrame()
     if use_auto_universe:
-        universe_df = _load_taiwan_stock_universe_cached()
+        universe_df = load_universe()
         stock_codes = universe_df["StockCode"].dropna().astype(str).tolist()
     else:
         stock_codes = manual_codes
         try:
-            manual_universe = _load_taiwan_stock_universe_cached()
+            manual_universe = load_universe()
         except Exception as exc:
             manual_universe = pd.DataFrame()
             messages.append({"level": "warning", "text": f"無法載入股票名稱對照表：{exc}"})
@@ -230,11 +260,11 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
 
             download_progress_callback = _download_progress_callback
 
-        daily_data, success_list, failed_list, download_errors = _download_stock_data_cached(
-            stock_codes=tuple(stock_codes),
-            start_date=params["start_date"],
-            end_date=params["end_date"],
-            _progress_callback=download_progress_callback,
+        daily_data, success_list, failed_list, download_errors = download_stock(
+            stock_codes,
+            params["start_date"],
+            params["end_date"],
+            download_progress_callback,
         )
         # The cached call returns the stored objects; copy the mutable diagnostics
         # list before appending investor-fetch notes so we never mutate the cache.
@@ -256,7 +286,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         # return the same holey data. Evict so an identical re-run re-downloads.
         # Per-stock no-data failures (failed_list) do NOT trigger eviction — those
         # are usually permanent (delisted / illiquid) and safe to cache.
-        _download_stock_data_cached.clear()
+        on_stock_download_error()
 
     if daily_data.empty:
         messages.append({"level": "warning", "text": "下載完成，但沒有取得任何可用股價資料。"})
@@ -312,10 +342,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         )
         market_wide_flow_empty = True
         try:
-            investor_flow_df = _download_investor_flow_data_cached(
-                end_date=params["end_date"],
-                lookback_days=investor_lookback_days,
-            )
+            investor_flow_df = download_investor(params["end_date"], investor_lookback_days)
             market_wide_flow_empty = investor_flow_df.empty
             if not investor_flow_df.empty:
                 # Capture the whole-market trading-day axis BEFORE narrowing the
@@ -371,7 +398,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             # Same reasoning as the stock-download cache: a partial investor-flow
             # fetch (some dates errored) must not be re-served for the TTL, or the
             # streak flags stay silently wrong. Evict so a re-run retries.
-            _download_investor_flow_data_cached.clear()
+            on_investor_fetch_failure()
 
     processed = attach_investor_flow_flags(
         processed,
