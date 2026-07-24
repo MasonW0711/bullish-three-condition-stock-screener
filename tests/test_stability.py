@@ -4,6 +4,7 @@ import unittest
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from io import StringIO
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -1578,6 +1579,40 @@ class PriceCacheTests(unittest.TestCase):
                 with open(meta, "w", encoding="utf-8") as handle:
                     handle.write("{ not valid json")
             self.assertIsNone(load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1)))
+
+    def test_cache_is_inactive_without_a_parquet_engine(self):
+        # Streamlit Cloud has no pyarrow (it is declared only for the desktop
+        # build). The cache must then be a silent no-op — never raise, never
+        # write, always miss — so screening still works via a live download.
+        import price_cache
+
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+            price_cache, "_PARQUET_AVAILABLE", False
+        ):
+            price_cache.save_snapshot(
+                cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8),
+                (self._daily(), ["2330.TW"], [], []),
+            )
+            self.assertEqual(list(Path(cache_dir).iterdir()), [])  # nothing written
+            self.assertIsNone(
+                price_cache.load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            )
+
+    def test_download_stock_data_falls_back_to_live_without_parquet_engine(self):
+        import price_cache
+
+        calls = []
+
+        def fake_uncached(codes, start, end, progress_callback=None):
+            calls.append(list(codes))
+            return self._daily(), list(codes), [], []
+
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+            price_cache, "_PARQUET_AVAILABLE", False
+        ), patch.object(data_loader, "_download_stock_data_uncached", side_effect=fake_uncached):
+            data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+            data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+        self.assertEqual(len(calls), 2)  # no caching, every call downloads live
 
     def test_download_stock_data_serves_second_call_from_disk(self):
         daily = self._daily()

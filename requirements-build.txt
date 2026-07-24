@@ -1,1 +1,8 @@
 pyinstaller>=6.10
+# Parquet engine for the on-disk price snapshot cache (price_cache.py). Declared
+# HERE and not in requirements.txt on purpose: the cache only pays off in the
+# desktop bundle (idle-shutdown after 15s makes every launch a cold start),
+# while Streamlit Cloud runs a Python version pyarrow may ship no wheel for —
+# there pip falls back to a source build, fails for lack of cmake, and takes the
+# whole deploy down. The cache degrades to inactive when the engine is absent.
+pyarrow>=15

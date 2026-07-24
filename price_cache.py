@@ -40,6 +40,27 @@ HISTORICAL_MAX_AGE_DAYS = 7  # final historical windows: refresh weekly for late
 _SNAPSHOT_RESULT = tuple  # (daily_data: DataFrame, success: list, failed: list, errors: list)
 
 
+def _detect_parquet_engine() -> bool:
+    """Is a parquet engine importable? Probed once, at import."""
+    for module in ("pyarrow", "fastparquet"):
+        try:
+            __import__(module)
+            return True
+        except ImportError:
+            continue
+    return False
+
+
+# pyarrow is an OPTIONAL dependency, declared only in requirements-build.txt (the
+# desktop bundle, where this cache actually pays off — the app idle-shuts-down
+# after 15s so every launch is a cold start). It is deliberately NOT in
+# requirements.txt: Streamlit Cloud runs a Python version pyarrow may have no
+# wheel for, and a source build there fails for lack of cmake, which would break
+# the whole deploy for a cache that ephemeral containers cannot benefit from
+# anyway. Without an engine the cache simply stays inactive.
+_PARQUET_AVAILABLE = _detect_parquet_engine()
+
+
 def default_cache_dir() -> Path:
     """Per-user cache directory.
 
@@ -74,6 +95,8 @@ def _as_date(value) -> date:
 
 def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[datetime] = None) -> None:
     """Persist a whole download result. Fail-open: any error is logged and ignored."""
+    if not _PARQUET_AVAILABLE:
+        return  # no engine: cache stays inactive, callers just download live
     try:
         now = now or datetime.now()
         cache_dir = Path(cache_dir)
@@ -113,6 +136,8 @@ def load_snapshot(cache_dir, codes, start_date, end_date, now: Optional[datetime
 
     Returns None on any miss, staleness, or error so the caller downloads live.
     """
+    if not _PARQUET_AVAILABLE:
+        return None  # no engine: always a miss, caller downloads live
     try:
         now = now or datetime.now()
         cache_dir = Path(cache_dir)

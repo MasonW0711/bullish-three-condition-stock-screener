@@ -2,6 +2,15 @@
 
 本檔記錄各版本的重要變更。日期為當地時間。
 
+## v3.2.1 — 2026-07-24
+
+修復 v3.2.0 造成的 Streamlit Cloud 部署失敗。
+
+- **移除 `requirements.txt` 的 `pyarrow`（部署中斷主因）。** Streamlit Cloud 為 Python 3.14.6，pyarrow 21.0.0 無 cp314 wheel，pip 改走原始碼建置卻找不到 `cmake`，相依安裝失敗使**整個 App 無法啟動**。現代 Streamlit 已不依賴 pyarrow，該行為 v3.2.0 快照快取所加，是唯一肇因。
+- **parquet 引擎改列為選用，只在 `requirements-build.txt`（桌面打包）宣告。** 快取的價值本就集中在桌面版（閒置 15 秒即關、每次開啟都是冷啟動）；雲端容器為臨時性，本來就無法受益。桌面 build 與 CI 使用 Python 3.13，pyarrow 有對應 wheel。
+- **`price_cache` 於載入時偵測 parquet 引擎（`_PARQUET_AVAILABLE`）。** 無引擎時快取靜默停用（不寫檔、恆為 miss、不拋錯也不刷警告），篩選改走即時下載，功能不受影響。
+  - 回歸測試：`test_cache_is_inactive_without_a_parquet_engine`、`test_download_stock_data_falls_back_to_live_without_parquet_engine`。
+
 ## v3.2.0 — 2026-07-11
 
 效能、可靠性與可測性強化。訊號邏輯（引擎輸出）逐格 byte-identical，未改變任何篩選結果；差分測試（合成資料＋真實台股）驗證。
