@@ -19,6 +19,7 @@ from data_loader import (
     resample_ohlcv,
 )
 from export_engine import create_excel_bytes
+from price_cache import default_cache_dir
 from signal_engine import (
     attach_investor_flow_flags,
     build_direction_signals,
@@ -73,6 +74,7 @@ def _download_stock_data_cached(
         start_date=start_date,
         end_date=end_date,
         progress_callback=_progress_callback,
+        cache_dir=default_cache_dir(),
     )
 
 
@@ -192,19 +194,49 @@ def _empty_result(
     }
 
 
-def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str], progress_callback=None) -> dict:
+def _run_screening(
+    params: dict,
+    use_auto_universe: bool,
+    manual_codes: list[str],
+    progress_callback=None,
+    *,
+    load_universe=None,
+    download_stock=None,
+    download_investor=None,
+    on_stock_download_error=None,
+    on_investor_fetch_failure=None,
+) -> dict:
+    """Pure screening orchestration (no direct Streamlit calls).
+
+    Data access and cache eviction are injected so the whole flow — message
+    assembly, investor-lookback sizing, partial-failure handling — is unit
+    testable with fakes. Production defaults wire in the Streamlit-cached
+    downloaders and their ``.clear`` eviction (used on transient failures).
+    """
+    load_universe = load_universe or _load_taiwan_stock_universe_cached
+    if download_stock is None:
+        def download_stock(codes, start, end, callback):
+            return _download_stock_data_cached(
+                stock_codes=tuple(codes), start_date=start, end_date=end, _progress_callback=callback
+            )
+    if download_investor is None:
+        def download_investor(end_date, lookback_days):
+            return _download_investor_flow_data_cached(end_date=end_date, lookback_days=lookback_days)
+    on_stock_download_error = on_stock_download_error or _download_stock_data_cached.clear
+    on_investor_fetch_failure = on_investor_fetch_failure or _download_investor_flow_data_cached.clear
+
     timeframe_code = TIMEFRAME_OPTIONS[params["analysis_timeframe"]]
     min_volume_shares = params["min_volume"] * 1000
     messages: list[dict[str, str]] = []
 
     universe_df = pd.DataFrame()
     if use_auto_universe:
-        universe_df = _load_taiwan_stock_universe_cached()
+        universe_df = load_universe()
         stock_codes = universe_df["StockCode"].dropna().astype(str).tolist()
     else:
         stock_codes = manual_codes
         try:
-            manual_universe = _load_taiwan_stock_universe_cached()
+            manual_universe = load_universe()
         except Exception as exc:
             manual_universe = pd.DataFrame()
             messages.append({"level": "warning", "text": f"無法載入股票名稱對照表：{exc}"})
@@ -230,11 +262,11 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
 
             download_progress_callback = _download_progress_callback
 
-        daily_data, success_list, failed_list, download_errors = _download_stock_data_cached(
-            stock_codes=tuple(stock_codes),
-            start_date=params["start_date"],
-            end_date=params["end_date"],
-            _progress_callback=download_progress_callback,
+        daily_data, success_list, failed_list, download_errors = download_stock(
+            stock_codes,
+            params["start_date"],
+            params["end_date"],
+            download_progress_callback,
         )
         # The cached call returns the stored objects; copy the mutable diagnostics
         # list before appending investor-fetch notes so we never mutate the cache.
@@ -250,6 +282,13 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             "level": "warning",
             "text": f"部分股票批次下載失敗，可能是網路逾時或來源限流：{sample}{more}",
         })
+        # Transient batch failures (rate-limit / network timeouts) must not stay
+        # cached: st.cache_data would otherwise re-serve this partial result for
+        # the whole TTL with no retry, so re-clicking「開始篩選」would silently
+        # return the same holey data. Evict so an identical re-run re-downloads.
+        # Per-stock no-data failures (failed_list) do NOT trigger eviction — those
+        # are usually permanent (delisted / illiquid) and safe to cache.
+        on_stock_download_error()
 
     if daily_data.empty:
         messages.append({"level": "warning", "text": "下載完成，但沒有取得任何可用股價資料。"})
@@ -305,10 +344,7 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         )
         market_wide_flow_empty = True
         try:
-            investor_flow_df = _download_investor_flow_data_cached(
-                end_date=params["end_date"],
-                lookback_days=investor_lookback_days,
-            )
+            investor_flow_df = download_investor(params["end_date"], investor_lookback_days)
             market_wide_flow_empty = investor_flow_df.empty
             if not investor_flow_df.empty:
                 # Capture the whole-market trading-day axis BEFORE narrowing the
@@ -361,6 +397,10 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
             # Also record it in the batch-level diagnostics so it appears in the
             # Excel「下載失敗清單」alongside the stock download errors.
             download_errors.append(warning_text)
+            # Same reasoning as the stock-download cache: a partial investor-flow
+            # fetch (some dates errored) must not be re-served for the TTL, or the
+            # streak flags stay silently wrong. Evict so a re-run retries.
+            on_investor_fetch_failure()
 
     processed = attach_investor_flow_flags(
         processed,
@@ -375,6 +415,14 @@ def _run_screening(params: dict, use_auto_universe: bool, manual_codes: list[str
         processed["StockName"] = processed["StockName"].fillna(processed["StockCode"])
     else:
         processed["StockName"] = processed["StockCode"]
+
+    # The join appends StockName last; move it next to StockCode so the Excel
+    # All_Data sheet reads code-then-name like the signal/summary sheets do.
+    ordered_cols = processed.columns.tolist()
+    ordered_cols.remove("StockName")
+    insert_at = ordered_cols.index("StockCode") + 1 if "StockCode" in ordered_cols else 0
+    ordered_cols.insert(insert_at, "StockName")
+    processed = processed[ordered_cols]
 
     direction_bundle = build_direction_signals(processed, params)
     long_signals = direction_bundle["long_signals"]
@@ -443,9 +491,19 @@ def _render_direction_results(
         st.info(f"目前沒有可供選擇的{direction_label}股票。")
         return
 
+    name_lookup: dict[str, str] = {}
+    if signals_df is not None and not signals_df.empty and "StockName" in signals_df.columns:
+        for code, name in zip(signals_df["StockCode"].astype(str), signals_df["StockName"].astype(str)):
+            name_lookup.setdefault(code, name)
+
+    def _format_stock(code: str) -> str:
+        name = name_lookup.get(code, "")
+        return f"{code} {name}".strip() if name and name != code else code
+
     selected_stock = st.selectbox(
         "選擇股票",
         options=signal_stock_codes,
+        format_func=_format_stock,
         key=f"{key_prefix}_chart_select",
     )
     selected_df = all_data[all_data["StockCode"] == selected_stock].copy()
@@ -454,6 +512,7 @@ def _render_direction_results(
             selected_df,
             timeframe_label=saved_params["analysis_timeframe"],
             direction=direction_label,
+            stock_name=name_lookup.get(str(selected_stock)),
         )
     except Exception as exc:
         figure, chart_message = None, f"建立圖表時發生錯誤：{exc}"
@@ -751,8 +810,9 @@ def main():
     st.subheader("結果下載")
     timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
 
-    # 匯出內容只在新一次篩選後改變；以 run_id 快取，避免每次 UI 互動
-    # （例如切換 K 線圖股票）都對全量資料重建 Excel。
+    # CSV（僅訊號列，很小）在每次新篩選後即時建立並以 run_id 快取；Excel 因含
+    # All_Data 全量工作表、對全市場執行時建構成本高（openpyxl 數十萬列），改為
+    # 延遲到使用者按下「準備 Excel」才建，避免從未下載時白白耗費 CPU／記憶體。
     run_id = st.session_state.get("screening_run_id", 0)
     export_cache = st.session_state.get("export_cache")
     if export_cache is None or export_cache.get("run_id") != run_id:
@@ -768,38 +828,20 @@ def main():
             if not display_combined.empty
             else b""
         )
-
-        excel_bytes = b""
-        excel_error = None
-        try:
-            excel_bytes = create_excel_bytes(
-                all_data=all_data,
-                long_signals=long_signals,
-                short_signals=short_signals,
-                latest_summary_long=latest_summary_long,
-                latest_summary_short=latest_summary_short,
-                failed_list=failed_list,
-                params=saved_params,
-                download_notes=results.get("download_errors", []),
-            )
-        except Exception as exc:
-            excel_error = f"建立 Excel 匯出檔時發生錯誤：{exc}"
-
         export_cache = {
             "run_id": run_id,
             "csv_bytes": csv_bytes,
             "csv_empty": display_combined.empty,
-            "excel_bytes": excel_bytes,
-            "excel_error": excel_error,
         }
         st.session_state["export_cache"] = export_cache
 
     csv_bytes = export_cache["csv_bytes"]
-    excel_bytes = export_cache["excel_bytes"]
-    excel_error = export_cache["excel_error"]
 
-    if excel_error:
-        st.error(excel_error)
+    # Lazily-built Excel, cached in session by run_id.
+    excel_state = st.session_state.get("excel_export")
+    if excel_state is None or excel_state.get("run_id") != run_id:
+        excel_state = {"run_id": run_id, "bytes": None, "error": None}
+        st.session_state["excel_export"] = excel_state
 
     csv_direction_label = {"做多": "做多", "做空": "做空"}.get(direction_filter, "做多＋做空")
     download_col1, download_col2 = st.columns(2)
@@ -811,14 +853,42 @@ def main():
         disabled=bool(export_cache["csv_empty"]),
         width="stretch",
     )
-    download_col2.download_button(
-        label="下載 Excel 結果",
-        data=excel_bytes,
-        file_name=f"signals_{timeframe_code}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=all_data.empty or bool(excel_error),
-        width="stretch",
-    )
+    with download_col2:
+        if excel_state["bytes"] is None and excel_state["error"] is None:
+            if st.button(
+                "準備 Excel 匯出檔",
+                disabled=all_data.empty,
+                width="stretch",
+                key="prepare_excel",
+                help="Excel 含 All_Data 全量資料，建構較久，按此開始建立。",
+            ):
+                with st.spinner("正在建立 Excel 匯出檔（含 All_Data 全量資料）..."):
+                    try:
+                        excel_state["bytes"] = create_excel_bytes(
+                            all_data=all_data,
+                            long_signals=long_signals,
+                            short_signals=short_signals,
+                            latest_summary_long=latest_summary_long,
+                            latest_summary_short=latest_summary_short,
+                            failed_list=failed_list,
+                            params=saved_params,
+                            download_notes=results.get("download_errors", []),
+                        )
+                    except Exception as exc:
+                        excel_state["error"] = f"建立 Excel 匯出檔時發生錯誤：{exc}"
+                st.session_state["excel_export"] = excel_state
+                st.rerun()
+        if excel_state["error"]:
+            st.error(excel_state["error"])
+        elif excel_state["bytes"] is not None:
+            st.download_button(
+                label="下載 Excel 結果",
+                data=excel_state["bytes"],
+                file_name=f"signals_{timeframe_code}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+                key="download_excel",
+            )
 
     days = saved_params.get("investor_consecutive_days", 3)
     active_investor_filters = [

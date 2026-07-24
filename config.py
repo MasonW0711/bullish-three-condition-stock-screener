@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "3.0.0"
-APP_UPDATED = "2026-07-05"
+APP_VERSION = "3.2.0"
+APP_UPDATED = "2026-07-11"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (

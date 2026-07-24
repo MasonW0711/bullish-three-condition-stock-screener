@@ -26,6 +26,10 @@ jobs:
             dist_path: dist/BullishThreeConditionStockScreener.app
 
     runs-on: ${{ matrix.os }}
+    # Cap the job so a hung PyInstaller/packaging step fails fast instead of
+    # burning a full 24h runner slot (past v2.2.0/v2.3.0 runs stalled to the
+    # GitHub Actions maximum). A clean build finishes in well under 30 min.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -35,6 +39,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
 
       - name: Install dependencies
         run: |

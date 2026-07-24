@@ -1,13 +1,19 @@
 import contextlib
+import tempfile
 import unittest
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from io import StringIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
+import data_loader
+from price_cache import load_snapshot, save_snapshot
+
 with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
-    from app import _compute_latest_summary
+    from app import _compute_latest_summary, _run_screening
+from config import DEFAULT_PARAMETERS
 from config import LATEST_SUMMARY_COLUMNS
 from data_loader import (
     _download_candidate,
@@ -22,6 +28,7 @@ from data_loader import (
     normalize_yfinance_data,
     resample_ohlcv,
 )
+from chart_engine import create_stock_chart
 from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
 from export_engine import create_excel_bytes
 from config import EXCEL_SHEET_LABELS
@@ -1466,6 +1473,296 @@ class StabilityTests(unittest.TestCase):
         self.assertEqual(result.loc[7, "bars_since_breakout"], 1)
         self.assertTrue(result.loc[7, "breakout_window_valid"])
         self.assertTrue(result.loc[7, "retest_hold_daily"])
+
+
+class PipelinePurityTests(unittest.TestCase):
+    def test_run_signal_pipeline_does_not_mutate_input(self):
+        # v3.2.0 memory optimization: the pipeline copies once at entry
+        # (add_prev_close) and mutates that owned frame in place through the
+        # later stages. The caller's frame must remain untouched — no new
+        # columns, no reordering, identical values.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 101, 103, 106, 108],
+                "High": [101, 104, 106, 109, 110],
+                "Low": [99, 100, 102, 105, 107],
+                "Close": [100, 103, 105, 108, 109],
+                "Volume": [5000] * 5,
+            }
+        )
+        before = frame.copy(deep=True)
+        run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+        pd.testing.assert_frame_equal(frame, before)
+
+
+class PriceCacheTests(unittest.TestCase):
+    def _daily(self):
+        return pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07"]),
+                "StockCode": "2330.TW",
+                "Open": [100.0, 101.0, 102.0],
+                "High": [101.0, 102.0, 103.0],
+                "Low": [99.0, 100.0, 101.0],
+                "Close": [100.5, 101.5, 102.5],
+                "Volume": [1_000_000.0, 1_100_000.0, 1_200_000.0],
+            }
+        )
+
+    def test_snapshot_round_trip(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            result = (self._daily(), ["2330.TW"], ["9999.TW"], [])
+            save_snapshot(cache_dir, ["2330.TW", "9999.TW"], date(2026, 1, 1), date(2026, 1, 8), result)
+            loaded = load_snapshot(cache_dir, ["2330.TW", "9999.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            self.assertIsNotNone(loaded)
+            pd.testing.assert_frame_equal(loaded[0].reset_index(drop=True), result[0].reset_index(drop=True))
+            self.assertEqual(loaded[1], ["2330.TW"])
+            self.assertEqual(loaded[2], ["9999.TW"])
+
+    def test_historical_window_reused_then_expires(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            captured = datetime(2026, 7, 1, 10, 0, 0)
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                          (self._daily(), ["2330.TW"], [], []), now=captured)
+            # Window ends in the past → reusable for a few days …
+            self.assertIsNotNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                              now=captured + timedelta(days=3))
+            )
+            # … but not past HISTORICAL_MAX_AGE_DAYS (7).
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                              now=captured + timedelta(days=8))
+            )
+
+    def test_current_day_window_uses_short_ttl(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            captured = datetime(2026, 7, 1, 10, 0, 0)
+            # end == the run day → the last bar still evolves, so short TTL only.
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                          (self._daily(), ["2330.TW"], [], []), now=captured)
+            self.assertIsNotNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                              now=captured + timedelta(minutes=10))
+            )
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                              now=captured + timedelta(minutes=40))
+            )
+
+    def test_intraday_snapshot_not_promoted_after_date_rollover(self):
+        # A snapshot captured intraday (end == the capture day, partial last bar)
+        # must stay on the short TTL even after the calendar rolls its end_date
+        # into the past — it must NOT be reclassified as a final historical window.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            captured = datetime(2026, 7, 1, 11, 0, 0)
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                          (self._daily(), ["2330.TW"], [], []), now=captured)
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 7, 1),
+                              now=datetime(2026, 7, 3, 11, 0, 0))
+            )
+
+    def test_corrupt_snapshot_falls_back_to_none(self):
+        import glob
+        import os
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
+                          (self._daily(), ["2330.TW"], [], []))
+            for meta in glob.glob(os.path.join(cache_dir, "*.json")):
+                with open(meta, "w", encoding="utf-8") as handle:
+                    handle.write("{ not valid json")
+            self.assertIsNone(load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1)))
+
+    def test_download_stock_data_serves_second_call_from_disk(self):
+        daily = self._daily()
+        calls = []
+
+        def fake_uncached(codes, start, end, progress_callback=None):
+            calls.append(list(codes))
+            return daily.copy(), list(codes), [], []
+
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+            data_loader, "_download_stock_data_uncached", side_effect=fake_uncached
+        ):
+            first = data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+            second = data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+        self.assertEqual(len(calls), 1)  # second call served from disk snapshot
+        pd.testing.assert_frame_equal(first[0].reset_index(drop=True), second[0].reset_index(drop=True))
+
+    def test_download_stock_data_does_not_cache_batch_errors(self):
+        daily = self._daily()
+
+        def fake_uncached(codes, start, end, progress_callback=None):
+            return daily.copy(), list(codes), [], ["第 1 批下載失敗（網路或來源異常）：Timeout"]
+
+        with tempfile.TemporaryDirectory() as cache_dir, patch.object(
+            data_loader, "_download_stock_data_uncached", side_effect=fake_uncached
+        ):
+            data_loader.download_stock_data(["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), cache_dir=cache_dir)
+            # A batch-errored result must not be persisted.
+            self.assertIsNone(load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8)))
+
+
+class ScreeningServiceTests(unittest.TestCase):
+    """Cover the injected _run_screening orchestration + the fix-② cache eviction."""
+
+    def _params(self, **overrides):
+        params = dict(DEFAULT_PARAMETERS)
+        params["start_date"] = date(2026, 1, 1)
+        params["end_date"] = date(2026, 3, 1)
+        params["min_volume"] = 0
+        params.update(overrides)
+        return params
+
+    def _universe(self):
+        return pd.DataFrame(
+            {
+                "StockCode": ["2330.TW", "2317.TW"],
+                "BaseCode": ["2330", "2317"],
+                "StockName": ["台積電", "鴻海"],
+                "MarketLabel": ["上市", "上市"],
+                "Industry": ["半導體", "電子"],
+            }
+        )
+
+    def _daily(self, codes):
+        dates = pd.bdate_range("2026-01-01", periods=40)
+        frames = []
+        for i, code in enumerate(codes):
+            close = 100 + pd.Series(range(40)) * 0.3 + i
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "Date": dates,
+                        "StockCode": code,
+                        "Open": close - 0.5,
+                        "High": close + 1.0,
+                        "Low": close - 1.0,
+                        "Close": close,
+                        "Volume": 5_000_000,
+                    }
+                )
+            )
+        return pd.concat(frames, ignore_index=True)
+
+    def _run(self, download_stock, download_investor=None, on_stock_download_error=None, **pkw):
+        return _run_screening(
+            self._params(**pkw),
+            use_auto_universe=True,
+            manual_codes=[],
+            load_universe=self._universe,
+            download_stock=download_stock,
+            download_investor=download_investor or (lambda end_date, lookback_days: pd.DataFrame()),
+            on_stock_download_error=on_stock_download_error or Mock(),
+            on_investor_fetch_failure=Mock(),
+        )
+
+    def test_run_screening_happy_path(self):
+        result = self._run(lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []))
+        self.assertFalse(result["all_data"].empty)
+        self.assertEqual(sorted(result["success_list"]), ["2317.TW", "2330.TW"])
+        self.assertTrue(result["used_auto_universe"])
+        # StockName joined and moved next to StockCode.
+        self.assertIn("StockName", result["all_data"].columns)
+
+    def test_evicts_cache_on_transient_download_error(self):
+        evict = Mock()
+        self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], ["第 1 批下載失敗（網路或來源異常）：Timeout"]),
+            on_stock_download_error=evict,
+        )
+        evict.assert_called_once()
+
+    def test_no_eviction_on_perstock_no_data_failure(self):
+        evict = Mock()
+        # First code returns data, second is a per-stock failure but NO batch error.
+        self._run(
+            lambda codes, s, e, cb: (self._daily([list(codes)[0]]), [list(codes)[0]], [list(codes)[1]], []),
+            on_stock_download_error=evict,
+        )
+        evict.assert_not_called()
+
+    def test_investor_lookback_covers_streak_and_window(self):
+        captured = {}
+
+        def fake_investor(end_date, lookback_days):
+            captured["lookback_days"] = lookback_days
+            return pd.DataFrame()
+
+        self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []),
+            download_investor=fake_investor,
+            investor_consecutive_days=8,
+            lookback_bars=20,
+            foreign_buy_streak=True,
+        )
+        # needed_trading_days = N(8) + lookback(20) = 28; the fetch window must cover it.
+        self.assertGreaterEqual(captured["lookback_days"], 28)
+
+
+class ChartEngineTests(unittest.TestCase):
+    def _chart_frame(self, with_name: bool = False) -> pd.DataFrame:
+        # Two attack successes so the red line changes level: 100 -> 105. This
+        # exercises the step-vs-diagonal rendering.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                "Open": [100, 101, 103, 106, 108],
+                "High": [101, 104, 106, 109, 110],
+                "Low": [99, 100, 102, 105, 107],
+                "Close": [100, 103, 105, 108, 109],
+                "Volume": [1000] * 5,
+            }
+        )
+        processed = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
+        if with_name:
+            processed["StockName"] = "台積電"
+        return processed
+
+    def test_red_line_uses_step_shape_not_diagonal(self):
+        # The ffilled red/black lines are step functions; they must be drawn with
+        # line_shape="hv" so a level change renders as a horizontal step, not a
+        # diagonal ramp through prices that were never the line.
+        fig, message = create_stock_chart(self._chart_frame(), "日 K")
+        self.assertIsNone(message)
+        line_traces = [t for t in fig.data if getattr(t, "name", None) in {"紅線", "黑線"}]
+        self.assertTrue(line_traces, "expected at least one red/black line trace")
+        for trace in line_traces:
+            self.assertEqual(trace.line.shape, "hv")
+
+    def test_candles_use_taiwan_colors(self):
+        # Taiwan convention: up = red, down = green (opposite of the US/plotly
+        # default). Guard against a silent revert to the default palette.
+        fig, _ = create_stock_chart(self._chart_frame(), "日 K")
+        candles = [t for t in fig.data if t.type == "candlestick"]
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].increasing.fillcolor, "#dc2626")
+        self.assertEqual(candles[0].decreasing.fillcolor, "#16a34a")
+
+    def test_title_includes_stock_name_from_column(self):
+        fig, _ = create_stock_chart(self._chart_frame(with_name=True), "日 K")
+        self.assertIn("2330.TW", fig.layout.title.text)
+        self.assertIn("台積電", fig.layout.title.text)
+
+    def test_title_includes_stock_name_from_argument(self):
+        fig, _ = create_stock_chart(self._chart_frame(), "日 K", stock_name="鴻海")
+        self.assertIn("鴻海", fig.layout.title.text)
+
+    def test_chart_works_without_stock_name(self):
+        # StockName is optional; a frame without it (older callers/tests) still
+        # renders and the title falls back to the code alone.
+        fig, message = create_stock_chart(self._chart_frame(), "日 K")
+        self.assertIsNone(message)
+        self.assertIn("2330.TW", fig.layout.title.text)
 
 
 if __name__ == "__main__":

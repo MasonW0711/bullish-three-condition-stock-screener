@@ -18,6 +18,8 @@ import requests
 import urllib3
 import yfinance as yf
 
+from price_cache import load_snapshot, save_snapshot
+
 from config import (
     INVESTOR_LOOKBACK_DAYS,
     REQUEST_RETRIES,
@@ -372,6 +374,39 @@ def _download_candidate(symbols: str | list[str], start_date, end_date) -> pd.Da
 
 
 def download_stock_data(
+    stock_codes: list[str],
+    start_date,
+    end_date,
+    progress_callback=None,
+    cache_dir=None,
+) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
+    """Download daily OHLCV data, optionally served from an on-disk snapshot.
+
+    When ``cache_dir`` is given, a previously saved whole-result snapshot for the
+    same (codes, start, end) is returned if still fresh (see price_cache), and a
+    fresh successful download is saved back. The cache never merges partial data
+    (auto_adjust=True re-adjusts full history), and is fail-open. ``cache_dir``
+    defaults to None so direct callers and tests get the un-cached behavior.
+    """
+    if cache_dir is not None:
+        cached = load_snapshot(cache_dir, stock_codes, start_date, end_date)
+        if cached is not None:
+            if progress_callback is not None:
+                progress_callback(1.0, "使用本機快取的股價資料（同條件近期已下載）。")
+            return cached
+
+    result = _download_stock_data_uncached(
+        stock_codes, start_date, end_date, progress_callback=progress_callback
+    )
+
+    # Only snapshot a clean, non-empty result: caching an empty or batch-errored
+    # download would just replay a transient failure from disk.
+    if cache_dir is not None and not result[0].empty and not result[3]:
+        save_snapshot(cache_dir, stock_codes, start_date, end_date, result)
+    return result
+
+
+def _download_stock_data_uncached(
     stock_codes: list[str],
     start_date,
     end_date,
