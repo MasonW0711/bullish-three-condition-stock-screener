@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -36,8 +37,6 @@ logger = logging.getLogger(__name__)
 
 RECENT_END_TTL_SECONDS = 1800  # evolving current-day data: match the 30-min in-memory TTL
 HISTORICAL_MAX_AGE_DAYS = 7  # final historical windows: refresh weekly for late corrections
-
-_SNAPSHOT_RESULT = tuple  # (daily_data: DataFrame, success: list, failed: list, errors: list)
 
 
 def _detect_parquet_engine() -> bool:
@@ -51,14 +50,43 @@ def _detect_parquet_engine() -> bool:
     return False
 
 
-# pyarrow is an OPTIONAL dependency, declared only in requirements-build.txt (the
-# desktop bundle, where this cache actually pays off — the app idle-shuts-down
-# after 15s so every launch is a cold start). It is deliberately NOT in
-# requirements.txt: Streamlit Cloud runs a Python version pyarrow may have no
-# wheel for, and a source build there fails for lack of cmake, which would break
-# the whole deploy for a cache that ephemeral containers cannot benefit from
-# anyway. Without an engine the cache simply stays inactive.
+# This is normally True EVERYWHERE, including Streamlit Cloud: streamlit itself
+# hard-requires pyarrow across our whole pinned range (1.36.0 -> "pyarrow>=7.0",
+# 1.60.0 -> "pyarrow<25,>=7.0", no marker), so the engine is always installed.
+# The guard exists only so an exotic environment without an engine degrades to
+# "cache inactive" instead of crashing — it is NOT a mechanism for disabling the
+# cache on Cloud, and the cache must therefore be self-bounding (see _prune).
+#
+# Post-mortem of the v3.2.0 outage, corrected in v3.2.2: the break was NOT caused
+# by declaring pyarrow. It was caused by declaring it with an upper bound —
+# "pyarrow>=15,<22" pinned 21.0.0, which ships no cp314 wheel, so pip fell back
+# to a source build that needs cmake (absent on Cloud). Without our line, pip
+# resolves streamlit's own ">=7.0" to a release that does have cp314 wheels.
+# Lesson: never cap a native dependency below its newest wheel-bearing release.
 _PARQUET_AVAILABLE = _detect_parquet_engine()
+
+
+def _writer_stamp() -> str:
+    """Unique per-writer suffix so concurrent savers never share a temp file."""
+    return f"{os.getpid()}.{uuid.uuid4().hex}"
+
+
+def _prune(cache_dir: Path, now: datetime) -> None:
+    """Delete snapshots that can never be served again, plus stale temp files.
+
+    The cache is live on every platform (see _PARQUET_AVAILABLE) and its key
+    includes the date window, which moves every day for the rolling default
+    range — so without this the directory would grow without bound forever.
+    Anything older than the longest TTL is unreachable by load_snapshot, so
+    deleting it loses nothing. Best-effort: never raises into the caller.
+    """
+    cutoff = now.timestamp() - HISTORICAL_MAX_AGE_DAYS * 86400
+    for path in cache_dir.glob("*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue  # another process may have removed it already
 
 
 def default_cache_dir() -> Path:
@@ -104,10 +132,18 @@ def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[
         daily_data, success_list, failed_list, download_errors = result
         parquet_path, meta_path = _paths(cache_dir, _snapshot_key(codes, start_date, end_date))
         # Atomic parquet write so a crash mid-write never leaves a torn file that
-        # a later read would trust.
-        tmp_path = parquet_path.with_suffix(".parquet.tmp")
-        daily_data.to_parquet(tmp_path, index=False)
-        os.replace(tmp_path, parquet_path)
+        # a later read would trust. The temp name MUST be unique per writer: a
+        # shared "<key>.tmp" lets two processes saving the same key interleave
+        # into one file, and because parquet is COLUMNAR the survivor is usually a
+        # perfectly VALID file whose column chunks come from two different
+        # downloads — read_parquet succeeds, nothing raises, fail-open never
+        # triggers, and the mixed prices produce phantom breakout signals.
+        tmp_path = parquet_path.with_name(f"{parquet_path.name}.{_writer_stamp()}.tmp")
+        try:
+            daily_data.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, parquet_path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)  # no orphan on failure
         meta_payload = json.dumps(
             {
                 "captured_at": now.isoformat(),
@@ -123,10 +159,14 @@ def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[
             }
         )
         # Atomic sidecar write too, so a crash can never pair a new parquet with a
-        # torn/old metadata file.
-        meta_tmp = meta_path.with_suffix(".json.tmp")
-        meta_tmp.write_text(meta_payload, encoding="utf-8")
-        os.replace(meta_tmp, meta_path)
+        # torn/old metadata file. Same per-writer unique name as the parquet.
+        meta_tmp = meta_path.with_name(f"{meta_path.name}.{_writer_stamp()}.tmp")
+        try:
+            meta_tmp.write_text(meta_payload, encoding="utf-8")
+            os.replace(meta_tmp, meta_path)
+        finally:
+            Path(meta_tmp).unlink(missing_ok=True)
+        _prune(cache_dir, now)
     except Exception as exc:  # noqa: BLE001 - cache is best-effort
         logger.warning("價格快照寫入失敗（略過快取）：%s", exc)
 

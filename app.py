@@ -385,7 +385,13 @@ def _run_screening(
                 messages.append({"level": "warning", "text": "目前無法取得最新法人買賣超資料，法人條件已視為未達成。"})
             else:
                 messages.append({"level": "info", "text": "已取得法人買賣超資料，但本次篩選的股票在此期間沒有對應的法人買賣超紀錄，法人條件視為未達成。"})
-        elif fetch_failures > 0:
+        # Evaluated INDEPENDENTLY of emptiness, not as an elif: when every TWSE +
+        # TPEX fetch fails, download_investor_flow_data fail-opens and returns an
+        # EMPTY frame stamped fetch_failures == fetch_attempts. Chaining this to
+        # the branch above made the total-failure case — the worst one — skip both
+        # the diagnostics and the cache eviction, so the empty result was re-served
+        # for the full 1-hour TTL with the user never told why.
+        if fetch_failures > 0:
             date_sample = "、".join(failed_dates[:5])
             date_more = f" 等共 {len(failed_dates)} 日" if len(failed_dates) > 5 else ""
             date_detail = f"，受影響日期：{date_sample}{date_more}" if failed_dates else ""

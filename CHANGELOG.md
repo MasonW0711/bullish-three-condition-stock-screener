@@ -2,6 +2,45 @@
 
 本檔記錄各版本的重要變更。日期為當地時間。
 
+## v3.2.2 — 2026-07-24
+
+深度審查（七維度、對抗式驗證）後的必修項目。
+
+### 🔴 修正：併發寫入可產生「混用兩次下載」的快取檔（會造成假訊號）
+
+- `price_cache.save_snapshot` 的暫存檔名原為 `<key>.parquet.tmp`，**只由 key 決定**，兩個行程存同一組 (代號, 起訖) 會開同一個檔案交錯寫入。因 parquet 是**欄式**格式，倖存者通常是一個**完全合法**的檔案，但欄位來自兩次不同下載——`read_parquet` 成功、不拋錯、fail-open 永不觸發，混用的價格會產生假突破訊號。桌面版無單一實例鎖，多開即可觸發。
+- 改為每個寫入者使用唯一暫存檔名（`pid.uuid4`），並在 `finally` 清除，parquet 與 json sidecar 皆同。
+  - 回歸測試：`test_concurrent_saves_never_mix_columns_from_two_downloads`（40,000 列 × 2 執行緒；已驗證還原舊碼會**穩定失敗** 3/3）。
+
+### 🟠 修正：法人資料「全部抓取失敗」時靜默且不清快取
+
+- `if investor_flow_df.empty:` / `elif fetch_failures > 0:` 的鏈接，使「每一次 TWSE＋TPEX 抓取都失敗」這個**最嚴重**的情況跳過診斷訊息與快取清除——空結果被整整 1 小時的 TTL 重複回傳，使用者完全不知情。改為獨立判斷。
+  - 回歸測試：`test_total_investor_fetch_failure_still_evicts_and_reports`、`test_partial_investor_fetch_failure_still_evicts`、`test_clean_investor_fetch_does_not_evict`。
+
+### 🟠 更正：v3.2.0 部署事故的根因記載錯誤
+
+v3.2.1 記載「現代 Streamlit 已不依賴 pyarrow」——**這是錯的**，已於本版更正：
+
+- 實測 `streamlit 1.36.0 → pyarrow>=7.0`、`1.60.0 → pyarrow<25,>=7.0`，**整個 pin 範圍都硬性依賴 pyarrow**，雲端一直都裝得到，快取在雲端**是啟用的**。
+- 真正肇因是我加的**上界** `pyarrow>=15,<22`：它把版本釘死在 21.0.0（**0 個 cp314 wheel**），才導致原始碼建置與 cmake 失敗。移除該行之所以有效，是讓 pip 改用 streamlit 自己的 `>=7.0` 解到 25.0.0（**14 個 cp314 wheel**）。
+- **教訓：不要為原生相依加上界，把它壓在最新有 wheel 的版本之下。** 已更正 `price_cache.py` 註解、`requirements-build.txt` 說明與測試命名前提。
+
+### 🟠 修正：快取無上限成長（雲端亦受影響，因上述前提錯誤）
+
+- 快取鍵含日期區間，滾動預設區間使其**每日產生新鍵**，而原本沒有任何刪除路徑。新增 `_prune`：每次寫入後清掉超過最長 TTL、已永遠不可能被服務的快照與殘留暫存檔（best-effort，不影響呼叫端）。
+  - 回歸測試：`test_prune_removes_snapshots_that_can_never_be_served_again`。
+
+### 🟠 補上會漏掉真實回歸的測試
+
+- **`merge_asof(direction="backward")` 無測試釘住**：改成 `"nearest"`／`"forward"`（**未來偷看**）原本 93 個測試全過。新增 `test_investor_flags_never_use_flow_published_after_the_bar`。
+- **每股 future mask 無多股測試**：改成全域 max 原本全過。新增 `test_investor_flags_stop_at_each_stock_own_last_flow_date`。
+- **`_snapshot_key` 完全無防護**：把 codes 從鍵中拿掉原本全過（會跨清單誤供資料）。新增 `test_snapshots_are_isolated_per_code_list_and_window`。
+- 補實 `test_cache_is_inactive_without_a_parquet_engine` 原本空洞的斷言（現同時驗證有引擎時確實會寫入與回讀）。
+
+### 其他
+
+- 移除死碼 `_SNAPSHOT_RESULT`。
+
 ## v3.2.1 — 2026-07-24
 
 修復 v3.2.0 造成的 Streamlit Cloud 部署失敗。
