@@ -214,16 +214,22 @@ def _run_screening(
     downloaders and their ``.clear`` eviction (used on transient failures).
     """
     load_universe = load_universe or _load_taiwan_stock_universe_cached
+    # An eviction hook only makes sense for the cache it belongs to, so it
+    # defaults to clearing the real Streamlit cache ONLY when that cache is the
+    # one actually being read. With an injected downloader the default becomes a
+    # no-op, so a caller supplying a fake can never wipe the production cache.
     if download_stock is None:
         def download_stock(codes, start, end, callback):
             return _download_stock_data_cached(
                 stock_codes=tuple(codes), start_date=start, end_date=end, _progress_callback=callback
             )
+        on_stock_download_error = on_stock_download_error or _download_stock_data_cached.clear
     if download_investor is None:
         def download_investor(end_date, lookback_days):
             return _download_investor_flow_data_cached(end_date=end_date, lookback_days=lookback_days)
-    on_stock_download_error = on_stock_download_error or _download_stock_data_cached.clear
-    on_investor_fetch_failure = on_investor_fetch_failure or _download_investor_flow_data_cached.clear
+        on_investor_fetch_failure = on_investor_fetch_failure or _download_investor_flow_data_cached.clear
+    on_stock_download_error = on_stock_download_error or (lambda: None)
+    on_investor_fetch_failure = on_investor_fetch_failure or (lambda: None)
 
     timeframe_code = TIMEFRAME_OPTIONS[params["analysis_timeframe"]]
     min_volume_shares = params["min_volume"] * 1000
@@ -335,9 +341,16 @@ def _run_screening(
         # holiday pad. The streak must be evaluable across the whole lookback
         # window, not only the most recent bar, or older qualifying signals get
         # silently dropped when N is large.
+        # lookback_bars counts BARS of the selected timeframe (spec §6), not
+        # trading days, so it must be scaled before being mixed with the streak
+        # length (which really is in trading days). Without this a Weekly or
+        # Monthly screen fetched only ~34 calendar days of flow while the
+        # lookback window reached back months, silently dropping every older
+        # qualifying signal.
+        bars_to_trading_days = {"D": 1, "W": 5, "M": 21}.get(timeframe_code, 1)
         needed_trading_days = int(params.get("investor_consecutive_days", 3)) + int(
             params.get("lookback_bars", 10)
-        )
+        ) * bars_to_trading_days
         investor_lookback_days = max(
             int(app_config.INVESTOR_LOOKBACK_DAYS),
             int(needed_trading_days * 1.6) + 14,
@@ -385,7 +398,13 @@ def _run_screening(
                 messages.append({"level": "warning", "text": "目前無法取得最新法人買賣超資料，法人條件已視為未達成。"})
             else:
                 messages.append({"level": "info", "text": "已取得法人買賣超資料，但本次篩選的股票在此期間沒有對應的法人買賣超紀錄，法人條件視為未達成。"})
-        elif fetch_failures > 0:
+        # Evaluated INDEPENDENTLY of emptiness, not as an elif: when every TWSE +
+        # TPEX fetch fails, download_investor_flow_data fail-opens and returns an
+        # EMPTY frame stamped fetch_failures == fetch_attempts. Chaining this to
+        # the branch above made the total-failure case — the worst one — skip both
+        # the diagnostics and the cache eviction, so the empty result was re-served
+        # for the full 1-hour TTL with the user never told why.
+        if fetch_failures > 0:
             date_sample = "、".join(failed_dates[:5])
             date_more = f" 等共 {len(failed_dates)} 日" if len(failed_dates) > 5 else ""
             date_detail = f"，受影響日期：{date_sample}{date_more}" if failed_dates else ""
@@ -879,7 +898,14 @@ def main():
                 st.session_state["excel_export"] = excel_state
                 st.rerun()
         if excel_state["error"]:
+            # Offer a retry: a failed build (usually transient — memory pressure
+            # on a big screen) must not lock the export away until the user
+            # re-runs the whole screening.
             st.error(excel_state["error"])
+            if st.button("重試建立 Excel", width="stretch", key="retry_excel"):
+                excel_state["error"] = None
+                st.session_state["excel_export"] = excel_state
+                st.rerun()
         elif excel_state["bytes"] is not None:
             st.download_button(
                 label="下載 Excel 結果",

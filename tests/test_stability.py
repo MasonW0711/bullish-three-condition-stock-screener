@@ -9,8 +9,10 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
+import os
+
 import data_loader
-from price_cache import load_snapshot, save_snapshot
+from price_cache import HISTORICAL_MAX_AGE_DAYS, load_snapshot, save_snapshot
 
 with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
     from app import _compute_latest_summary, _run_screening
@@ -29,7 +31,7 @@ from data_loader import (
     normalize_yfinance_data,
     resample_ohlcv,
 )
-from chart_engine import create_stock_chart
+from chart_engine import _MARKER_STYLES, create_stock_chart
 from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
 from export_engine import create_excel_bytes
 from config import EXCEL_SHEET_LABELS
@@ -1500,6 +1502,71 @@ class PipelinePurityTests(unittest.TestCase):
         pd.testing.assert_frame_equal(frame, before)
 
 
+class InvestorAsOfTests(unittest.TestCase):
+    """Pin the as-of direction and the per-stock future mask (§3.7)."""
+
+    def test_investor_flags_never_use_flow_published_after_the_bar(self):
+        # Look-ahead guard. The flow BEFORE the bar breaks the streak; the flow
+        # AFTER the bar would complete it. Only direction="backward" is correct —
+        # "nearest"/"forward" would leak future data into a past bar and both
+        # previously passed the whole suite.
+        bars = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-10"]),
+                "StockCode": ["2330.TW"],
+                "Open": [100.0], "High": [101.0], "Low": [99.0], "Close": [100.0],
+                "Volume": [1_000_000.0],
+            }
+        )
+        investor = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-04", "2026-05-08", "2026-05-11", "2026-05-12"]),
+                "BaseCode": ["2330"] * 4,
+                # As of the bar (05-10) the latest two trading days are 05-08(+)
+                # and 05-04(-): streak broken. The post-bar rows are both (+).
+                "foreign_net": [-1.0, 1.0, 1.0, 1.0],
+                "trust_net": [-1.0, 1.0, 1.0, 1.0],
+            }
+        )
+        result = attach_investor_flow_flags(bars, investor, consecutive_days=2)
+        self.assertFalse(bool(result.loc[0, "foreign_buy_streak_ok"]))
+        self.assertFalse(bool(result.loc[0, "trust_buy_streak_ok"]))
+
+    def test_investor_flags_stop_at_each_stock_own_last_flow_date(self):
+        # The future mask is per-BaseCode. A global max would let the stock with
+        # the SHORTER flow history keep its last streak flag alive on bars dated
+        # after its own data ended, borrowing the other stock's coverage.
+        dates = pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"])
+        bars = pd.concat(
+            [
+                pd.DataFrame({"Date": dates, "StockCode": "2330.TW", "Open": 100.0,
+                              "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 1e6}),
+                pd.DataFrame({"Date": dates, "StockCode": "2317.TW", "Open": 100.0,
+                              "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 1e6}),
+            ],
+            ignore_index=True,
+        )
+        investor = pd.concat(
+            [
+                # 2330 reports all the way to 05-07.
+                pd.DataFrame({"Date": dates, "BaseCode": "2330",
+                              "foreign_net": 10.0, "trust_net": 10.0}),
+                # 2317 stops after 05-04.
+                pd.DataFrame({"Date": dates[:2], "BaseCode": "2317",
+                              "foreign_net": 10.0, "trust_net": 10.0}),
+            ],
+            ignore_index=True,
+        )
+        result = attach_investor_flow_flags(bars, investor, consecutive_days=2,
+                                            market_trading_days=dates.values)
+        late = result[(result["StockCode"] == "2317.TW") & (result["Date"] > pd.Timestamp("2026-05-04"))]
+        self.assertTrue(len(late) > 0)
+        self.assertFalse(bool(late["foreign_buy_streak_ok"].any()))
+        # The stock that DOES have coverage keeps its flags on the same dates.
+        covered = result[(result["StockCode"] == "2330.TW") & (result["Date"] == pd.Timestamp("2026-05-07"))]
+        self.assertTrue(bool(covered["foreign_buy_streak_ok"].iloc[0]))
+
+
 class PriceCacheTests(unittest.TestCase):
     def _daily(self):
         return pd.DataFrame(
@@ -1529,15 +1596,17 @@ class PriceCacheTests(unittest.TestCase):
             captured = datetime(2026, 7, 1, 10, 0, 0)
             save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
                           (self._daily(), ["2330.TW"], [], []), now=captured)
-            # Window ends in the past → reusable for a few days …
+            # Window ends in the past → reusable within HISTORICAL_MAX_AGE_DAYS …
             self.assertIsNotNone(
                 load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
-                              now=captured + timedelta(days=3))
+                              now=captured + timedelta(hours=6))
             )
-            # … but not past HISTORICAL_MAX_AGE_DAYS (7).
+            # … but not beyond it. The bound is deliberately short: yfinance
+            # retro-adjusts Volume (not just OHLC) on a split, so an older
+            # snapshot can carry a pre-split volume basis and flip min_volume.
             self.assertIsNone(
                 load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
-                              now=captured + timedelta(days=8))
+                              now=captured + timedelta(days=HISTORICAL_MAX_AGE_DAYS, hours=1))
             )
 
     def test_current_day_window_uses_short_ttl(self):
@@ -1596,6 +1665,123 @@ class PriceCacheTests(unittest.TestCase):
             self.assertEqual(list(Path(cache_dir).iterdir()), [])  # nothing written
             self.assertIsNone(
                 price_cache.load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            )
+        # Not vacuous: with an engine the SAME calls do populate and return data,
+        # so the assertions above are pinning the guard, not an empty directory.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            price_cache.save_snapshot(
+                cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8),
+                (self._daily(), ["2330.TW"], [], []),
+            )
+            self.assertNotEqual(list(Path(cache_dir).iterdir()), [])
+            self.assertIsNotNone(
+                price_cache.load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            )
+
+    def test_snapshots_are_isolated_per_code_list_and_window(self):
+        # Several snapshots share ONE cache dir, so a key that ignores the codes
+        # or the window would cross-serve. Without this, _snapshot_key could drop
+        # the code list entirely and the whole suite would still pass.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            one = self._daily().assign(Close=[1.0, 2.0, 3.0])
+            many = self._daily().assign(Close=[9.0, 9.0, 9.0])
+            save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8), (one, ["2330.TW"], [], []))
+            save_snapshot(cache_dir, ["2330.TW", "2317.TW"], date(2026, 1, 1), date(2026, 1, 8),
+                          (many, ["2330.TW", "2317.TW"], [], []))
+
+            got_one = load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            got_many = load_snapshot(cache_dir, ["2330.TW", "2317.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            self.assertEqual(list(got_one[0]["Close"]), [1.0, 2.0, 3.0])
+            self.assertEqual(list(got_many[0]["Close"]), [9.0, 9.0, 9.0])
+            self.assertEqual(got_one[1], ["2330.TW"])
+            # A different window must MISS, never fall back to another window.
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 9))
+            )
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 2), date(2026, 1, 8))
+            )
+            # Order and duplicates must NOT change the key.
+            self.assertIsNotNone(
+                load_snapshot(cache_dir, ["2317.TW", "2330.TW", "2330.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            )
+
+    def test_concurrent_saves_never_mix_columns_from_two_downloads(self):
+        # Regression for the v3.2.1 blocker: a shared "<key>.tmp" let two writers
+        # interleave into one file. Because parquet is columnar the result was a
+        # VALID file whose columns came from different downloads — read_parquet
+        # succeeded, fail-open never fired, and the mixed prices produced phantom
+        # signals. Each writer must use its own temp name.
+        import threading
+
+        # The frame must be big enough that to_parquet takes long enough for the
+        # writers to interleave — a 3-row frame finishes atomically by luck and
+        # would let the bug pass.
+        rows = 40_000
+        dates = pd.date_range("2020-01-01", periods=rows, freq="min")
+
+        def frame_for(marker: float) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "Date": dates,
+                    "StockCode": "2330.TW",
+                    "Open": marker, "High": marker, "Low": marker, "Close": marker,
+                    "Volume": marker,
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            errors: list[BaseException] = []
+
+            def writer(marker):
+                frame = frame_for(marker)
+                try:
+                    for _ in range(12):
+                        save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8),
+                                      (frame, ["2330.TW"], [], []))
+                except BaseException as exc:  # noqa: BLE001 - surfaced below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=writer, args=(m,)) for m in (11.0, 22.0)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+
+            loaded = load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 1, 8))
+            self.assertIsNotNone(loaded, "a valid snapshot must survive concurrent writers")
+            data = loaded[0]
+            # The whole file must come from ONE writer. The bug produced a VALID
+            # parquet whose columns came from different writers, so check ACROSS
+            # columns, not just within one.
+            values = set(data["Close"]) | set(data["Open"]) | set(data["High"]) | set(data["Volume"])
+            self.assertEqual(values, {11.0} if 11.0 in values else {22.0},
+                             f"columns mixed across writers: {sorted(values)}")
+            self.assertEqual(len(data), rows)
+            # And no temp files may be left behind.
+            self.assertEqual([p.name for p in Path(cache_dir).glob("*.tmp")], [])
+
+    def test_prune_removes_snapshots_that_can_never_be_served_again(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            save_snapshot(cache_dir, ["OLD.TW"], date(2026, 1, 1), date(2026, 1, 8),
+                          (self._daily(), ["OLD.TW"], [], []))
+            stale_age = (HISTORICAL_MAX_AGE_DAYS + 3) * 86400
+            old_time = datetime.now().timestamp() - stale_age
+            for path in Path(cache_dir).iterdir():
+                os.utime(path, (old_time, old_time))
+            self.assertNotEqual(list(Path(cache_dir).iterdir()), [])
+
+            # Writing any snapshot sweeps the unreachable ones.
+            save_snapshot(cache_dir, ["NEW.TW"], date(2026, 2, 1), date(2026, 2, 8),
+                          (self._daily(), ["NEW.TW"], [], []))
+            names = {p.name for p in Path(cache_dir).iterdir()}
+            self.assertTrue(names)
+            self.assertIsNotNone(
+                load_snapshot(cache_dir, ["NEW.TW"], date(2026, 2, 1), date(2026, 2, 8))
+            )
+            self.assertIsNone(
+                load_snapshot(cache_dir, ["OLD.TW"], date(2026, 1, 1), date(2026, 1, 8))
             )
 
     def test_download_stock_data_falls_back_to_live_without_parquet_engine(self):
@@ -1686,7 +1872,8 @@ class ScreeningServiceTests(unittest.TestCase):
             )
         return pd.concat(frames, ignore_index=True)
 
-    def _run(self, download_stock, download_investor=None, on_stock_download_error=None, **pkw):
+    def _run(self, download_stock, download_investor=None, on_stock_download_error=None,
+             on_investor_fetch_failure=None, **pkw):
         return _run_screening(
             self._params(**pkw),
             use_auto_universe=True,
@@ -1695,8 +1882,64 @@ class ScreeningServiceTests(unittest.TestCase):
             download_stock=download_stock,
             download_investor=download_investor or (lambda end_date, lookback_days: pd.DataFrame()),
             on_stock_download_error=on_stock_download_error or Mock(),
-            on_investor_fetch_failure=Mock(),
+            on_investor_fetch_failure=on_investor_fetch_failure or Mock(),
         )
+
+    @staticmethod
+    def _flow_frame(rows, *, fetch_failures=0, fetch_attempts=0, failure_dates=()):
+        frame = pd.DataFrame(rows, columns=["Date", "BaseCode", "foreign_net", "trust_net"])
+        frame.attrs["fetch_failures"] = fetch_failures
+        frame.attrs["fetch_attempts"] = fetch_attempts
+        frame.attrs["fetch_failure_dates"] = list(failure_dates)
+        return frame
+
+    def test_total_investor_fetch_failure_still_evicts_and_reports(self):
+        # download_investor_flow_data fail-opens: when EVERY TWSE+TPEX fetch
+        # errors it returns an EMPTY frame stamped fetch_failures ==
+        # fetch_attempts. The diagnostics + eviction must not be chained to the
+        # non-empty case, or the worst failure mode is the one that stays silent
+        # and gets re-served from cache for the whole TTL.
+        evict = Mock()
+        empty_but_failed = self._flow_frame(
+            [], fetch_failures=5, fetch_attempts=5, failure_dates=["2026-02-02"]
+        )
+        result = self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []),
+            download_investor=lambda end_date, lookback_days: empty_but_failed,
+            on_investor_fetch_failure=evict,
+            foreign_buy_streak=True,
+        )
+        evict.assert_called_once()
+        texts = " ".join(m["text"] for m in result["messages"])
+        self.assertIn("5/5", texts)
+        self.assertTrue(any("5/5" in note for note in result["download_errors"]))
+
+    def test_partial_investor_fetch_failure_still_evicts(self):
+        evict = Mock()
+        partial = self._flow_frame(
+            [(pd.Timestamp("2026-02-02"), "2330", 10.0, 5.0)],
+            fetch_failures=2, fetch_attempts=9, failure_dates=["2026-02-03"],
+        )
+        self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []),
+            download_investor=lambda end_date, lookback_days: partial,
+            on_investor_fetch_failure=evict,
+            foreign_buy_streak=True,
+        )
+        evict.assert_called_once()
+
+    def test_clean_investor_fetch_does_not_evict(self):
+        evict = Mock()
+        clean = self._flow_frame(
+            [(pd.Timestamp("2026-02-02"), "2330", 10.0, 5.0)], fetch_failures=0, fetch_attempts=9
+        )
+        self._run(
+            lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []),
+            download_investor=lambda end_date, lookback_days: clean,
+            on_investor_fetch_failure=evict,
+            foreign_buy_streak=True,
+        )
+        evict.assert_not_called()
 
     def test_run_screening_happy_path(self):
         result = self._run(lambda codes, s, e, cb: (self._daily(list(codes)), list(codes), [], []))
@@ -1782,6 +2025,32 @@ class ChartEngineTests(unittest.TestCase):
         self.assertEqual(len(candles), 1)
         self.assertEqual(candles[0].increasing.fillcolor, "#dc2626")
         self.assertEqual(candles[0].decreasing.fillcolor, "#16a34a")
+
+    def test_volume_bars_follow_taiwan_colors(self):
+        # Taiwan convention: up = red, down = green. The pre-v3.1.0 code used the
+        # US palette; without this a silent revert is invisible.
+        frame = self._chart_frame()
+        fig, _ = create_stock_chart(frame, "日 K")
+        bars = [t for t in fig.data if t.type == "bar"]
+        self.assertEqual(len(bars), 1)
+        colors = list(bars[0].marker.color)
+        ordered = frame.sort_values("Date")
+        expected = ["#dc2626" if c >= o else "#16a34a"
+                    for o, c in zip(ordered["Open"], ordered["Close"])]
+        self.assertEqual(colors, expected)
+        self.assertIn("#dc2626", colors)  # the fixture must exercise an up bar
+
+    def test_dual_break_markers_do_not_overlap(self):
+        # When both lines break on one bar the two triangles must sit at
+        # different heights, or the black marker hides behind the red one.
+        red = [t for t in _MARKER_STYLES if t[0] == "break_red_line_daily"][0]
+        black = [t for t in _MARKER_STYLES if t[0] == "break_black_line_daily"][0]
+        self.assertEqual(red[4], black[4])   # same anchor column (High)
+        self.assertEqual(red[5], black[5])   # same direction
+        self.assertNotEqual(red[6], black[6])  # but different stagger multiplier
+        down_red = [t for t in _MARKER_STYLES if t[0] == "break_down_red_line"][0]
+        down_black = [t for t in _MARKER_STYLES if t[0] == "break_down_black_line"][0]
+        self.assertNotEqual(down_red[6], down_black[6])
 
     def test_title_includes_stock_name_from_column(self):
         fig, _ = create_stock_chart(self._chart_frame(with_name=True), "日 K")

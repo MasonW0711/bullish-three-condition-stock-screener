@@ -2,6 +2,64 @@
 
 本檔記錄各版本的重要變更。日期為當地時間。
 
+## v3.2.2 — 2026-07-24
+
+深度審查（七維度、對抗式驗證）後的必修項目。
+
+### 🔴 修正：併發寫入可產生「混用兩次下載」的快取檔（會造成假訊號）
+
+- `price_cache.save_snapshot` 的暫存檔名原為 `<key>.parquet.tmp`，**只由 key 決定**，兩個行程存同一組 (代號, 起訖) 會開同一個檔案交錯寫入。因 parquet 是**欄式**格式，倖存者通常是一個**完全合法**的檔案，但欄位來自兩次不同下載——`read_parquet` 成功、不拋錯、fail-open 永不觸發，混用的價格會產生假突破訊號。桌面版無單一實例鎖，多開即可觸發。
+- 改為每個寫入者使用唯一暫存檔名（`pid.uuid4`），並在 `finally` 清除，parquet 與 json sidecar 皆同。
+  - 回歸測試：`test_concurrent_saves_never_mix_columns_from_two_downloads`（40,000 列 × 2 執行緒；已驗證還原舊碼會**穩定失敗** 3/3）。
+
+### 🟠 修正：法人資料「全部抓取失敗」時靜默且不清快取
+
+- `if investor_flow_df.empty:` / `elif fetch_failures > 0:` 的鏈接，使「每一次 TWSE＋TPEX 抓取都失敗」這個**最嚴重**的情況跳過診斷訊息與快取清除——空結果被整整 1 小時的 TTL 重複回傳，使用者完全不知情。改為獨立判斷。
+  - 回歸測試：`test_total_investor_fetch_failure_still_evicts_and_reports`、`test_partial_investor_fetch_failure_still_evicts`、`test_clean_investor_fetch_does_not_evict`。
+
+### 🟠 更正：v3.2.0 部署事故的根因記載錯誤
+
+v3.2.1 記載「現代 Streamlit 已不依賴 pyarrow」——**這是錯的**，已於本版更正：
+
+- 實測 `streamlit 1.36.0 → pyarrow>=7.0`、`1.60.0 → pyarrow<25,>=7.0`，**整個 pin 範圍都硬性依賴 pyarrow**，雲端一直都裝得到，快取在雲端**是啟用的**。
+- 真正肇因是我加的**上界** `pyarrow>=15,<22`：它把版本釘死在 21.0.0（**0 個 cp314 wheel**），才導致原始碼建置與 cmake 失敗。移除該行之所以有效，是讓 pip 改用 streamlit 自己的 `>=7.0` 解到 25.0.0（**14 個 cp314 wheel**）。
+- **教訓：不要為原生相依加上界，把它壓在最新有 wheel 的版本之下。** 已更正 `price_cache.py` 註解、`requirements-build.txt` 說明與測試命名前提。
+
+### 🟠 修正：快取無上限成長（雲端亦受影響，因上述前提錯誤）
+
+- 快取鍵含日期區間，滾動預設區間使其**每日產生新鍵**，而原本沒有任何刪除路徑。新增 `_prune`：每次寫入後清掉超過最長 TTL、已永遠不可能被服務的快照與殘留暫存檔（best-effort，不影響呼叫端）。
+  - 回歸測試：`test_prune_removes_snapshots_that_can_never_be_served_again`。
+
+### 🟠 補上會漏掉真實回歸的測試
+
+- **`merge_asof(direction="backward")` 無測試釘住**：改成 `"nearest"`／`"forward"`（**未來偷看**）原本 93 個測試全過。新增 `test_investor_flags_never_use_flow_published_after_the_bar`。
+- **每股 future mask 無多股測試**：改成全域 max 原本全過。新增 `test_investor_flags_stop_at_each_stock_own_last_flow_date`。
+- **`_snapshot_key` 完全無防護**：把 codes 從鍵中拿掉原本全過（會跨清單誤供資料）。新增 `test_snapshots_are_isolated_per_code_list_and_window`。
+- 補實 `test_cache_is_inactive_without_a_parquet_engine` 原本空洞的斷言（現同時驗證有引擎時確實會寫入與回讀）。
+
+### 🟠 其餘 Major：Excel 記憶體與週／月線法人視窗
+
+- **Excel `All_Data` 只輸出回看窗格內的 K 棒。** 原本輸出全部下載歷史，全市場約 23 萬列 × 50 欄，openpyxl 逐格建物件，實測峰值 4.2 GB／75 秒。訊號判定本來就只用窗格內資料，窗格外不構成任何已報訊號的證據。實測改善：**75 秒 → 5.8 秒、xlsx 52 MB → 5.3 MB**；略過的列數會寫入診斷訊息。
+- **法人抓取視窗依週期換算。** `needed_trading_days` 原本把 `lookback_bars` 直接當交易日，但它是**所選週期的 K 棒數**（spec §6）。週線／月線因此只抓約 34 個日曆日的法人資料，卻要涵蓋回看數月的窗格，較舊的合格訊號被靜默丟棄。改為 `D=1 / W=5 / M=21` 換算。（此為 v3.2.0 之前即存在的問題）
+
+### 🟡 快取強化（Minor）
+
+- **歷史區間 TTL 由 7 天縮短為 1 天**：yfinance 連**成交量**都會回溯調整，7 天可能沿用除權前的量能基準而翻轉 `min_volume` 絕對門檻。1 天仍完整保有桌面冷啟動的效益。
+- **時間一律以 UTC 比較**：原用 naive 本地時間，DST 回撥或機器時區變動會讓年齡少算最多一小時、變相延長 TTL。
+- **`end_was_current` 缺失時保守採用短 TTL**（原本回退成載入時重算，正好把該欄位要防的升級問題放回來）。
+- **快取鍵**：分隔符改用不可能出現在股票代號中的控制字元（原本 `|` 可被代號內容偽造），雜湊截斷由 16 → 32 字元。
+- **檔案權限改為 0600**（sidecar 內含使用者自選股清單）；`default_cache_dir` 補上 macOS 分支，且環境變數僅在**絕對路徑**時採用（空值或相對值原本會把快取寫進當前工作目錄）。
+
+### 🟡 其他修正
+
+- **`attach_investor_flow_flags` 補回遺漏的 `.strip()`**：v3.2.0 改寫成 `merge_asof` 時掉了股票側 BaseCode 的 `.strip()`，`StockCode` 帶空白時會比對不到、法人旗標全歸零——「byte-identical」對這類輸入原本並不成立。已驗證修正後與 v3.0.0 一致。
+- **移除兩處多餘的整表排序**：實測整表排序由 3 次降為 1 次（`add_prev_close` 之後無任何階段重排），CHANGELOG v3.2.0「9 次 → 單次」的說法過於樂觀，此處一併更正。以 120 組差分測試（含**刻意打亂順序**的輸入）驗證輸出仍與 v3.0.0 逐格一致。
+- **Excel 建立失敗可重試**（原本失敗後按鈕消失，必須重跑整次篩選）。
+- **注入下載器時，快取清除預設改為 no-op**，避免測試或替身呼叫端意外清掉正式快取。
+- 補上 K 線圖成交量顏色與雙破標記錯開的測試（原本改回舊行為不會被發現）。
+- 移除死碼 `_SNAPSHOT_RESULT`；`price_cache` 公開 API 補型別註記並改用 `X | None` 慣例。
+- **spec.md 新增 §5.2 資料新鮮度與快取契約**，把「不得增量拼接」「新鮮度上限」「fail-open」「磁碟須有界」寫成正式規格；§5.1 補上「暫時性失敗不得被快取沿用」。
+
 ## v3.2.1 — 2026-07-24
 
 修復 v3.2.0 造成的 Streamlit Cloud 部署失敗。

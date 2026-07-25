@@ -1,8 +1,13 @@
 pyinstaller>=6.10
-# Parquet engine for the on-disk price snapshot cache (price_cache.py). Declared
-# HERE and not in requirements.txt on purpose: the cache only pays off in the
-# desktop bundle (idle-shutdown after 15s makes every launch a cold start),
-# while Streamlit Cloud runs a Python version pyarrow may ship no wheel for —
-# there pip falls back to a source build, fails for lack of cmake, and takes the
-# whole deploy down. The cache degrades to inactive when the engine is absent.
+# Parquet engine for the on-disk price snapshot cache (price_cache.py). streamlit
+# already hard-requires pyarrow (>=7.0 across our whole pinned range), so this is
+# not what makes it available at runtime — it is declared here so PyInstaller
+# collects it explicitly into the desktop bundle rather than relying on a pandas
+# implementation detail to pull it in.
+#
+# NOTE — deliberately NO upper bound. v3.2.0 shipped "pyarrow>=15,<22" in
+# requirements.txt; that ceiling pinned 21.0.0, which has no cp314 wheel, so pip
+# fell back to a source build, could not find cmake, and took the entire
+# Streamlit Cloud deploy down. Capping a native dependency below its newest
+# wheel-bearing release is the hazard — declaring the dependency is not.
 pyarrow>=15
