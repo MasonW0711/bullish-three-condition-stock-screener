@@ -410,9 +410,10 @@ def add_path_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> pd.DataFrame:
     """Apply direction-agnostic volume + lookback gating to each of the four paths."""
-    # sort_values already returns a fresh frame; the produced final columns make
-    # this the pipeline's output frame, independent of the entry data.
-    output = df.sort_values(["StockCode", "Date"])
+    # No re-sort: add_prev_close already ordered the frame by [StockCode, Date]
+    # and no stage reorders it, so sorting again only paid for another whole-frame
+    # copy of the widest frame in the pipeline.
+    output = df
     group_sizes = output.groupby("StockCode")["Date"].transform("size")
     row_number = output.groupby("StockCode").cumcount()
 
@@ -518,7 +519,11 @@ def attach_investor_flow_flags(
     output = df.copy()
     output["Date"] = pd.to_datetime(output["Date"], errors="coerce")
     output = output.dropna(subset=["Date"]).copy()
-    output["BaseCode"] = output["StockCode"].astype(str).str.split(".").str[0]
+    # .strip() matches the investor side (below) and the pre-v3.2.0 per-stock
+    # loop, which looked the group up with str(base_code).strip(). Dropping it in
+    # the merge_asof rewrite made a StockCode carrying stray whitespace silently
+    # match nothing, zeroing every investor flag for that stock.
+    output["BaseCode"] = output["StockCode"].astype(str).str.split(".").str[0].str.strip()
     consecutive_days = max(int(consecutive_days), 1)
 
     flag_columns = _INVESTOR_FLAG_COLUMNS
@@ -660,4 +665,5 @@ def run_signal_pipeline(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         lookback_bars=int(params.get("lookback_bars", 10)),
         min_volume=int(params.get("min_volume", 2000)),
     )
-    return output.sort_values(["StockCode", "Date"]).reset_index(drop=True)
+    # Already ordered by add_prev_close; only the index needs normalizing.
+    return output.reset_index(drop=True)

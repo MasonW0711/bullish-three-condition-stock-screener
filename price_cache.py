@@ -26,17 +26,25 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 RECENT_END_TTL_SECONDS = 1800  # evolving current-day data: match the 30-min in-memory TTL
-HISTORICAL_MAX_AGE_DAYS = 7  # final historical windows: refresh weekly for late corrections
+# Historical windows are "final", but yfinance retro-adjusts the whole series —
+# INCLUDING Volume — on any split / stock dividend. A snapshot older than one
+# adjustment cycle can therefore carry a pre-split volume basis, which flips the
+# absolute min_volume gate and changes the reported signal set. One day still
+# delivers the entire desktop win (the bundle idle-shuts-down every 15s, so a
+# day's use is many cold starts) while bounding that drift to a single session.
+HISTORICAL_MAX_AGE_DAYS = 1
+_KEY_FIELD_SEPARATOR = "\x1f"  # unit separator: cannot occur in a stock code
+_SNAPSHOT_FILE_MODE = 0o600  # cache holds the user's watchlist; keep it private
 
 
 def _detect_parquet_engine() -> bool:
@@ -92,23 +100,35 @@ def _prune(cache_dir: Path, now: datetime) -> None:
 def default_cache_dir() -> Path:
     """Per-user cache directory.
 
-    Uses the platform cache location: ``%LOCALAPPDATA%`` on Windows, otherwise
-    ``$XDG_CACHE_HOME`` or ``~/.cache``. (desktop_launcher writes LOGS to a
-    different per-platform dir; this is a cache, so it lives under the cache root.)
+    ``%LOCALAPPDATA%`` on Windows, ``~/Library/Caches`` on macOS, otherwise
+    ``$XDG_CACHE_HOME`` or ``~/.cache``. Env overrides are only honoured when
+    ABSOLUTE — an empty or relative value would otherwise put the cache in
+    whatever the current working directory happens to be.
     """
     home = Path.home()
     if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        base = _absolute_env_dir("LOCALAPPDATA", home / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = home / "Library" / "Caches"
     else:
-        base = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
+        base = _absolute_env_dir("XDG_CACHE_HOME", home / ".cache")
     return base / "BullishThreeConditionStockScreener" / "price_snapshots"
+
+
+def _absolute_env_dir(name: str, fallback: Path) -> Path:
+    raw = (os.environ.get(name) or "").strip()
+    candidate = Path(raw) if raw else None
+    return candidate if candidate is not None and candidate.is_absolute() else fallback
 
 
 def _snapshot_key(codes, start_date, end_date) -> str:
     # Sorted + deduped: the downloaded frame is order-independent and each symbol
-    # appears once, so [A, A, B] and [B, A] must map to the same snapshot.
-    payload = "|".join(sorted({str(code) for code in codes})) + f"@{start_date}~{end_date}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    # appears once, so [A, A, B] and [B, A] must map to the same snapshot. The
+    # separator is a control character that cannot appear in a stock code, so no
+    # code content can forge a different code set's key.
+    joined = _KEY_FIELD_SEPARATOR.join(sorted({str(code) for code in codes}))
+    payload = _KEY_FIELD_SEPARATOR.join((joined, str(start_date), str(end_date)))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
 def _paths(cache_dir: Path, key: str) -> tuple[Path, Path]:
@@ -121,12 +141,41 @@ def _as_date(value) -> date:
     return pd.to_datetime(value).date()
 
 
-def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[datetime] = None) -> None:
+def _as_utc(value: datetime | None) -> datetime:
+    """Normalize to aware UTC so ages are wall-clock-jump proof.
+
+    Freshness was compared with naive local ``datetime.now()``: across a DST
+    fall-back (or a machine timezone change) the computed age undercounts the
+    real elapsed time by an hour, extending a TTL that exists to bound staleness.
+    """
+    if value is None:
+        return datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.astimezone(timezone.utc)  # interpret naive input as local
+    return value.astimezone(timezone.utc)
+
+
+def _restrict(path: Path) -> None:
+    """Make a cache file owner-only; the sidecar lists the user's watchlist."""
+    try:
+        os.chmod(path, _SNAPSHOT_FILE_MODE)
+    except OSError:
+        pass  # best-effort (e.g. filesystems without POSIX modes)
+
+
+def save_snapshot(
+    cache_dir: Path | str,
+    codes,
+    start_date,
+    end_date,
+    result: tuple[pd.DataFrame, list[str], list[str], list[str]],
+    now: datetime | None = None,
+) -> None:
     """Persist a whole download result. Fail-open: any error is logged and ignored."""
     if not _PARQUET_AVAILABLE:
         return  # no engine: cache stays inactive, callers just download live
     try:
-        now = now or datetime.now()
+        now = _as_utc(now)
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         daily_data, success_list, failed_list, download_errors = result
@@ -158,6 +207,7 @@ def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[
                 "download_errors": list(download_errors),
             }
         )
+        _restrict(parquet_path)
         # Atomic sidecar write too, so a crash can never pair a new parquet with a
         # torn/old metadata file. Same per-writer unique name as the parquet.
         meta_tmp = meta_path.with_name(f"{meta_path.name}.{_writer_stamp()}.tmp")
@@ -166,12 +216,19 @@ def save_snapshot(cache_dir, codes, start_date, end_date, result, now: Optional[
             os.replace(meta_tmp, meta_path)
         finally:
             Path(meta_tmp).unlink(missing_ok=True)
+        _restrict(meta_path)
         _prune(cache_dir, now)
     except Exception as exc:  # noqa: BLE001 - cache is best-effort
         logger.warning("價格快照寫入失敗（略過快取）：%s", exc)
 
 
-def load_snapshot(cache_dir, codes, start_date, end_date, now: Optional[datetime] = None):
+def load_snapshot(
+    cache_dir: Path | str,
+    codes,
+    start_date,
+    end_date,
+    now: datetime | None = None,
+) -> tuple[pd.DataFrame, list[str], list[str], list[str]] | None:
     """Return a cached (daily_data, success, failed, errors) tuple, or None.
 
     Returns None on any miss, staleness, or error so the caller downloads live.
@@ -179,24 +236,22 @@ def load_snapshot(cache_dir, codes, start_date, end_date, now: Optional[datetime
     if not _PARQUET_AVAILABLE:
         return None  # no engine: always a miss, caller downloads live
     try:
-        now = now or datetime.now()
+        now = _as_utc(now)
         cache_dir = Path(cache_dir)
         parquet_path, meta_path = _paths(cache_dir, _snapshot_key(codes, start_date, end_date))
         if not parquet_path.exists() or not meta_path.exists():
             return None
         info = json.loads(meta_path.read_text(encoding="utf-8"))
-        captured_at = datetime.fromisoformat(info["captured_at"])
+        captured_at = _as_utc(datetime.fromisoformat(info["captured_at"]))
         age_seconds = (now - captured_at).total_seconds()
         if age_seconds < 0:
             return None  # clock moved backwards; distrust the snapshot
-        # Use the capture-time classification (fall back to a load-time estimate
-        # for snapshots written before this field existed). A window that was
-        # current at capture has a possibly-partial last bar forever, so it must
-        # never be promoted to the long historical TTL once the date rolls over.
-        end_was_current = info.get("end_was_current")
-        if end_was_current is None:
-            end_was_current = _as_date(end_date) >= now.date()
-        if end_was_current:
+        # Classification is FIXED at capture: a window that was current then has
+        # a possibly-partial last bar forever, so it must never be promoted to
+        # the longer historical TTL once the calendar rolls the end date past.
+        # A snapshot without the field predates it — assume the短 TTL rather
+        # than recomputing at load, which is exactly the promotion this prevents.
+        if info.get("end_was_current", True):
             if age_seconds > RECENT_END_TTL_SECONDS:
                 return None
         elif age_seconds > HISTORICAL_MAX_AGE_DAYS * 86400:

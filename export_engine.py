@@ -116,10 +116,34 @@ def create_excel_bytes(
             return df.sort_values("Date").tail(EXCEL_MAX_ROWS_PER_SHEET).sort_index().reset_index(drop=True)
         return df.tail(EXCEL_MAX_ROWS_PER_SHEET).reset_index(drop=True)
 
+    def _trim_all_data(df: pd.DataFrame) -> pd.DataFrame:
+        """Keep only the bars the screen actually reasoned about.
+
+        All_Data carried the FULL downloaded history for every symbol — on a
+        full-market run that is ~230k rows x ~50 columns, and openpyxl builds a
+        cell object per value, peaking at multiple GB and taking over a minute.
+        The lookback window is what the signals were judged on (signal_engine
+        gates on ``lookback_rank <= lookback_bars``), so anything older is not
+        evidence for any reported signal. The full series is still available via
+        the per-stock chart and by re-running with a shorter timeframe.
+        """
+        if df is None or df.empty or "lookback_rank" not in df.columns:
+            return df
+        lookback_bars = int(params.get("lookback_bars", 10))
+        trimmed = df[df["lookback_rank"] <= lookback_bars]
+        dropped = len(df) - len(trimmed)
+        if dropped > 0:
+            notes.append(
+                f"「{EXCEL_SHEET_LABELS.get('All_Data', 'All_Data')}」僅輸出回看窗格內"
+                f"（最近 {lookback_bars} 根 K 棒）的 {len(trimmed)} 列，已略過窗格外的 {dropped} 列；"
+                "訊號判定僅使用窗格內資料，完整歷史請見個股 K 線圖。"
+            )
+        return trimmed.reset_index(drop=True)
+
     data_frames = {
         sheet_key: _localize_frame(_truncate_for_excel(frame, sheet_key))
         for sheet_key, frame in (
-            ("All_Data", all_data),
+            ("All_Data", _trim_all_data(all_data)),
             ("Long_Signals", long_signals),
             ("Short_Signals", short_signals),
             ("Latest_Summary_Long", latest_summary_long),

@@ -31,7 +31,7 @@ from data_loader import (
     normalize_yfinance_data,
     resample_ohlcv,
 )
-from chart_engine import create_stock_chart
+from chart_engine import _MARKER_STYLES, create_stock_chart
 from display_utils import booleans_to_chinese, sanitize_for_spreadsheet
 from export_engine import create_excel_bytes
 from config import EXCEL_SHEET_LABELS
@@ -1596,15 +1596,17 @@ class PriceCacheTests(unittest.TestCase):
             captured = datetime(2026, 7, 1, 10, 0, 0)
             save_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
                           (self._daily(), ["2330.TW"], [], []), now=captured)
-            # Window ends in the past → reusable for a few days …
+            # Window ends in the past → reusable within HISTORICAL_MAX_AGE_DAYS …
             self.assertIsNotNone(
                 load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
-                              now=captured + timedelta(days=3))
+                              now=captured + timedelta(hours=6))
             )
-            # … but not past HISTORICAL_MAX_AGE_DAYS (7).
+            # … but not beyond it. The bound is deliberately short: yfinance
+            # retro-adjusts Volume (not just OHLC) on a split, so an older
+            # snapshot can carry a pre-split volume basis and flip min_volume.
             self.assertIsNone(
                 load_snapshot(cache_dir, ["2330.TW"], date(2026, 1, 1), date(2026, 6, 1),
-                              now=captured + timedelta(days=8))
+                              now=captured + timedelta(days=HISTORICAL_MAX_AGE_DAYS, hours=1))
             )
 
     def test_current_day_window_uses_short_ttl(self):
@@ -2023,6 +2025,32 @@ class ChartEngineTests(unittest.TestCase):
         self.assertEqual(len(candles), 1)
         self.assertEqual(candles[0].increasing.fillcolor, "#dc2626")
         self.assertEqual(candles[0].decreasing.fillcolor, "#16a34a")
+
+    def test_volume_bars_follow_taiwan_colors(self):
+        # Taiwan convention: up = red, down = green. The pre-v3.1.0 code used the
+        # US palette; without this a silent revert is invisible.
+        frame = self._chart_frame()
+        fig, _ = create_stock_chart(frame, "日 K")
+        bars = [t for t in fig.data if t.type == "bar"]
+        self.assertEqual(len(bars), 1)
+        colors = list(bars[0].marker.color)
+        ordered = frame.sort_values("Date")
+        expected = ["#dc2626" if c >= o else "#16a34a"
+                    for o, c in zip(ordered["Open"], ordered["Close"])]
+        self.assertEqual(colors, expected)
+        self.assertIn("#dc2626", colors)  # the fixture must exercise an up bar
+
+    def test_dual_break_markers_do_not_overlap(self):
+        # When both lines break on one bar the two triangles must sit at
+        # different heights, or the black marker hides behind the red one.
+        red = [t for t in _MARKER_STYLES if t[0] == "break_red_line_daily"][0]
+        black = [t for t in _MARKER_STYLES if t[0] == "break_black_line_daily"][0]
+        self.assertEqual(red[4], black[4])   # same anchor column (High)
+        self.assertEqual(red[5], black[5])   # same direction
+        self.assertNotEqual(red[6], black[6])  # but different stagger multiplier
+        down_red = [t for t in _MARKER_STYLES if t[0] == "break_down_red_line"][0]
+        down_black = [t for t in _MARKER_STYLES if t[0] == "break_down_black_line"][0]
+        self.assertNotEqual(down_red[6], down_black[6])
 
     def test_title_includes_stock_name_from_column(self):
         fig, _ = create_stock_chart(self._chart_frame(with_name=True), "日 K")
