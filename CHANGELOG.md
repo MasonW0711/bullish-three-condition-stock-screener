@@ -2,6 +2,25 @@
 
 本檔記錄各版本的重要變更。日期為當地時間。
 
+## v3.2.3 — 2026-07-25
+
+修正桌面打包「build 卡 24 小時」的真正原因，並更正 v3.2.2 對此的錯誤說明。
+
+### 移除 `macos-13`（Intel）建置目標
+
+- **它從未成功過一次。** v1.0.3 以來全部 6 次 desktop build，`macos-13` job **6/6 皆為 `cancelled`**，每次都是在佇列中等到 GitHub 的 **24 小時上限**（v3.2.0 該 job 耗時恰好 `24h 0m 0s`）才被自動取消——**runner 從未被指派、job 從未開始執行**。
+- 因此 **`macos-intel.zip` 從來沒有出現在任何一個 Release 中**；使用者一直只拿得到 Windows 與 Apple Silicon 版。這個 job 唯一的作用，是讓每次 tag 觸發的 build 整體狀態卡在 `queued` 一整天。
+- 移除後，每次 build 約 **3 分鐘**乾淨完成（Windows 3m02s、Apple Silicon 1m36s，實測值）。
+
+### 更正 v3.2.2 對 `timeout-minutes` 的錯誤描述
+
+- v3.2.2 宣稱 `timeout-minutes: 30`「直接上限化那個已知的 24 小時卡死」——**這是錯的**。`timeout-minutes` 只在 **runner 接手 job 之後**才開始計時，**完全不涵蓋排隊等待**，因此對上述佇列卡死毫無作用。該設定仍保留，但其作用僅限於「防止已開始執行的 build 步驟卡住」。
+- 已在 workflow 註解與 v3.2.2 條目就地標註更正。
+
+### 文件
+
+- README 原本指示使用者下載 `macos-intel.zip`——**該檔案從未存在**。已改為明確標示不提供 Intel 封裝版，並指引改用本機執行或雲端版。
+
 ## v3.2.2 — 2026-07-24
 
 深度審查（七維度、對抗式驗證）後的必修項目。
@@ -89,7 +108,8 @@ v3.2.1 記載「現代 Streamlit 已不依賴 pyarrow」——**這是錯的**�
 
 ### 封裝 / CI
 
-- `build-desktop-executables.yml` 加 `timeout-minutes: 30`（直接上限化過去 v2.2/v2.3 卡到 24 小時的 build）與 `cache: pip`。
+- `build-desktop-executables.yml` 加 `timeout-minutes: 30` 與 `cache: pip`。
+  - **（v3.2.3 更正）** 原文宣稱這「直接上限化過去卡到 24 小時的 build」，**這是錯的**：`timeout-minutes` 只在 runner 接手後才開始計時，不涵蓋排隊等待。真正的 24 小時來自 Intel runner 排不到而卡在佇列，該問題由 v3.2.3 移除 `macos-13` 才真正解決。
 - `requirements.txt` 新增 `pyarrow`（price_cache 的 parquet 引擎）。
 
 ## v3.1.0 — 2026-07-07

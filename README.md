@@ -95,8 +95,8 @@ streamlit run app.py
 ### 直接使用已封裝版本
 
 - **Windows x64**：下載 `BullishThreeConditionStockScreener-windows-x64.zip`，解壓縮後執行資料夾中的 `BullishThreeConditionStockScreener.exe`。
-- **macOS Intel**：下載 `BullishThreeConditionStockScreener-macos-intel.zip`，解壓縮後執行 `BullishThreeConditionStockScreener.app`。
-- **macOS Apple Silicon**：下載 `BullishThreeConditionStockScreener-macos-apple-silicon.zip`，解壓縮後執行 `BullishThreeConditionStockScreener.app`。
+- **macOS（Apple Silicon）**：下載 `BullishThreeConditionStockScreener-macos-apple-silicon.zip`，解壓縮後執行 `BullishThreeConditionStockScreener.app`。
+  - macOS **Intel 不提供**封裝版（v3.2.3 起明確標示；該版本實際上從未成功建置過，先前的說明有誤）。Intel Mac 請改用下方「本機執行」或雲端版。
 - 執行檔會自動在本機啟動 Streamlit，並開啟預設瀏覽器。
 - **Windows** 若要結束程式，請直接關閉啟動時一起打開的命令視窗；**macOS** 可直接結束 `BullishThreeConditionStockScreener.app`。
 

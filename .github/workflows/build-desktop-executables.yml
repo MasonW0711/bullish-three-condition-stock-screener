@@ -18,17 +18,22 @@ jobs:
           - os: windows-latest
             archive_name: BullishThreeConditionStockScreener-windows-x64.zip
             dist_path: dist/BullishThreeConditionStockScreener
-          - os: macos-13
-            archive_name: BullishThreeConditionStockScreener-macos-intel.zip
-            dist_path: dist/BullishThreeConditionStockScreener.app
+          # macos-13 (Intel) was removed in v3.2.3. It never once succeeded: all
+          # six desktop builds from v1.0.3 onward ended in `cancelled` after
+          # sitting in the queue for exactly 24h — GitHub's maximum queue wait —
+          # because no Intel runner was ever assigned. The job never started, so
+          # no macos-intel.zip was ever published in ANY release. It only kept
+          # each run pinned at "queued" for a day. Apple Silicon is the shipped
+          # macOS target; Intel is not supported.
           - os: macos-14
             archive_name: BullishThreeConditionStockScreener-macos-apple-silicon.zip
             dist_path: dist/BullishThreeConditionStockScreener.app
 
     runs-on: ${{ matrix.os }}
-    # Cap the job so a hung PyInstaller/packaging step fails fast instead of
-    # burning a full 24h runner slot (past v2.2.0/v2.3.0 runs stalled to the
-    # GitHub Actions maximum). A clean build finishes in well under 30 min.
+    # Guards a hung build STEP only. Note it does NOT bound queue wait: the timer
+    # starts when a runner picks the job up, which is why it did nothing for the
+    # macos-13 queue stalls above — those needed the runner removed, not a
+    # timeout. A clean build finishes in ~3 min.
     timeout-minutes: 30
 
     steps:
