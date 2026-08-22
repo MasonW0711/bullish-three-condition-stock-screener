@@ -1512,9 +1512,9 @@ class StabilityTests(unittest.TestCase):
             ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07", "2026-05-08"]
         )
         for code, prices in (("2330.TW", prices_a), ("8069.TWO", prices_b)):
-            for date, (o, h, low, c) in zip(dates, prices):
+            for bar_date, (o, h, low, c) in zip(dates, prices):
                 rows.append(
-                    {"Date": date, "StockCode": code, "Open": o, "High": h,
+                    {"Date": bar_date, "StockCode": code, "Open": o, "High": h,
                      "Low": low, "Close": c, "Volume": 1000}
                 )
         result = run_signal_pipeline(
