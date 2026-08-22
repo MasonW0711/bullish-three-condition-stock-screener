@@ -2223,5 +2223,78 @@ class ChartEngineTests(unittest.TestCase):
         self.assertIsNone(message)
         self.assertIn("2330.TW", fig.layout.title.text)
 
+    def test_chart_draws_frozen_baseline_when_line_moves_mid_window(self):
+        # v3.3.0: the drawn red/black lines are the CURRENT ffilled levels and
+        # move on a fresh attack success, while the signal is validated against
+        # the frozen L. Spec §3.5e 案例二 without the kill bar: the red line moves
+        # 100 -> 103 inside a live window, so the valid P1 bar's whole body sits
+        # BELOW the drawn red line. The frozen-L trace must expose the real level.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08", "2026-05-11"]
+                ),
+                "StockCode": ["2330.TW"] * 7,
+                "Open": [100, 101, 104, 97, 104, 106, 102],
+                "High": [100, 103, 104.5, 103.5, 105.5, 106.5, 102.5],
+                "Low": [100, 101, 98, 97, 104, 100.5, 99.5],
+                "Close": [100, 103, 98, 103, 105, 101, 100.5],
+                "Volume": [1000] * 7,
+            }
+        )
+        result = run_signal_pipeline(
+            frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5}
+        )
+
+        # bar6 is a valid P1 against the frozen L=100 while the drawn red line
+        # has already moved to 103 — the whole body (100.5..102) is below it.
+        self.assertTrue(result.loc[6, "p1_final"])
+        self.assertEqual(result.loc[6, "active_breakout_line_price"], 100)
+        self.assertEqual(result.loc[6, "red_line"], 103)
+        self.assertLess(result.loc[6, "High"], result.loc[6, "red_line"])
+
+        fig, message = create_stock_chart(result, "日 K")
+        self.assertIsNone(message)
+        frozen = [t for t in fig.data if t.name == "做多回測基準線（凍結 L）"]
+        self.assertEqual(len(frozen), 1, "expected the frozen long baseline trace")
+        values = list(frozen[0].y)
+        # Drawn from the breakout bar (bar3, where L was frozen) through the window.
+        self.assertEqual(values[6], 100)
+        self.assertEqual(values[3], 100)
+        # Nothing before the breakout — no baseline exists yet.
+        self.assertTrue(all(pd.isna(v) for v in values[:3]))
+        # It must be a step function, like the other level lines.
+        self.assertEqual(frozen[0].line.shape, "hv")
+
+    def test_chart_rejects_multi_stock_frame(self):
+        # The per-bar series in create_stock_chart (ffilled lines, and the
+        # frozen-baseline span, which shifts across rows) are NOT grouped by
+        # stock, so a multi-stock frame would render an interleaved chart under
+        # one symbol's title. spec §5 requires every shift/ffill to be grouped by
+        # StockCode; the function must fail closed instead of drawing garbage.
+        one = self._chart_frame()
+        other = one.copy()
+        other["StockCode"] = "8069.TWO"
+        mixed = pd.concat([one, other], ignore_index=True)
+
+        fig, message = create_stock_chart(mixed, "日 K")
+        self.assertIsNone(fig)
+        self.assertIn("單一股票", message)
+        # A single-stock frame is unaffected.
+        fig_ok, message_ok = create_stock_chart(one, "日 K")
+        self.assertIsNone(message_ok)
+        self.assertIsNotNone(fig_ok)
+
+    def test_chart_omits_frozen_baseline_when_columns_absent(self):
+        # create_stock_chart is called on raw OHLCV frames too (older callers and
+        # the pre-signal preview); the new traces must degrade silently.
+        fig, message = create_stock_chart(self._chart_frame(), "日 K")
+        self.assertIsNone(message)
+        names = {t.name for t in fig.data}
+        self.assertNotIn("做多回測基準線（凍結 L）", names)
+        self.assertNotIn("做空回測基準線（凍結 L）", names)
+
+
 if __name__ == "__main__":
     unittest.main()
