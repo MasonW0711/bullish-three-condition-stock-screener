@@ -357,14 +357,21 @@ def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.Da
     the appearance bar itself (bars_since == 0) is excluded — on that bar the
     close is, by construction, on one side of the line, which would otherwise
     produce a degenerate signal identical to the attack (§3.5c).
+
+    Early invalidation (§3.5c, v3.3.0): a window bar closing on the wrong side of
+    L kills that direction for every LATER bar in the same window — long dies on
+    ``Close < L``, short dies on ``Close > L``. The two sides need SEPARATE breach
+    flags because P2 and P4 share one window and one line: a bar that breaches the
+    long side is (unless it closes exactly on L) precisely a bar the short side is
+    happy with, so a single shared flag would kill both directions on every bar.
     """
     output = df  # pipeline stage: mutates the owned frame in place
     window = max(int(new_line_window), 1)
     appeared = output["new_line_appeared"].fillna(False).astype(bool)
 
     output["_new_line_group"] = appeared.groupby(output["StockCode"]).cumsum()
-    output["bars_since_new_line"] = output.groupby(["StockCode", "_new_line_group"]).cumcount()
-    output = output.drop(columns=["_new_line_group"])
+    keys = [output["StockCode"], output["_new_line_group"]]
+    output["bars_since_new_line"] = output.groupby(keys).cumcount()
 
     active_new_type = output["new_line_type"].where(appeared)
     active_new_price = output["new_line_price"].where(appeared)
@@ -376,7 +383,30 @@ def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.Da
         & (output["bars_since_new_line"] >= 1)
         & (output["bars_since_new_line"] <= window)
     )
+
+    # The breach scan starts at bars_since >= 1, i.e. the APPEARANCE bar is
+    # excluded. That bar closes on a fixed side of L by construction (red line ->
+    # above, black line -> below), so counting it would kill the opposite
+    # direction outright for every line and erase the heterochromatic paths that
+    # §3.5d mandates (a black line's P2 / a red line's P4 from window bar 2).
+    line_price = output["active_new_line_price"]
+    breach_long = window_valid & (output["Close"] < line_price)
+    breach_short = window_valid & (output["Close"] > line_price)
+
+    def _breached_before(flags: pd.Series) -> pd.Series:
+        """True once an EARLIER bar of the same window breached; never leaks across
+        windows/stocks because both the cumsum and the shift are per-group."""
+        return (
+            flags.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
+        )
+
+    long_valid = window_valid & ~_breached_before(breach_long)
+    short_valid = window_valid & ~_breached_before(breach_short)
+
+    output = output.drop(columns=["_new_line_group"])
     output["new_line_window_valid"] = window_valid
+    output["new_line_window_valid_long"] = long_valid.fillna(False).astype(bool)
+    output["new_line_window_valid_short"] = short_valid.fillna(False).astype(bool)
     # Directional precondition (§3.5c): the previous bar must have closed on the
     # side the retest approaches from — above L for a long hold, below L for a
     # short reject. A consequence (§3.5d): a black line's first window bar can
@@ -384,13 +414,13 @@ def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.Da
     # window bar can never be P4, so the heterochromatic first-bar case vanishes.
     prev_close = output["prev_close"]
     output["p2_new_line_hold"] = (
-        window_valid
+        long_valid
         & (prev_close >= output["active_new_line_price"])
         & (output["Low"] <= output["active_new_line_price"])
         & (output["Close"] >= output["active_new_line_price"])
     )
     output["p4_new_line_reject"] = (
-        window_valid
+        short_valid
         & (prev_close <= output["active_new_line_price"])
         & (output["High"] >= output["active_new_line_price"])
         & (output["Close"] <= output["active_new_line_price"])

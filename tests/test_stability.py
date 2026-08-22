@@ -1379,6 +1379,161 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[7, "retest_reject_daily"])
         self.assertFalse(result.loc[7, "p3_break_down_reject"])
 
+    def test_p2_new_line_window_invalidated_by_close_below_line(self):
+        # §3.5c (v3.3.0): the reported false-long. A red line L=100 appears at
+        # bar1; bar3's whole BODY (and its High) sits below L; bar4 recovers and
+        # bar5 meets every P2 hold condition inside the raw window. The long side
+        # of the new-line window died at bar3, so no P2 may fire.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06",
+                     "2026-05-07", "2026-05-08"]
+                ),
+                "StockCode": ["2330.TW"] * 6,
+                "Open": [100, 101, 104, 99.5, 96, 101],
+                "High": [100, 103, 104.5, 99.6, 100.8, 101.5],
+                "Low": [100, 101, 98, 96.5, 95.8, 99.5],
+                "Close": [100, 103, 99, 97, 100.5, 100.2],
+                "Volume": [1000] * 6,
+            }
+        )
+
+        result = run_signal_pipeline(
+            frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
+        )
+
+        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
+        # Invalidation is PROSPECTIVE: bar2 is the first breaching bar (close 99
+        # < L) and stays "valid" itself — the column is the ex-ante eligibility
+        # term P2 consumes at that bar, and the bar's own Close then resolves
+        # retest-vs-breach. Folding that outcome back into its own eligibility
+        # would make the exported column diverge from the formula's actual term
+        # (and would not change P2 either way: Close < L and Close >= L are
+        # exclusive). Mirrors breakout_window_valid in _windowed_retest.
+        self.assertLess(result.loc[2, "Close"], 100)
+        self.assertTrue(result.loc[2, "new_line_window_valid_long"])
+        self.assertFalse(result.loc[2, "p2_new_line_hold"])
+        # bar3's entire candle is below L; it is the first bar the breach kills.
+        self.assertLess(result.loc[3, "High"], 100)
+        self.assertFalse(result.loc[3, "new_line_window_valid_long"])
+        # bar5 passes all three P2 conditions and the raw window still holds...
+        self.assertEqual(result.loc[5, "bars_since_new_line"], 4)
+        self.assertTrue(result.loc[5, "new_line_window_valid"])
+        self.assertGreaterEqual(result.loc[5, "prev_close"], 100)
+        self.assertLessEqual(result.loc[5, "Low"], 100)
+        self.assertGreaterEqual(result.loc[5, "Close"], 100)
+        # ...but the long side was invalidated, so P2 must not fire.
+        self.assertFalse(result.loc[5, "new_line_window_valid_long"])
+        self.assertFalse(result.loc[5, "p2_new_line_hold"])
+
+    def test_p4_new_line_window_invalidated_by_close_above_line(self):
+        # Short mirror: a black line L=100 appears at bar1; bar2 closes ABOVE L
+        # (breach of the short side); bar4 then meets every P4 reject condition
+        # inside the raw window but must not fire.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(
+                    ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
+                ),
+                "StockCode": ["2330.TW"] * 5,
+                # bars 2-4 are all attack FAILURES, so no new line displaces the
+                # black line 100 and the whole window belongs to it.
+                "Open": [100, 99, 96, 103, 100.5],
+                "High": [101, 100, 103, 104, 101],
+                "Low": [99, 96, 95, 98, 97],
+                "Close": [100, 97, 102, 99, 98],
+                "Volume": [1000] * 5,
+            }
+        )
+
+        result = run_signal_pipeline(
+            frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
+        )
+
+        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
+        # bar2 closes 102 > 100 -> breaches the short side for every LATER bar,
+        # while remaining eligible itself (prospective invalidation, as above).
+        self.assertGreater(result.loc[2, "Close"], 100)
+        self.assertTrue(result.loc[2, "new_line_window_valid_short"])
+        self.assertFalse(result.loc[2, "p4_new_line_reject"])
+        self.assertFalse(result.loc[3, "new_line_window_valid_short"])
+        self.assertEqual(result.loc[4, "bars_since_new_line"], 3)
+        self.assertTrue(result.loc[4, "new_line_window_valid"])
+        self.assertLessEqual(result.loc[4, "prev_close"], 100)
+        self.assertGreaterEqual(result.loc[4, "High"], 100)
+        self.assertLessEqual(result.loc[4, "Close"], 100)
+        self.assertFalse(result.loc[4, "new_line_window_valid_short"])
+        self.assertFalse(result.loc[4, "p4_new_line_reject"])
+
+    def test_new_line_breach_scan_excludes_the_appearance_bar(self):
+        # §3.5c: the appearance bar closes on a fixed side of L by construction
+        # (black line -> below). If the breach scan counted it, the black line's
+        # long side would die instantly and the §3.5d heterochromatic P2 could
+        # never exist. bar1 closes 97 < L=100 yet bar3 must still fire P2.
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 99, 96, 101],
+                "High": [101, 100, 105, 105],
+                "Low": [99, 96, 99, 99],
+                "Close": [100, 97, 101, 102],
+                "Volume": [1000] * 4,
+            }
+        )
+
+        result = run_signal_pipeline(
+            frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
+        )
+
+        # The appearance bar itself closes below L but is NOT a breach.
+        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
+        self.assertLess(result.loc[1, "Close"], 100)
+        self.assertTrue(result.loc[3, "new_line_window_valid_long"])
+        self.assertTrue(result.loc[3, "p2_new_line_hold"])
+
+    def test_new_line_breach_does_not_leak_across_windows_or_stocks(self):
+        # The breach cumsum/shift are per (StockCode, new-line group): a breach in
+        # one window must not disable the NEXT window, nor another stock's.
+        rows = []
+        # 2330: line 100 at bar1, breached at bar2 (kills bar3), then a NEW line
+        # 97 appears at bar4 whose own window starts clean again at bar5.
+        prices_a = [
+            (100, 100, 100, 100), (101, 103, 101, 103), (104, 104.5, 97, 98),
+            (99, 99.5, 96, 97), (98, 104, 97.5, 103), (104, 105, 98, 99),
+        ]
+        # 8069: never breached; a clean textbook P2 must survive.
+        prices_b = [
+            (100, 100, 100, 100), (101, 103, 101, 103), (103, 105, 99.5, 104),
+            (104, 105, 99.8, 100.5), (101, 102, 100, 101), (101, 102, 100, 101),
+        ]
+        dates = pd.to_datetime(
+            ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07", "2026-05-08"]
+        )
+        for code, prices in (("2330.TW", prices_a), ("8069.TWO", prices_b)):
+            for date, (o, h, low, c) in zip(dates, prices):
+                rows.append(
+                    {"Date": date, "StockCode": code, "Open": o, "High": h,
+                     "Low": low, "Close": c, "Volume": 1000}
+                )
+        result = run_signal_pipeline(
+            pd.DataFrame(rows), {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
+        )
+
+        a = result[result["StockCode"] == "2330.TW"].reset_index(drop=True)
+        b = result[result["StockCode"] == "8069.TWO"].reset_index(drop=True)
+        # 2330 bar2 breached the first window (close 98 < 100). The breach kills
+        # LATER bars, not itself, so bar3 is the one that goes invalid.
+        self.assertLess(a.loc[2, "Close"], 100)
+        self.assertFalse(a.loc[3, "new_line_window_valid_long"])
+        # ...but bar4 opens a NEW line (97) whose window starts clean at bar5.
+        self.assertTrue(a.loc[4, "new_line_appeared"])
+        self.assertEqual(a.loc[4, "active_new_line_price"], 97)
+        self.assertTrue(a.loc[5, "new_line_window_valid_long"])
+        # 8069 was never breached, so its own long window stays alive throughout.
+        self.assertTrue(b.loc[3, "new_line_window_valid_long"])
+
     def test_dual_break_down_uses_lower_line_for_short_retest(self):
         # Short mirror of test_dual_break_uses_higher_line_for_long_retest: a red
         # line (100) and a black line (110) are both in force; bar5 breaks DOWN
@@ -2067,7 +2222,6 @@ class ChartEngineTests(unittest.TestCase):
         fig, message = create_stock_chart(self._chart_frame(), "日 K")
         self.assertIsNone(message)
         self.assertIn("2330.TW", fig.layout.title.text)
-
 
 if __name__ == "__main__":
     unittest.main()
