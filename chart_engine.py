@@ -19,6 +19,20 @@ _LINE_STYLES = [
     ("black_line", _BLACK_LINE_COLOR, "黑線"),
 ]
 
+# The FROZEN retest baseline L (§3.5a/b), drawn only while its window is live.
+# This is a different object from the dashed red/black lines above: those are the
+# CURRENT forward-filled lines and move whenever a fresh attack succeeds, whereas
+# L is pinned at the value that was actually crossed on the breakout/breakdown bar
+# and never moves for the life of the window. When a line moves mid-window (spec
+# §3.5e 案例二) the two diverge, and a perfectly valid P1 bar can end up sitting
+# entirely BELOW the drawn red line — which reads as "跌破卻仍做多" even though the
+# signal is correct. Plotting the frozen level is what makes that legible.
+# (column, window-valid column, label, color)
+_FROZEN_BASELINES = [
+    ("active_breakout_line_price", "breakout_window_valid", "做多回測基準線（凍結 L）", "#7c3aed"),
+    ("active_breakdown_line_price", "breakdown_window_valid", "做空回測基準線（凍結 L）", "#0891b2"),
+]
+
 # (column, label, color, symbol, y_col, y_sign, stagger). ``stagger`` multiplies
 # the vertical offset so that when both lines break on the same bar the two
 # markers no longer sit on top of each other (the black one used to hide behind
@@ -43,6 +57,10 @@ def create_stock_chart(
     breakout/breakdown and retest markers are drawn regardless so the chart
     stays informative on either tab. ``stock_name`` is shown in the title next
     to the code; when omitted it is read from a ``StockName`` column if present.
+
+    Returns ``(figure, None)`` on success or ``(None, message)`` when the frame
+    cannot be charted — including a frame holding more than one ``StockCode``,
+    which is rejected rather than silently interleaved.
     """
     if stock_df is None or stock_df.empty:
         return None, "目前沒有可供顯示的資料。"
@@ -51,6 +69,15 @@ def create_stock_chart(
     missing_columns = required_columns.difference(stock_df.columns)
     if missing_columns:
         return None, f"圖表資料缺少必要欄位：{sorted(missing_columns)}"
+    # Single-stock precondition, enforced rather than assumed. Every per-bar
+    # series below is computed WITHOUT a per-stock groupby — the ffilled
+    # red/black lines, and the frozen-baseline ``span`` which shifts ACROSS rows —
+    # so a multi-stock frame sorted by Date alone would interleave symbols and
+    # render a silently meaningless chart under a single symbol's title. spec §5
+    # requires every shift/ffill to be grouped by StockCode; here that grouping
+    # IS this precondition, so fail closed like the checks above.
+    if stock_df["StockCode"].nunique() > 1:
+        return None, "圖表僅支援單一股票資料，請先篩選出單一股票。"
 
     chart_df = stock_df.sort_values("Date").copy()
     if chart_df[["Open", "High", "Low", "Close"]].dropna(how="any").shape[0] < 2:
@@ -100,6 +127,32 @@ def create_stock_chart(
                 line={"color": line_color, "width": 1.5, "dash": "dash", "shape": "hv"},
                 name=line_label,
                 connectgaps=False,
+            ),
+            row=1,
+            col=1,
+        )
+
+    for price_col, valid_col, line_label, line_color in _FROZEN_BASELINES:
+        if price_col not in chart_df.columns or valid_col not in chart_df.columns:
+            continue
+        live = chart_df[valid_col].fillna(False).astype(bool)
+        # Extend one bar backwards so the segment visually starts on the event
+        # bar. That bar is excluded from the window itself (§3.5a: 事件當根不計
+        # 回測) but it is where L was frozen, so anchoring there is what shows
+        # the user which level the window is measuring against.
+        span = live | live.shift(-1, fill_value=False)
+        baseline = chart_df[price_col].where(span)
+        if not baseline.notna().any():
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df["Date"],
+                y=baseline,
+                mode="lines",
+                line={"color": line_color, "width": 2.5, "shape": "hv"},
+                name=line_label,
+                connectgaps=False,
+                hovertemplate="%{x|%Y-%m-%d}<br>" + line_label + "：%{y:.2f}<extra></extra>",
             ),
             row=1,
             col=1,

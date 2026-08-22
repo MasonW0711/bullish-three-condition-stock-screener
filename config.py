@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "3.2.3"
-APP_UPDATED = "2026-07-25"
+APP_VERSION = "3.3.0"
+APP_UPDATED = "2026-08-21"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (
@@ -165,7 +165,9 @@ DISPLAY_COLUMN_LABELS = {
     "bars_since_new_line": "新線後第幾根",
     "active_new_line_type": "目前新線類型",
     "active_new_line_price": "目前新線價格",
-    "new_line_window_valid": "新線窗格有效",
+    "new_line_window_valid": "新線窗格（根數內）",
+    "new_line_window_valid_long": "新線窗格有效（做多）",
+    "new_line_window_valid_short": "新線窗格有效（做空）",
     "bars_since_breakout": "突破後第幾根",
     "bars_since_breakdown": "跌破後第幾根",
     "breakout_window_valid": "突破回測窗有效",
