@@ -118,6 +118,16 @@ def _is_retest(output: pd.DataFrame, line: pd.Series, *, upward: bool, tolerance
     )
 
 
+def _breached_earlier(breach: pd.Series, keys: list) -> pd.Series:
+    """True once an EARLIER bar of the same (stock, window) group breached.
+
+    Prospective early invalidation: the breaching bar itself stays eligible and
+    only LATER bars lose the window. Both the cumsum and the shift are taken per
+    group, so a breach never leaks across windows or stocks.
+    """
+    return breach.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
+
+
 def add_prev_close(df: pd.DataFrame) -> pd.DataFrame:
     """Add grouped prev_close = previous K-bar close, per StockCode."""
     # sort_values already returns a fresh, independent frame, so this is the
@@ -359,9 +369,7 @@ def _windowed_retest(
         breach = active_price.notna() & (output["Close"] < active_price)
     else:
         breach = active_price.notna() & (output["Close"] > active_price)
-    breach_before = (
-        breach.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
-    )
+    breach_before = _breached_earlier(breach, keys)
 
     window_valid = (
         active_price.notna()
@@ -454,10 +462,7 @@ def _new_line_window(
 
     in_window = (group >= 1) & (bars_since >= 1) & (bars_since <= window)
     breach = in_window & ((output["Close"] < line) if upward else (output["Close"] > line))
-    breached_before = (
-        breach.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
-    )
-    valid = in_window & ~breached_before
+    valid = in_window & ~_breached_earlier(breach, keys)
     retest = valid & _is_retest(output, line, upward=upward, tolerance=tolerance)
 
     output[bars_out] = bars_since.where(group >= 1)
