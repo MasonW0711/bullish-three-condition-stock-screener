@@ -1,41 +1,121 @@
 """Signal calculation engine for the multi-direction (long/short) screener.
 
-v3 detects four signal paths and routes them by direction:
-- P1 BreakUp_Hold   (Long)  : upward breakout of red/black line, then within the
-  retest window a 由上往下 retest that holds at/above the broken line.
-- P2 NewLine_Hold   (Long)  : a freshly-appeared line, then a 由上往下 hold within
-  the new-line window.
-- P3 BreakDown_Reject (Short): downward break, then within the window a 由下往上
-  retest rejected at/below the broken line.
-- P4 NewLine_Reject (Short) : a freshly-appeared line, then a 由下往上 reject.
+Four signal paths, routed by direction and grouped into two 路徑:
+- 突破回測路徑 (secondary):
+  - P1 BreakUp_Hold   (Long)  : upward breakout of red/black line, then within the
+    retest window a 由上往下 retest that holds at/above the broken line.
+  - P3 BreakDown_Reject (Short): downward break, then within the window a 由下往上
+    retest rejected at/below the broken line.
+- 新線路徑 (primary):
+  - P2 NewLine_Hold   (Long)  : a freshly-appeared RED line, then a 由上往下 hold
+    within the new-line window.
+  - P4 NewLine_Reject (Short) : a freshly-appeared BLACK line, then a 由下往上 reject.
 
-v3 (vs v2) adds to every retest a direction precondition (the previous bar closed
-on the approach side of the line), a post-event retest window (retest_window;
-the event bar itself never self-counts), and early invalidation (a bar closing
-through the frozen line kills that window). Existing column names
-(break_*_line_daily, breakout_line_type/price, active_breakout_line_*,
-retest_hold_daily, retest_reject_daily) are preserved; bars_since_breakout/-down
-and breakout/breakdown_window_valid are additive.
+v3 added to every retest a direction precondition (the previous bar closed on the
+approach side of the line), a post-event window (the event bar itself never
+self-counts), and early invalidation (a bar closing through the line kills that
+window). v4 binds each new line's colour to one direction and tracks the two
+colours independently (§3.5c), stops a bar that OPENS well past the line from
+counting as a test (開盤穿線不算測線, §3.5f), and drops any signal whose line a
+later bar closed through (訊號後破線, §3.5g).
 """
 
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
-from config import INVESTOR_FLAG_COLUMNS as _INVESTOR_FLAG_COLUMNS, SIGNAL_COLUMNS
+from config import (
+    BREAKOUT_RETEST_PATH,
+    DEFAULT_PARAMETERS,
+    INVESTOR_FLAG_COLUMNS as _INVESTOR_FLAG_COLUMNS,
+    NEW_LINE_PATH,
+    SIGNAL_COLUMNS,
+)
 
 logger = logging.getLogger(__name__)
 
+
+class _PathSpec(NamedTuple):
+    """How one path's per-bar flag becomes signal rows.
+
+    The line a signal is judged against is ``line_price_col`` on the signal bar.
+    Its type comes from ``line_type_col`` for the breakout paths (either colour
+    can be broken) and is the fixed ``line_type`` for the new-line paths (the
+    colour decides the direction).
+    """
+
+    raw_col: str
+    broken_col: str
+    final_col: str
+    side: str
+    direction: str
+    signal_type: str
+    path: str
+    line_price_col: str
+    line_type_col: str | None = None
+    line_type: str | None = None
+
+
 _PATH_SPECS = [
-    # (final_col, direction, signal_type, line_type_col, line_price_col, side)
-    ("p1_final", "Long", "P1_BreakUp_Hold", "active_breakout_line_type", "active_breakout_line_price", "long"),
-    ("p2_final", "Long", "P2_NewLine_Hold", "active_new_line_type", "active_new_line_price", "long"),
-    ("p3_final", "Short", "P3_BreakDown_Reject", "active_breakdown_line_type", "active_breakdown_line_price", "short"),
-    ("p4_final", "Short", "P4_NewLine_Reject", "active_new_line_type", "active_new_line_price", "short"),
+    _PathSpec(
+        raw_col="p1_break_up_hold", broken_col="p1_broken_after", final_col="p1_final",
+        side="long", direction="Long", signal_type="P1_BreakUp_Hold", path=BREAKOUT_RETEST_PATH,
+        line_price_col="active_breakout_line_price", line_type_col="active_breakout_line_type",
+    ),
+    _PathSpec(
+        raw_col="p2_new_line_hold", broken_col="p2_broken_after", final_col="p2_final",
+        side="long", direction="Long", signal_type="P2_NewLine_Hold", path=NEW_LINE_PATH,
+        line_price_col="red_line", line_type="Red Line",
+    ),
+    _PathSpec(
+        raw_col="p3_break_down_reject", broken_col="p3_broken_after", final_col="p3_final",
+        side="short", direction="Short", signal_type="P3_BreakDown_Reject", path=BREAKOUT_RETEST_PATH,
+        line_price_col="active_breakdown_line_price", line_type_col="active_breakdown_line_type",
+    ),
+    _PathSpec(
+        raw_col="p4_new_line_reject", broken_col="p4_broken_after", final_col="p4_final",
+        side="short", direction="Short", signal_type="P4_NewLine_Reject", path=NEW_LINE_PATH,
+        line_price_col="black_line", line_type="Black Line",
+    ),
 ]
+
+
+def _open_cross_tolerance(params: dict) -> float:
+    """The 開盤穿線容許度 as a fraction of the line (param is in %, floored at 0)."""
+    pct = params.get("open_cross_tolerance_pct", DEFAULT_PARAMETERS["open_cross_tolerance_pct"])
+    return max(float(pct), 0.0) / 100.0
+
+
+def _is_retest(output: pd.DataFrame, line: pd.Series, *, upward: bool, tolerance: float) -> pd.Series:
+    """守住 (upward) / 壓回 (downward) of ``line`` on each bar — shared by all four paths.
+
+    A 守住 is a 由上往下 test that holds: the previous bar closed on/above the
+    line, this bar's Low reaches it, and it closes on/above it. The v4 open
+    condition (§3.5f) adds that the bar did not OPEN below the line by more than
+    ``tolerance`` (a fraction of the line): a bar that opens well past the line
+    and only trades back during the session CROSSED the line rather than tested
+    it. 壓回 is the exact mirror. The open condition only decides whether this
+    bar is a test; it never invalidates a window — only a close through the line
+    does that.
+    """
+    prev_close = output["prev_close"]
+    if upward:
+        return (
+            (prev_close >= line)
+            & (output["Low"] <= line)
+            & (output["Close"] >= line)
+            & (output["Open"] >= line * (1 - tolerance))
+        )
+    return (
+        (prev_close <= line)
+        & (output["High"] >= line)
+        & (output["Close"] <= line)
+        & (output["Open"] <= line * (1 + tolerance))
+    )
 
 
 def add_prev_close(df: pd.DataFrame) -> pd.DataFrame:
@@ -235,6 +315,7 @@ def _windowed_retest(
     event_type_col: str,
     upward: bool,
     window: int,
+    tolerance: float,
     active_price_out: str,
     active_type_out: str,
     bars_out: str,
@@ -253,11 +334,10 @@ def _windowed_retest(
       (long: Close < L; short: Close > L) kills the window for every LATER bar in
       that group. cumsum→shift(1) is taken WITHIN the group so the flag never
       leaks across groups/stocks.
-    - direction precondition: the bar BEFORE the retest bar closed on/above L
-      (long) or on/below L (short) — the 由上往下 / 由下往上 approach (§3.5a/b).
+    - the retest itself is _is_retest: the 由上往下 / 由下往上 approach, the touch,
+      the close, and the v4 open condition (§3.5a/b/f).
     """
     stock = output["StockCode"]
-    prev_close = output["prev_close"]
 
     event = output[event_price_col].notna()
     group = event.groupby(stock).cumsum()
@@ -289,20 +369,7 @@ def _windowed_retest(
         & (bars_since <= window)
         & ~breach_before
     )
-    if upward:
-        retest = (
-            window_valid
-            & (prev_close >= active_price)
-            & (output["Low"] <= active_price)
-            & (output["Close"] >= active_price)
-        )
-    else:
-        retest = (
-            window_valid
-            & (prev_close <= active_price)
-            & (output["High"] >= active_price)
-            & (output["Close"] <= active_price)
-        )
+    retest = window_valid & _is_retest(output, active_price, upward=upward, tolerance=tolerance)
 
     output[active_price_out] = active_price
     output[active_type_out] = active_type
@@ -311,14 +378,19 @@ def _windowed_retest(
     output[retest_out] = retest.fillna(False).astype(bool)
 
 
-def add_retest_hold_signals(df: pd.DataFrame, retest_window: int) -> pd.DataFrame:
+def add_retest_hold_signals(
+    df: pd.DataFrame,
+    retest_window: int,
+    open_cross_tolerance: float = 0.0,
+) -> pd.DataFrame:
     """Directional, windowed retest of the broken / broken-down line (§3.5a/b).
 
     P1 long hold: within ``retest_window`` bars AFTER an upward breakout (the
     breakout bar itself excluded), the previous bar closed on/above the frozen
-    line L (由上往下 precondition), this bar's Low touches L and Close holds
-    at/above L; the window dies early if any bar in it closes strictly below L.
-    P3 short reject is the exact mirror. See _windowed_retest.
+    line L (由上往下 precondition), this bar's Low touches L, Close holds at/above
+    L, and it did not open below L by more than ``open_cross_tolerance`` (a
+    fraction of L, §3.5f); the window dies early if any bar in it closes strictly
+    below L. P3 short reject is the exact mirror. See _windowed_retest.
     """
     output = df  # pipeline stage: mutates the owned frame in place
     window = max(int(retest_window), 1)
@@ -329,6 +401,7 @@ def add_retest_hold_signals(df: pd.DataFrame, retest_window: int) -> pd.DataFram
         event_type_col="breakout_line_type",
         upward=True,
         window=window,
+        tolerance=open_cross_tolerance,
         active_price_out="active_breakout_line_price",
         active_type_out="active_breakout_line_type",
         bars_out="bars_since_breakout",
@@ -341,6 +414,7 @@ def add_retest_hold_signals(df: pd.DataFrame, retest_window: int) -> pd.DataFram
         event_type_col="breakdown_line_type",
         upward=False,
         window=window,
+        tolerance=open_cross_tolerance,
         active_price_out="active_breakdown_line_price",
         active_type_out="active_breakdown_line_type",
         bars_out="bars_since_breakdown",
@@ -350,80 +424,85 @@ def add_retest_hold_signals(df: pd.DataFrame, retest_window: int) -> pd.DataFram
     return output
 
 
-def add_new_line_window_signals(df: pd.DataFrame, new_line_window: int) -> pd.DataFrame:
-    """Track the most-recent new line and flag P2/P4 retests within its window.
+def _new_line_window(
+    output: pd.DataFrame,
+    *,
+    appeared: pd.Series,
+    line_col: str,
+    upward: bool,
+    window: int,
+    tolerance: float,
+    bars_out: str,
+    valid_out: str,
+    retest_out: str,
+) -> None:
+    """Window one colour's newest line and flag its one-direction retest (§3.5c).
 
-    The window covers the ``new_line_window`` bars AFTER appearance (bars 1..N);
-    the appearance bar itself (bars_since == 0) is excluded — on that bar the
-    close is, by construction, on one side of the line, which would otherwise
-    produce a degenerate signal identical to the attack (§3.5c).
+    Per (StockCode, same-colour line): the appearance bar is bar 0 and the window
+    is bars 1..``window``. Only a newer line of the SAME colour starts a new
+    group, so the other colour's lines never touch this window. The line level is
+    ``line_col`` itself: the forward-filled red/black line only moves on a fresh
+    same-colour attack success, which is exactly what starts a new group.
+    Early invalidation: a window bar closing through the line (long: below,
+    short: above) kills the window for every LATER bar of the same line.
+    """
+    stock = output["StockCode"]
+    group = appeared.groupby(stock).cumsum()
+    keys = [stock, group]
+    bars_since = output.groupby(keys).cumcount()
+    line = output[line_col]
 
-    Early invalidation (§3.5c, v3.3.0): a window bar closing on the wrong side of
-    L kills that direction for every LATER bar in the same window — long dies on
-    ``Close < L``, short dies on ``Close > L``. The two sides need SEPARATE breach
-    flags because P2 and P4 share one window and one line: a bar that breaches the
-    long side is (unless it closes exactly on L) precisely a bar the short side is
-    happy with, so a single shared flag would kill both directions on every bar.
+    in_window = (group >= 1) & (bars_since >= 1) & (bars_since <= window)
+    breach = in_window & ((output["Close"] < line) if upward else (output["Close"] > line))
+    breached_before = (
+        breach.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
+    )
+    valid = in_window & ~breached_before
+    retest = valid & _is_retest(output, line, upward=upward, tolerance=tolerance)
+
+    output[bars_out] = bars_since.where(group >= 1)
+    output[valid_out] = valid.fillna(False).astype(bool)
+    output[retest_out] = retest.fillna(False).astype(bool)
+
+
+def add_new_line_window_signals(
+    df: pd.DataFrame,
+    new_line_window: int,
+    open_cross_tolerance: float = 0.0,
+) -> pd.DataFrame:
+    """Flag P2 on the newest red line and P4 on the newest black line (§3.5c).
+
+    v4: a new line's colour decides its direction — a new red line only looks
+    for a long 守住 (P2), a new black line only for a short 壓回 (P4) — and the two
+    colours are tracked independently, so a new black line never ends a red
+    line's window or vice versa. The appearance bar itself (bars_since == 0) is
+    excluded: it closes on the line's own side by construction and would merely
+    duplicate the attack.
     """
     output = df  # pipeline stage: mutates the owned frame in place
     window = max(int(new_line_window), 1)
-    appeared = output["new_line_appeared"].fillna(False).astype(bool)
 
-    output["_new_line_group"] = appeared.groupby(output["StockCode"]).cumsum()
-    keys = [output["StockCode"], output["_new_line_group"]]
-    output["bars_since_new_line"] = output.groupby(keys).cumcount()
-
-    active_new_type = output["new_line_type"].where(appeared)
-    active_new_price = output["new_line_price"].where(appeared)
-    output["active_new_line_type"] = active_new_type.groupby(output["StockCode"]).ffill()
-    output["active_new_line_price"] = active_new_price.groupby(output["StockCode"]).ffill()
-
-    window_valid = (
-        output["active_new_line_price"].notna()
-        & (output["bars_since_new_line"] >= 1)
-        & (output["bars_since_new_line"] <= window)
+    _new_line_window(
+        output,
+        appeared=output["red_attack_success"].fillna(False).astype(bool),
+        line_col="red_line",
+        upward=True,
+        window=window,
+        tolerance=open_cross_tolerance,
+        bars_out="bars_since_new_red_line",
+        valid_out="new_red_line_window_valid",
+        retest_out="p2_new_line_hold",
     )
-
-    # The breach scan starts at bars_since >= 1, i.e. the APPEARANCE bar is
-    # excluded. That bar closes on a fixed side of L by construction (red line ->
-    # above, black line -> below), so counting it would kill the opposite
-    # direction outright for every line and erase the heterochromatic paths that
-    # §3.5d mandates (a black line's P2 / a red line's P4 from window bar 2).
-    line_price = output["active_new_line_price"]
-    breach_long = window_valid & (output["Close"] < line_price)
-    breach_short = window_valid & (output["Close"] > line_price)
-
-    def _breached_before(flags: pd.Series) -> pd.Series:
-        """True once an EARLIER bar of the same window breached; never leaks across
-        windows/stocks because both the cumsum and the shift are per-group."""
-        return (
-            flags.astype("int64").groupby(keys).cumsum().groupby(keys).shift(1).fillna(0) > 0
-        )
-
-    long_valid = window_valid & ~_breached_before(breach_long)
-    short_valid = window_valid & ~_breached_before(breach_short)
-
-    output = output.drop(columns=["_new_line_group"])
-    output["new_line_window_valid"] = window_valid
-    output["new_line_window_valid_long"] = long_valid.fillna(False).astype(bool)
-    output["new_line_window_valid_short"] = short_valid.fillna(False).astype(bool)
-    # Directional precondition (§3.5c): the previous bar must have closed on the
-    # side the retest approaches from — above L for a long hold, below L for a
-    # short reject. A consequence (§3.5d): a black line's first window bar can
-    # never be P2 (its appearance bar closes below L) and a red line's first
-    # window bar can never be P4, so the heterochromatic first-bar case vanishes.
-    prev_close = output["prev_close"]
-    output["p2_new_line_hold"] = (
-        long_valid
-        & (prev_close >= output["active_new_line_price"])
-        & (output["Low"] <= output["active_new_line_price"])
-        & (output["Close"] >= output["active_new_line_price"])
-    )
-    output["p4_new_line_reject"] = (
-        short_valid
-        & (prev_close <= output["active_new_line_price"])
-        & (output["High"] >= output["active_new_line_price"])
-        & (output["Close"] <= output["active_new_line_price"])
+    _new_line_window(
+        output,
+        appeared=output["black_attack_success"].fillna(False).astype(bool),
+        line_col="black_line",
+        upward=False,
+        window=window,
+        tolerance=open_cross_tolerance,
+        bars_out="bars_since_new_black_line",
+        valid_out="new_black_line_window_valid",
+        retest_out="p4_new_line_reject",
     )
     return output
 
@@ -438,8 +517,41 @@ def add_path_signals(df: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
+def add_broken_after_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """訊號後破線 (§3.5g): flag signal bars whose line a LATER bar closed through.
+
+    For each path's signal bar, look at every later bar of the same stock up to
+    its latest bar: a long signal is broken once any of them closes below the
+    line the signal used, a short signal once any closes above it. This is not
+    bounded by the observation window or the lookback — a signal is only listed
+    while it still stands. Computed from per-stock suffix min/max of Close
+    (reverse cummin/cummax, shifted so the signal bar itself is excluded).
+    Positional (numpy) on the [StockCode, Date]-sorted frame, so the index plays
+    no part in the alignment.
+    """
+    output = df  # pipeline stage: mutates the owned frame in place
+    close_rev = pd.Series(output["Close"].to_numpy()[::-1])
+    stock_rev = pd.Series(output["StockCode"].to_numpy()[::-1])
+
+    def _later(running: pd.Series) -> np.ndarray:
+        # cummin/cummax leave NaN on a bar with no Close; ffill carries the
+        # running extreme across it so a missing close never hides a later
+        # breach from the bars before it.
+        return running.groupby(stock_rev).ffill().groupby(stock_rev).shift(1).to_numpy()[::-1]
+
+    later_min = _later(close_rev.groupby(stock_rev).cummin())
+    later_max = _later(close_rev.groupby(stock_rev).cummax())
+
+    for spec in _PATH_SPECS:
+        line = output[spec.line_price_col].to_numpy(dtype=float)
+        with np.errstate(invalid="ignore"):
+            crossed = later_min < line if spec.side == "long" else later_max > line
+        output[spec.broken_col] = output[spec.raw_col].fillna(False).astype(bool).to_numpy() & crossed
+    return output
+
+
 def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> pd.DataFrame:
-    """Apply direction-agnostic volume + lookback gating to each of the four paths."""
+    """Gate each path by volume + lookback and drop signals broken afterwards."""
     # No re-sort: add_prev_close already ordered the frame by [StockCode, Date]
     # and no stage reorders it, so sorting again only paid for another whole-frame
     # copy of the widest frame in the pipeline.
@@ -451,10 +563,8 @@ def add_final_filters(df: pd.DataFrame, lookback_bars: int, min_volume: int) -> 
     output["lookback_rank"] = group_sizes - row_number
     gate = output["volume_pass"] & (output["lookback_rank"] <= int(lookback_bars))
 
-    output["p1_final"] = output["p1_break_up_hold"].fillna(False) & gate
-    output["p2_final"] = output["p2_new_line_hold"].fillna(False) & gate
-    output["p3_final"] = output["p3_break_down_reject"].fillna(False) & gate
-    output["p4_final"] = output["p4_new_line_reject"].fillna(False) & gate
+    for spec in _PATH_SPECS:
+        output[spec.final_col] = output[spec.raw_col].fillna(False) & gate & ~output[spec.broken_col]
     output["final_signal"] = (
         output["p1_final"] | output["p2_final"] | output["p3_final"] | output["p4_final"]
     )
@@ -618,8 +728,9 @@ def build_direction_signals(processed_df: pd.DataFrame, params: dict) -> dict:
     """Explode the wide per-bar frame into long/short signal rows (§3.8).
 
     Each path that passes (with its direction-aware investor gate, §3.7) becomes
-    rows in either ``long_signals`` (P1/P2) or ``short_signals`` (P3/P4). A single
-    bar matching multiple paths produces multiple rows. Returns a dict with keys
+    rows in either ``long_signals`` (P1/P2) or ``short_signals`` (P3/P4), each row
+    tagged with its ``path`` (新線路徑 / 突破回測路徑). A single bar matching
+    multiple paths produces multiple rows. Returns a dict with keys
     ``long_signals`` and ``short_signals``; each is sorted by Date desc, StockCode
     asc (§4.1) and carries the unified SIGNAL_COLUMNS schema.
     """
@@ -649,20 +760,21 @@ def build_direction_signals(processed_df: pd.DataFrame, params: dict) -> dict:
 
     long_rows: list[pd.DataFrame] = []
     short_rows: list[pd.DataFrame] = []
-    for final_col, direction, signal_type, type_col, price_col, side in _PATH_SPECS:
-        if final_col not in df.columns:
+    for spec in _PATH_SPECS:
+        if spec.final_col not in df.columns:
             continue
-        gate = long_gate if side == "long" else short_gate
-        mask = df[final_col].fillna(False).astype(bool) & gate
+        gate = long_gate if spec.side == "long" else short_gate
+        mask = df[spec.final_col].fillna(False).astype(bool) & gate
         if not mask.any():
             continue
         subset = df.loc[mask].copy()
-        subset["direction"] = direction
-        subset["signal_type"] = signal_type
-        subset["retest_line_type"] = subset[type_col]
-        subset["retest_line_price"] = subset[price_col]
+        subset["direction"] = spec.direction
+        subset["path"] = spec.path
+        subset["signal_type"] = spec.signal_type
+        subset["retest_line_type"] = subset[spec.line_type_col] if spec.line_type_col else spec.line_type
+        subset["retest_line_price"] = subset[spec.line_price_col]
         frame = subset.reindex(columns=SIGNAL_COLUMNS)
-        (long_rows if side == "long" else short_rows).append(frame)
+        (long_rows if spec.side == "long" else short_rows).append(frame)
 
     direction_filter = params.get("direction_filter", "全部")
 
@@ -687,9 +799,19 @@ def run_signal_pipeline(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     output = add_attack_lines(output)
     output = add_breakout_signals(output)
     output = add_breakdown_signals(output)
-    output = add_retest_hold_signals(output, retest_window=int(params.get("retest_window", 5)))
-    output = add_new_line_window_signals(output, new_line_window=int(params.get("new_line_window", 5)))
+    open_cross_tolerance = _open_cross_tolerance(params)
+    output = add_retest_hold_signals(
+        output,
+        retest_window=int(params.get("retest_window", 5)),
+        open_cross_tolerance=open_cross_tolerance,
+    )
+    output = add_new_line_window_signals(
+        output,
+        new_line_window=int(params.get("new_line_window", 5)),
+        open_cross_tolerance=open_cross_tolerance,
+    )
     output = add_path_signals(output)
+    output = add_broken_after_signals(output)
     output = add_final_filters(
         output,
         lookback_bars=int(params.get("lookback_bars", 10)),

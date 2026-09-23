@@ -269,9 +269,9 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[3, "retest_hold_daily"])
         self.assertFalse(result.loc[3, "p1_break_up_hold"])
         self.assertFalse(result.loc[3, "p1_final"])
-        # Bar 3 is itself a fresh new-line appearance (bars_since == 0), so P4 is
+        # Bar 3 is itself a fresh BLACK line appearance (bars_since == 0), so P4 is
         # excluded on the appearance bar.
-        self.assertEqual(result.loc[3, "bars_since_new_line"], 0)
+        self.assertEqual(result.loc[3, "bars_since_new_black_line"], 0)
         self.assertFalse(result.loc[3, "p4_new_line_reject"])
         # Bar3 IS a genuine downward break of the black line at 100, but as the
         # breakdown event bar (bars_since_breakdown == 0) it does NOT self-count
@@ -385,24 +385,27 @@ class StabilityTests(unittest.TestCase):
 
         self.assertEqual(latest_summary.columns.tolist(), LATEST_SUMMARY_COLUMNS)
 
-    def test_latest_summary_prefers_breakout_path_on_same_bar(self):
-        # Same stock, same date, two long paths: P1 must win regardless of
-        # the row order produced by the explode step.
-        signals = pd.DataFrame(
-            {
-                "Date": pd.to_datetime(["2026-05-05", "2026-05-05"]),
-                "StockCode": ["2330.TW", "2330.TW"],
-                "signal_type": ["P2_NewLine_Hold", "P1_BreakUp_Hold"],
-                "direction": ["Long", "Long"],
-                "retest_line_type": ["Red Line", "Black Line"],
-                "retest_line_price": [100.0, 99.0],
-            }
-        )
+    def test_latest_summary_keeps_both_paths_on_same_bar(self):
+        # v4 (was: P1 wins the same-bar tie). The summary keeps one row per
+        # (stock, path), so a P1 and a P2 on the same bar are both listed and the
+        # result does not depend on the row order produced by the explode step.
+        for signal_types in (["P2_NewLine_Hold", "P1_BreakUp_Hold"], ["P1_BreakUp_Hold", "P2_NewLine_Hold"]):
+            paths = {"P1_BreakUp_Hold": "突破回測路徑", "P2_NewLine_Hold": "新線路徑"}
+            signals = pd.DataFrame(
+                {
+                    "Date": pd.to_datetime(["2026-05-05", "2026-05-05"]),
+                    "StockCode": ["2330.TW", "2330.TW"],
+                    "signal_type": signal_types,
+                    "path": [paths[t] for t in signal_types],
+                    "direction": ["Long", "Long"],
+                    "retest_line_type": ["Red Line", "Black Line"],
+                    "retest_line_price": [100.0, 99.0],
+                }
+            )
 
-        summary = _compute_latest_summary(signals)
+            summary = _compute_latest_summary(signals)
 
-        self.assertEqual(len(summary), 1)
-        self.assertEqual(summary.loc[0, "SignalType"], "P1_BreakUp_Hold")
+            self.assertEqual(sorted(summary["SignalType"]), ["P1_BreakUp_Hold", "P2_NewLine_Hold"])
 
     def test_normalize_yfinance_data_tolerates_unexpected_shape(self):
         # yfinance schema drift must not raise; it should yield an empty frame.
@@ -628,15 +631,15 @@ class StabilityTests(unittest.TestCase):
         result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0, "new_line_window": 2})
 
         # Appearance bar (bars_since == 0) is excluded from the window.
-        self.assertEqual(result.loc[1, "bars_since_new_line"], 0)
+        self.assertEqual(result.loc[1, "bars_since_new_red_line"], 0)
         self.assertFalse(result.loc[1, "p2_new_line_hold"])
         # Inside the window (bars 1..2): P2 holds.
-        self.assertEqual(result.loc[2, "bars_since_new_line"], 1)
+        self.assertEqual(result.loc[2, "bars_since_new_red_line"], 1)
         self.assertTrue(result.loc[2, "p2_new_line_hold"])
         self.assertTrue(result.loc[3, "p2_new_line_hold"])
         # Beyond the window (bars_since == 3 > 2): expired.
-        self.assertEqual(result.loc[4, "bars_since_new_line"], 3)
-        self.assertFalse(result.loc[4, "new_line_window_valid"])
+        self.assertEqual(result.loc[4, "bars_since_new_red_line"], 3)
+        self.assertFalse(result.loc[4, "new_red_line_window_valid"])
         self.assertFalse(result.loc[4, "p2_new_line_hold"])
 
     def test_p4_new_line_reject_within_window(self):
@@ -655,7 +658,7 @@ class StabilityTests(unittest.TestCase):
 
         result = run_signal_pipeline(frame, {"lookback_bars": 10, "min_volume": 0})
 
-        self.assertEqual(result.loc[2, "bars_since_new_line"], 1)
+        self.assertEqual(result.loc[2, "bars_since_new_black_line"], 1)
         self.assertTrue(result.loc[2, "p4_new_line_reject"])
         # No downward break occurred (price was already below the line), so P3 stays off.
         self.assertFalse(result.loc[2, "p3_break_down_reject"])
@@ -764,18 +767,20 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(result.loc[3, "break_down_black_line"])
 
     def test_direction_signals_explode_into_multiple_rows(self):
-        # bar2 breaks down the red line at 100 (event); bar3 is the retest bar and
-        # satisfies BOTH P3 (break-down reject of the broken line, bars_since==1)
-        # and P4 (new-line reject within the new-line window): two short rows, no
-        # long rows, and no cross-direction dedup.
+        # v4 rewrite: the old fixture's P4 came from a RED line, which v4 no longer
+        # allows (a new line's colour decides its direction). Here bar2 is a black
+        # attack success (new black line 101) that also breaks the red line 100
+        # down (P3 event). bar3 touches both lines and closes below both, so it is
+        # a P3 reject of the frozen red line AND a P4 reject of the new black
+        # line: two short rows, no long rows, and no cross-path dedup.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
                 "StockCode": ["2330.TW"] * 4,
-                "Open": [100, 101, 104, 98],
-                "High": [101, 104, 105, 101],
-                "Low": [99, 100, 96, 97],
-                "Close": [100, 103, 98, 99],
+                "Open": [100, 100.5, 100.8, 99],
+                "High": [100, 101.5, 100.8, 101.2],
+                "Low": [100, 100.5, 98.5, 98.8],
+                "Close": [100, 101, 99, 99.5],
                 "Volume": [1000, 1000, 1000, 1000],
             }
         )
@@ -788,9 +793,10 @@ class StabilityTests(unittest.TestCase):
 
         self.assertTrue(long_signals.empty)
         self.assertEqual(len(short_signals), 2)
+        rows = set(zip(short_signals["signal_type"], short_signals["retest_line_type"], short_signals["retest_line_price"]))
         self.assertEqual(
-            set(short_signals["signal_type"]),
-            {"P3_BreakDown_Reject", "P4_NewLine_Reject"},
+            rows,
+            {("P3_BreakDown_Reject", "Red Line", 100.0), ("P4_NewLine_Reject", "Black Line", 101.0)},
         )
         self.assertEqual(set(short_signals["direction"]), {"Short"})
 
@@ -1112,23 +1118,23 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(bundle["long_signals"].empty)
         self.assertTrue(bundle["short_signals"].empty)
 
-    def test_latest_summary_prefers_breakdown_path_on_same_bar_short(self):
-        # Short mirror of the P1>P2 tie-break: on the same bar P3 must win over P4.
+    def test_latest_summary_keeps_both_paths_on_same_bar_short(self):
+        # Short mirror (was: P3 wins over P4 on the same bar). v4 lists both.
         signals = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-05", "2026-05-05"]),
                 "StockCode": ["2330.TW", "2330.TW"],
                 "signal_type": ["P4_NewLine_Reject", "P3_BreakDown_Reject"],
+                "path": ["新線路徑", "突破回測路徑"],
                 "direction": ["Short", "Short"],
-                "retest_line_type": ["Red Line", "Black Line"],
+                "retest_line_type": ["Black Line", "Red Line"],
                 "retest_line_price": [100.0, 99.0],
             }
         )
 
         summary = _compute_latest_summary(signals)
 
-        self.assertEqual(len(summary), 1)
-        self.assertEqual(summary.loc[0, "SignalType"], "P3_BreakDown_Reject")
+        self.assertEqual(sorted(summary["SignalType"]), ["P3_BreakDown_Reject", "P4_NewLine_Reject"])
 
     # --- v3 retest-directionality regression tests (§3.4/§3.5) ---
 
@@ -1259,10 +1265,11 @@ class StabilityTests(unittest.TestCase):
         # bar6 retests the higher line at 100 and holds -> P1.
         self.assertTrue(result.loc[6, "retest_hold_daily"])
 
-    def test_gap_through_bar_still_counts_as_retest(self):
-        # §3.5d: the direction precondition is close-to-close only. A bar that
-        # gaps open BELOW the line but closes back on it is still a valid long
-        # retest, because the PREVIOUS bar closed above the line.
+    def test_gap_through_bar_is_not_a_retest_beyond_open_tolerance(self):
+        # v4 rewrite (was: a gap-through bar still counts, §3.5d). bar4 opens at 97,
+        # 3% below L=100, trades down to 96.5 and closes back at 100. It CROSSED
+        # the line rather than tested it (開盤穿線不算測線, §3.5f): not a retest
+        # at the default 1% tolerance, a retest once the tolerance covers the gap.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(
@@ -1276,19 +1283,24 @@ class StabilityTests(unittest.TestCase):
                 "Volume": [1000] * 5,
             }
         )
+        params = {"lookback_bars": 20, "min_volume": 0, "retest_window": 5}
 
-        result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "retest_window": 5})
+        default = run_signal_pipeline(frame, params)
+        wide = run_signal_pipeline(frame, {**params, "open_cross_tolerance_pct": 5})
 
-        # bar4 opens 97 (below L=100), trades down to 96.5, closes back at 100.
-        self.assertEqual(result.loc[2, "active_breakout_line_price"], 100)
-        self.assertLess(result.loc[4, "Open"], 100)
-        self.assertTrue(result.loc[4, "retest_hold_daily"])
+        self.assertEqual(default.loc[2, "active_breakout_line_price"], 100)
+        self.assertLess(default.loc[4, "Open"], 100)
+        self.assertFalse(default.loc[4, "retest_hold_daily"])
+        # The open condition never invalidates the window: only a close does.
+        self.assertTrue(default.loc[4, "breakout_window_valid"])
+        self.assertTrue(wide.loc[4, "retest_hold_daily"])
 
-    def test_heterochromatic_first_window_bar_cannot_be_p2(self):
-        # §3.5d: a black line's appearance bar closes below the line, so the first
-        # window bar's previous close is below L and P2 (long hold) is impossible
-        # there even if that bar itself holds the line. It becomes possible only
-        # from the second window bar, once a prior bar has closed above L.
+    def test_black_line_never_produces_p2(self):
+        # v4 rewrite (was §3.5d: a black line could produce P2 from its second
+        # window bar). A new line's colour decides its direction, so a black line
+        # never produces a long P2 — not on window bar 1 (bar2) and not later
+        # (bar3). The "reclaim the black line, then hold" shape is caught by the
+        # 突破回測路徑 instead: bar2 breaks above it, bar3 is a P1 hold.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
@@ -1304,29 +1316,26 @@ class StabilityTests(unittest.TestCase):
         result = run_signal_pipeline(frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5})
 
         # Black line 100 appears at bar1 (close 97 < 100).
-        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
-        # bar2 (window bar 1) holds the line but its prev close (97) is below L.
-        self.assertEqual(result.loc[2, "bars_since_new_line"], 1)
-        self.assertLessEqual(result.loc[2, "Low"], 100)
-        self.assertGreaterEqual(result.loc[2, "Close"], 100)
-        self.assertFalse(result.loc[2, "p2_new_line_hold"])
-        # bar3 (window bar 2) now has a prior close (101) above L -> P2 holds.
-        self.assertEqual(result.loc[3, "bars_since_new_line"], 2)
-        self.assertTrue(result.loc[3, "p2_new_line_hold"])
+        self.assertEqual(result.loc[1, "black_line"], 100)
+        self.assertEqual(result.loc[3, "bars_since_new_black_line"], 2)
+        self.assertFalse(result["p2_new_line_hold"].any())
+        self.assertTrue(result.loc[3, "p1_break_up_hold"])
 
-    def test_p2_and_p4_can_fire_on_same_bar_both_directions(self):
-        # §3.8 degenerate co-occurrence: a single new line L=100, a bar whose
-        # previous close == L and whose own close == L (touching both High>=L and
-        # Low<=L) satisfies BOTH P2 (long) and P4 (short) -> one long row and one
-        # short row for that bar, no cross-direction dedup.
+    def test_p2_and_p4_can_fire_on_same_bar_from_two_colours(self):
+        # §3.8 co-occurrence, v4 rewrite (was: ONE new line producing both P2 and
+        # P4). A line now serves one direction only, so the co-occurrence needs a
+        # new red line (100, bar1) and a new black line (101, bar2) both in their
+        # windows: bar3 dips to the red line and pokes the black line, closing
+        # between them -> P2 on the red line AND P4 on the black line: one long
+        # row and one short row, no cross-direction dedup.
         frame = pd.DataFrame(
             {
                 "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
                 "StockCode": ["2330.TW"] * 4,
-                "Open": [100, 99, 98, 100],
-                "High": [101, 100, 101, 101],
-                "Low": [99, 96, 97, 99],
-                "Close": [100, 98, 100, 100],
+                "Open": [100, 100.2, 100.9, 100.5],
+                "High": [100, 101, 100.9, 101.2],
+                "Low": [100, 100.2, 100.3, 99.8],
+                "Close": [100, 101, 100.5, 100.4],
                 "Volume": [1000] * 4,
             }
         )
@@ -1340,8 +1349,14 @@ class StabilityTests(unittest.TestCase):
         bar3 = pd.Timestamp("2026-05-06")
         long_bar3 = bundle["long_signals"][bundle["long_signals"]["Date"] == bar3]
         short_bar3 = bundle["short_signals"][bundle["short_signals"]["Date"] == bar3]
-        self.assertEqual(list(long_bar3["signal_type"]), ["P2_NewLine_Hold"])
-        self.assertIn("P4_NewLine_Reject", set(short_bar3["signal_type"]))
+        self.assertEqual(
+            list(zip(long_bar3["signal_type"], long_bar3["retest_line_type"], long_bar3["retest_line_price"])),
+            [("P2_NewLine_Hold", "Red Line", 100.0)],
+        )
+        self.assertEqual(
+            list(zip(short_bar3["signal_type"], short_bar3["retest_line_type"], short_bar3["retest_line_price"])),
+            [("P4_NewLine_Reject", "Black Line", 101.0)],
+        )
 
     def test_p3_window_invalidated_by_close_through_line(self):
         # Short mirror of test_p1_window_invalidated_by_close_through_line: after a
@@ -1403,7 +1418,7 @@ class StabilityTests(unittest.TestCase):
             frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
         )
 
-        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
+        self.assertEqual(result.loc[1, "red_line"], 100)
         # Invalidation is PROSPECTIVE: bar2 is the first breaching bar (close 99
         # < L) and stays "valid" itself — the column is the ex-ante eligibility
         # term P2 consumes at that bar, and the bar's own Close then resolves
@@ -1412,19 +1427,18 @@ class StabilityTests(unittest.TestCase):
         # (and would not change P2 either way: Close < L and Close >= L are
         # exclusive). Mirrors breakout_window_valid in _windowed_retest.
         self.assertLess(result.loc[2, "Close"], 100)
-        self.assertTrue(result.loc[2, "new_line_window_valid_long"])
+        self.assertTrue(result.loc[2, "new_red_line_window_valid"])
         self.assertFalse(result.loc[2, "p2_new_line_hold"])
         # bar3's entire candle is below L; it is the first bar the breach kills.
         self.assertLess(result.loc[3, "High"], 100)
-        self.assertFalse(result.loc[3, "new_line_window_valid_long"])
+        self.assertFalse(result.loc[3, "new_red_line_window_valid"])
         # bar5 passes all three P2 conditions and the raw window still holds...
-        self.assertEqual(result.loc[5, "bars_since_new_line"], 4)
-        self.assertTrue(result.loc[5, "new_line_window_valid"])
+        self.assertEqual(result.loc[5, "bars_since_new_red_line"], 4)
         self.assertGreaterEqual(result.loc[5, "prev_close"], 100)
         self.assertLessEqual(result.loc[5, "Low"], 100)
         self.assertGreaterEqual(result.loc[5, "Close"], 100)
-        # ...but the long side was invalidated, so P2 must not fire.
-        self.assertFalse(result.loc[5, "new_line_window_valid_long"])
+        # ...but the window was invalidated, so P2 must not fire.
+        self.assertFalse(result.loc[5, "new_red_line_window_valid"])
         self.assertFalse(result.loc[5, "p2_new_line_hold"])
 
     def test_p4_new_line_window_invalidated_by_close_above_line(self):
@@ -1437,8 +1451,8 @@ class StabilityTests(unittest.TestCase):
                     ["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07"]
                 ),
                 "StockCode": ["2330.TW"] * 5,
-                # bars 2-4 are all attack FAILURES, so no new line displaces the
-                # black line 100 and the whole window belongs to it.
+                # bars 2-4 are all attack FAILURES, so no newer black line
+                # replaces the black line 100 and the whole window belongs to it.
                 "Open": [100, 99, 96, 103, 100.5],
                 "High": [101, 100, 103, 104, 101],
                 "Low": [99, 96, 95, 98, 97],
@@ -1451,35 +1465,35 @@ class StabilityTests(unittest.TestCase):
             frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
         )
 
-        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
-        # bar2 closes 102 > 100 -> breaches the short side for every LATER bar,
+        self.assertEqual(result.loc[1, "black_line"], 100)
+        # bar2 closes 102 > 100 -> breaches the window for every LATER bar,
         # while remaining eligible itself (prospective invalidation, as above).
         self.assertGreater(result.loc[2, "Close"], 100)
-        self.assertTrue(result.loc[2, "new_line_window_valid_short"])
+        self.assertTrue(result.loc[2, "new_black_line_window_valid"])
         self.assertFalse(result.loc[2, "p4_new_line_reject"])
-        self.assertFalse(result.loc[3, "new_line_window_valid_short"])
-        self.assertEqual(result.loc[4, "bars_since_new_line"], 3)
-        self.assertTrue(result.loc[4, "new_line_window_valid"])
+        self.assertFalse(result.loc[3, "new_black_line_window_valid"])
+        self.assertEqual(result.loc[4, "bars_since_new_black_line"], 3)
         self.assertLessEqual(result.loc[4, "prev_close"], 100)
         self.assertGreaterEqual(result.loc[4, "High"], 100)
         self.assertLessEqual(result.loc[4, "Close"], 100)
-        self.assertFalse(result.loc[4, "new_line_window_valid_short"])
+        self.assertFalse(result.loc[4, "new_black_line_window_valid"])
         self.assertFalse(result.loc[4, "p4_new_line_reject"])
 
-    def test_new_line_breach_scan_excludes_the_appearance_bar(self):
-        # §3.5c: the appearance bar closes on a fixed side of L by construction
-        # (black line -> below). If the breach scan counted it, the black line's
-        # long side would die instantly and the §3.5d heterochromatic P2 could
-        # never exist. bar1 closes 97 < L=100 yet bar3 must still fire P2.
+    def test_new_line_appearance_bar_never_counts_as_its_own_hold(self):
+        # v4 rewrite (was: the appearance bar must not count as a breach, or a
+        # black line's heterochromatic P2 would die — a path v4 removed). What the
+        # bars_since >= 1 window still guarantees: a red line's appearance bar
+        # that dips back to the line (Low 99.8 <= L=100) and closes above it is
+        # NOT a P2 of its own line; the first window bar (bar2) is.
         frame = pd.DataFrame(
             {
-                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05", "2026-05-06"]),
-                "StockCode": ["2330.TW"] * 4,
-                "Open": [100, 99, 96, 101],
-                "High": [101, 100, 105, 105],
-                "Low": [99, 96, 99, 99],
-                "Close": [100, 97, 101, 102],
-                "Volume": [1000] * 4,
+                "Date": pd.to_datetime(["2026-05-01", "2026-05-04", "2026-05-05"]),
+                "StockCode": ["2330.TW"] * 3,
+                "Open": [100, 100.5, 101],
+                "High": [100, 101.5, 101.2],
+                "Low": [100, 99.8, 99.9],
+                "Close": [100, 101, 100.5],
+                "Volume": [1000] * 3,
             }
         )
 
@@ -1487,11 +1501,10 @@ class StabilityTests(unittest.TestCase):
             frame, {"lookback_bars": 20, "min_volume": 0, "new_line_window": 5}
         )
 
-        # The appearance bar itself closes below L but is NOT a breach.
-        self.assertEqual(result.loc[1, "active_new_line_price"], 100)
-        self.assertLess(result.loc[1, "Close"], 100)
-        self.assertTrue(result.loc[3, "new_line_window_valid_long"])
-        self.assertTrue(result.loc[3, "p2_new_line_hold"])
+        self.assertEqual(result.loc[1, "bars_since_new_red_line"], 0)
+        self.assertLessEqual(result.loc[1, "Low"], 100)
+        self.assertFalse(result.loc[1, "p2_new_line_hold"])
+        self.assertTrue(result.loc[2, "p2_new_line_hold"])
 
     def test_new_line_breach_does_not_leak_across_windows_or_stocks(self):
         # The breach cumsum/shift are per (StockCode, new-line group): a breach in
@@ -1526,13 +1539,13 @@ class StabilityTests(unittest.TestCase):
         # 2330 bar2 breached the first window (close 98 < 100). The breach kills
         # LATER bars, not itself, so bar3 is the one that goes invalid.
         self.assertLess(a.loc[2, "Close"], 100)
-        self.assertFalse(a.loc[3, "new_line_window_valid_long"])
-        # ...but bar4 opens a NEW line (97) whose window starts clean at bar5.
-        self.assertTrue(a.loc[4, "new_line_appeared"])
-        self.assertEqual(a.loc[4, "active_new_line_price"], 97)
-        self.assertTrue(a.loc[5, "new_line_window_valid_long"])
-        # 8069 was never breached, so its own long window stays alive throughout.
-        self.assertTrue(b.loc[3, "new_line_window_valid_long"])
+        self.assertFalse(a.loc[3, "new_red_line_window_valid"])
+        # ...but bar4 opens a NEW red line (97) whose window starts clean at bar5.
+        self.assertTrue(a.loc[4, "red_attack_success"])
+        self.assertEqual(a.loc[4, "red_line"], 97)
+        self.assertTrue(a.loc[5, "new_red_line_window_valid"])
+        # 8069 was never breached, so its own window stays alive throughout.
+        self.assertTrue(b.loc[3, "new_red_line_window_valid"])
 
     def test_dual_break_down_uses_lower_line_for_short_retest(self):
         # Short mirror of test_dual_break_uses_higher_line_for_long_retest: a red

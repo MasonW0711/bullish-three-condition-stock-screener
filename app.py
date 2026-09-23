@@ -36,6 +36,7 @@ DEFAULT_TEXT_STOCK_LIST = app_config.DEFAULT_TEXT_STOCK_LIST
 DIRECTION_FILTER_OPTIONS = app_config.DIRECTION_FILTER_OPTIONS
 DISPLAY_COLUMN_LABELS = app_config.DISPLAY_COLUMN_LABELS
 LATEST_SUMMARY_COLUMNS = app_config.LATEST_SUMMARY_COLUMNS
+PATH_FILTER_OPTIONS = app_config.PATH_FILTER_OPTIONS
 SIGNAL_COLUMNS = app_config.SIGNAL_COLUMNS
 TIMEFRAME_LABELS = app_config.TIMEFRAME_LABELS
 TIMEFRAME_OPTIONS = app_config.TIMEFRAME_OPTIONS
@@ -88,6 +89,7 @@ def _build_params(
     min_volume: int,
     new_line_window: int,
     retest_window: int,
+    open_cross_tolerance_pct: float,
     direction_filter: str,
     investor_consecutive_days: int,
     foreign_buy_streak: bool,
@@ -103,6 +105,7 @@ def _build_params(
         "min_volume": int(min_volume),
         "new_line_window": max(int(new_line_window), 1),
         "retest_window": max(int(retest_window), 1),
+        "open_cross_tolerance_pct": max(float(open_cross_tolerance_pct), 0.0),
         "direction_filter": direction_filter,
         "investor_consecutive_days": max(int(investor_consecutive_days), 1),
         "foreign_buy_streak": bool(foreign_buy_streak),
@@ -125,34 +128,28 @@ def _selected_investor_columns(params: dict) -> list[str]:
     ]
 
 
-# 同一根 K 棒可能同時命中兩條路徑；摘要每股只留一列時，
-# 以「突破型」優先（P1 > P2、P3 > P4），避免取決於資料排列順序。
-_SIGNAL_TYPE_PRIORITY = {
-    "P1_BreakUp_Hold": 2,
-    "P2_NewLine_Hold": 1,
-    "P3_BreakDown_Reject": 2,
-    "P4_NewLine_Reject": 1,
-}
-
-
 def _compute_latest_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
-    """Latest valid signal per stock for one direction's exploded frame (§4.2)."""
+    """Latest signal per (stock, path) for one direction's exploded frame (§4.2).
+
+    v4: one row per path, so filtering to 新線路徑 never hides a stock just
+    because its most recent signal happened to be a breakout retest. Within a
+    direction each path is a single signal type, so (stock, path, date) is unique
+    and no signal-type priority is needed.
+    """
     if signals_df is None or signals_df.empty:
         return pd.DataFrame(columns=LATEST_SUMMARY_COLUMNS)
 
-    ranked = signals_df.copy()
-    ranked["_priority"] = ranked["signal_type"].map(_SIGNAL_TYPE_PRIORITY).fillna(0)
     latest = (
-        ranked.sort_values(["StockCode", "Date", "_priority"])
-        .groupby("StockCode", group_keys=False)
+        signals_df.sort_values(["StockCode", "path", "Date"])
+        .groupby(["StockCode", "path"], group_keys=False)
         .tail(1)
-        .drop(columns=["_priority"])
         .copy()
     )
     summary = latest.rename(
         columns={
             "Date": "LatestSignalDate",
             "direction": "Direction",
+            "path": "Path",
             "signal_type": "SignalType",
             "retest_line_type": "RetestLineType",
             "retest_line_price": "RetestLinePrice",
@@ -166,7 +163,18 @@ def _compute_latest_summary(signals_df: pd.DataFrame) -> pd.DataFrame:
     for col in LATEST_SUMMARY_COLUMNS:
         if col not in summary.columns:
             summary[col] = pd.NA
-    return summary[LATEST_SUMMARY_COLUMNS].sort_values("LatestSignalDate", ascending=False).reset_index(drop=True)
+    return (
+        summary[LATEST_SUMMARY_COLUMNS]
+        .sort_values(["LatestSignalDate", "StockCode", "Path"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+
+
+def _filter_by_path(df: pd.DataFrame, path_filter: str, path_column: str) -> pd.DataFrame:
+    """Keep only rows of the selected 路徑 (``全部`` keeps everything)."""
+    if df is None or df.empty or path_filter == "全部" or path_column not in df.columns:
+        return df
+    return df[df[path_column] == path_filter].reset_index(drop=True)
 
 
 def _empty_result(
@@ -494,7 +502,7 @@ def _render_direction_results(
     else:
         st.dataframe(_prepare_display_frame(signals_df, SIGNAL_COLUMNS), width="stretch")
 
-    st.markdown(f"#### {direction_label}最新摘要（每股一列）")
+    st.markdown(f"#### {direction_label}最新摘要（每股每條路徑一列）")
     if summary_df is None or summary_df.empty:
         st.info("無最新摘要資料。")
     else:
@@ -603,7 +611,10 @@ def _render_sidebar() -> dict:
             min_value=1,
             value=DEFAULT_PARAMETERS["new_line_window"],
             step=1,
-            help="新紅／黑線出現後幾根 K 棒內，仍可作為 P2／P4 新線回測的基準線（不含出現當根，以所選週期計）。",
+            help=(
+                "新紅線（只找做多 P2）／新黑線（只找做空 P4）出現後幾根 K 棒內可產生訊號"
+                "（不含出現當根，以所選週期計）。紅、黑各自計算，另一色的新線不影響。"
+            ),
         )
         retest_window = st.number_input(
             "突破回測窗格（K 棒數）",
@@ -613,6 +624,18 @@ def _render_sidebar() -> dict:
             help=(
                 "向上突破／向下跌破後幾根 K 棒內，仍可作為 P1／P3 回測的基準線"
                 "（不含突破當根，以所選週期計）。窗格內收盤穿回基準線即提前失效。"
+            ),
+        )
+        open_cross_tolerance_pct = st.number_input(
+            "開盤穿線容許度（%）",
+            min_value=0.0,
+            value=float(DEFAULT_PARAMETERS["open_cross_tolerance_pct"]),
+            step=0.1,
+            format="%.1f",
+            help=(
+                "回測那根 K 棒開盤跳到線的另一側、超過線價的這個百分比時，視為穿線而非測線，"
+                "不算守住／壓回（四條路徑都適用）；之後在窗格內再回測一次才算。"
+                "穿線那根只要收盤沒破線，窗格仍有效。設為 0 表示開盤必須在線的同一側或剛好在線上。"
             ),
         )
         direction_filter = st.selectbox(
@@ -664,6 +687,7 @@ def _render_sidebar() -> dict:
             min_volume=min_volume,
             new_line_window=new_line_window,
             retest_window=retest_window,
+            open_cross_tolerance_pct=open_cross_tolerance_pct,
             direction_filter=direction_filter,
             investor_consecutive_days=investor_consecutive_days,
             foreign_buy_streak=foreign_buy_streak,
@@ -814,17 +838,41 @@ def main():
     bc4.metric("回測壓回 K 棒數", reject_count)
 
     direction_filter = saved_params.get("direction_filter", "全部")
+    # Display-only filter: it narrows the tables, summaries and chart stock list
+    # below, never the CSV / Excel exports (those carry the 路徑 column instead).
+    path_filter = st.radio(
+        "路徑",
+        options=PATH_FILTER_OPTIONS,
+        index=0,
+        horizontal=True,
+        key="path_filter",
+        help="新線路徑（P2／P4）是主要依據，突破回測路徑（P1／P3）是次要參考。",
+    )
     long_tab, short_tab = st.tabs(["做多", "做空"])
     with long_tab:
         if direction_filter == "做空":
             st.info("方向過濾設為「做空」，已隱藏做多結果。")
         else:
-            _render_direction_results("做多", "long", long_signals, latest_summary_long, all_data, saved_params)
+            _render_direction_results(
+                "做多",
+                "long",
+                _filter_by_path(long_signals, path_filter, "path"),
+                _filter_by_path(latest_summary_long, path_filter, "Path"),
+                all_data,
+                saved_params,
+            )
     with short_tab:
         if direction_filter == "做多":
             st.info("方向過濾設為「做多」，已隱藏做空結果。")
         else:
-            _render_direction_results("做空", "short", short_signals, latest_summary_short, all_data, saved_params)
+            _render_direction_results(
+                "做空",
+                "short",
+                _filter_by_path(short_signals, path_filter, "path"),
+                _filter_by_path(latest_summary_short, path_filter, "Path"),
+                all_data,
+                saved_params,
+            )
 
     st.subheader("結果下載")
     timeframe_code = TIMEFRAME_OPTIONS[saved_params["analysis_timeframe"]]
@@ -933,6 +981,7 @@ def main():
         f"回看 {saved_params['lookback_bars']} 根 K 棒　"
         f"新線窗格 {saved_params.get('new_line_window', 5)} 根　"
         f"突破回測窗格 {saved_params.get('retest_window', 5)} 根　"
+        f"開盤穿線容許度 {saved_params.get('open_cross_tolerance_pct', DEFAULT_PARAMETERS['open_cross_tolerance_pct'])}%　"
         f"最小成交量 {saved_params['min_volume']} 張　"
         f"法人條件：{'、'.join(active_investor_filters) if active_investor_filters else '無'}"
     )
