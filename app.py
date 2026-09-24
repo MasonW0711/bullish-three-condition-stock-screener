@@ -546,7 +546,11 @@ def _render_direction_results(
     if chart_message:
         st.warning(chart_message)
     elif figure is not None:
-        st.plotly_chart(figure, width="stretch")
+        # theme=None keeps the chart's own colours. Streamlit's default theme
+        # re-colours the text to match the app, which in dark mode turned the
+        # legend, title and axis labels near-white on the chart's forced white
+        # background.
+        st.plotly_chart(figure, width="stretch", theme=None)
 
 
 def _render_sidebar() -> dict:

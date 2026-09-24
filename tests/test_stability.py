@@ -2152,6 +2152,60 @@ class ScreeningServiceTests(unittest.TestCase):
         self.assertGreaterEqual(captured["lookback_days"], 28)
 
 
+class ResultsPageChartTests(unittest.TestCase):
+    """The results page must render the K-line chart in its OWN colours."""
+
+    def test_chart_is_not_recoloured_by_the_streamlit_theme(self):
+        # The chart forces a white background with dark text. Streamlit's default
+        # plotly theme re-colours the text to match the app theme, so in dark mode
+        # the legend, title and axis labels came out near-white on white.
+        from streamlit.testing.v1 import AppTest
+
+        frame = pd.DataFrame(
+            {
+                "Date": pd.bdate_range("2026-05-01", periods=4),
+                "StockCode": ["2330.TW"] * 4,
+                "Open": [100, 101, 102.5, 102],
+                "High": [100, 103.5, 102.8, 102],
+                "Low": [100, 101, 101.5, 99.8],
+                "Close": [100, 103, 102, 100.5],
+                "Volume": [1000] * 4,
+            }
+        )
+        params = {
+            **DEFAULT_PARAMETERS,
+            "start_date": date(2026, 5, 1),
+            "end_date": date(2026, 5, 29),
+            "min_volume": 0,
+            "lookback_bars": 50,
+        }
+        processed = attach_investor_flow_flags(run_signal_pipeline(frame, params), pd.DataFrame())
+        processed["StockName"] = "台積電"
+        bundle = build_direction_signals(processed, params)
+        app_test = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=30)
+        app_test.session_state["screening_results"] = {
+            "all_data": processed,
+            "long_signals": bundle["long_signals"],
+            "short_signals": bundle["short_signals"],
+            "latest_summary_long": _compute_latest_summary(bundle["long_signals"]),
+            "latest_summary_short": _compute_latest_summary(bundle["short_signals"]),
+            "success_list": ["2330.TW"],
+            "failed_list": [],
+            "download_errors": [],
+            "universe_df": pd.DataFrame(),
+            "messages": [],
+            "used_auto_universe": False,
+        }
+        app_test.session_state["screening_params"] = params
+
+        app_test.run()
+
+        self.assertEqual(list(app_test.exception), [])
+        charts = app_test.get("plotly_chart")
+        self.assertEqual(len(charts), 1)
+        self.assertNotEqual(charts[0].proto.theme, "streamlit")
+
+
 class ChartEngineTests(unittest.TestCase):
     def _chart_frame(self, with_name: bool = False) -> pd.DataFrame:
         # Two attack successes so the red line changes level: 100 -> 105. This

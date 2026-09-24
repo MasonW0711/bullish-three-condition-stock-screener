@@ -276,8 +276,11 @@ def create_stock_chart(
     fig.update_layout(
         title=f"{name_prefix} 突破／跌破與回測（{timeframe_label}{direction_suffix}）",
         xaxis_rangeslider_visible=False,
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
-        margin={"l": 20, "r": 20, "t": 70, "b": 20},
+        # Legend BELOW the plots: it wraps to several rows (one entry per line
+        # and marker type), and above the plots those rows grew up into the title.
+        # Plotly auto-expands the bottom margin to fit however many rows it needs.
+        legend={"orientation": "h", "yanchor": "top", "y": -0.06, "x": 0},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
         height=720,
         # Force a light background so the near-black 黑線 and its markers stay
         # visible regardless of the viewer's (possibly dark) Streamlit theme.
