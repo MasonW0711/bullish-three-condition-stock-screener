@@ -61,22 +61,46 @@ def _download_investor_flow_data_cached(
     )
 
 
-# 底線開頭的參數不會進入 st.cache_data 的快取鍵：首跑會以 callback 回報
-# 下載進度，相同條件重跑則直接命中快取、不再重新下載。
+class _StockDataNotCached(Exception):
+    """Raised by the cache lookup when (codes, start, end) has no entry yet."""
+
+
+# 下載進度 callback 會寫入快取函式「外」建立的側欄元件。若在 st.cache_data
+# 函式內呼叫，Streamlit 會錄下這些元件呼叫，下次相同條件命中快取時重播到
+# 已不存在的元件上而失敗。因此快取函式只負責存取結果、不做任何元件呼叫：
+# 不帶 _downloaded 呼叫＝查詢（未命中時丟例外，例外不會被快取），帶入＝寫入。
+# 底線開頭的參數不會進入快取鍵。
 @st.cache_data(ttl=60 * 30, show_spinner=False)
+def _stock_data_cache(
+    stock_codes: tuple[str, ...],
+    start_date: date,
+    end_date: date,
+    _downloaded=None,
+) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
+    if _downloaded is None:
+        raise _StockDataNotCached
+    return _downloaded
+
+
 def _download_stock_data_cached(
     stock_codes: tuple[str, ...],
     start_date: date,
     end_date: date,
-    _progress_callback=None,
+    progress_callback=None,
 ) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
-    return download_stock_data(
+    """相同條件重跑直接命中快取；只有未命中時才下載並以 callback 回報進度。"""
+    try:
+        return _stock_data_cache(stock_codes, start_date, end_date)
+    except _StockDataNotCached:
+        pass
+    downloaded = download_stock_data(
         stock_codes=list(stock_codes),
         start_date=start_date,
         end_date=end_date,
-        progress_callback=_progress_callback,
+        progress_callback=progress_callback,
         cache_dir=default_cache_dir(),
     )
+    return _stock_data_cache(stock_codes, start_date, end_date, _downloaded=downloaded)
 
 
 # 所有參數一律由呼叫端明確提供；預設值只存在於 config.DEFAULT_PARAMETERS，
@@ -229,9 +253,9 @@ def _run_screening(
     if download_stock is None:
         def download_stock(codes, start, end, callback):
             return _download_stock_data_cached(
-                stock_codes=tuple(codes), start_date=start, end_date=end, _progress_callback=callback
+                stock_codes=tuple(codes), start_date=start, end_date=end, progress_callback=callback
             )
-        on_stock_download_error = on_stock_download_error or _download_stock_data_cached.clear
+        on_stock_download_error = on_stock_download_error or _stock_data_cache.clear
     if download_investor is None:
         def download_investor(end_date, lookback_days):
             return _download_investor_flow_data_cached(end_date=end_date, lookback_days=lookback_days)
@@ -810,7 +834,8 @@ def main():
             preview = ", ".join(failed_list[:50])
             suffix = " ..." if len(failed_list) > 50 else ""
             st.warning("下載失敗股票：" + preview + suffix)
-    else:
+    elif success_list:
+        # 下載本身拋出例外時兩份清單都是空的，不能宣稱「全部成功」。
         st.success("所有要求的股票代號都已成功下載。")
 
     def _col_sum(frame: pd.DataFrame, *cols: str) -> int:
