@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-APP_VERSION = "3.3.0"
-APP_UPDATED = "2026-08-21"
+APP_VERSION = "4.0.0"
+APP_UPDATED = "2026-09-24"
 
 APP_TITLE = "紅黑線多空雙向突破回測選股系統"
 APP_PURPOSE = (
@@ -45,6 +45,13 @@ TIMEFRAME_LABELS = {code: label for label, code in TIMEFRAME_OPTIONS.items()}
 # Direction routing (v2). The values double as the direction_filter 選項 shown in the UI.
 DIRECTION_FILTER_OPTIONS = ["全部", "做多", "做空"]
 
+# Signal paths (v4). P2/P4 form the 新線路徑 (the primary basis), P1/P3 the
+# 突破回測路徑 (secondary). The values are shown as-is in the 路徑 column and
+# double as the results-page path filter 選項.
+NEW_LINE_PATH = "新線路徑"
+BREAKOUT_RETEST_PATH = "突破回測路徑"
+PATH_FILTER_OPTIONS = ["全部", NEW_LINE_PATH, BREAKOUT_RETEST_PATH]
+
 # 預設只抓最近一個月，避免全市場 × 長區間下載在雲端逾時。
 # 注意：日期必須在每次 rerun 時求值（見 default_date_range()），不能在模組
 # import 時固定，否則長駐的 Streamlit 行程會讓預設結束日期停在啟動當天。
@@ -68,6 +75,10 @@ DEFAULT_PARAMETERS = {
     "direction_filter": "全部",
     # v3 addition: P1/P3 breakout-retest window (bars after the event).
     "retest_window": 5,
+    # v4 addition: how far (as % of the line) a retest bar may OPEN on the far
+    # side of the line and still count as a test. Beyond it the bar crossed the
+    # line rather than tested it (開盤穿線不算測線).
+    "open_cross_tolerance_pct": 1.0,
     "foreign_buy_streak": False,
     "trust_buy_streak": False,
     "foreign_sell_streak": False,
@@ -104,6 +115,7 @@ SIGNAL_COLUMNS = [
     "Volume",
     "prev_close",
     "direction",
+    "path",
     "signal_type",
     "retest_line_type",
     "retest_line_price",
@@ -114,6 +126,7 @@ LATEST_SUMMARY_COLUMNS = [
     "StockCode",
     "StockName",
     "Direction",
+    "Path",
     "SignalType",
     "LatestSignalDate",
     "Timeframe",
@@ -162,12 +175,10 @@ DISPLAY_COLUMN_LABELS = {
     "active_breakout_line_price": "目前突破回測線價格",
     "active_breakdown_line_type": "目前跌破回測線類型",
     "active_breakdown_line_price": "目前跌破回測線價格",
-    "bars_since_new_line": "新線後第幾根",
-    "active_new_line_type": "目前新線類型",
-    "active_new_line_price": "目前新線價格",
-    "new_line_window_valid": "新線窗格（根數內）",
-    "new_line_window_valid_long": "新線窗格有效（做多）",
-    "new_line_window_valid_short": "新線窗格有效（做空）",
+    "bars_since_new_red_line": "新紅線後第幾根",
+    "new_red_line_window_valid": "新紅線觀察窗有效（做多）",
+    "bars_since_new_black_line": "新黑線後第幾根",
+    "new_black_line_window_valid": "新黑線觀察窗有效（做空）",
     "bars_since_breakout": "突破後第幾根",
     "bars_since_breakdown": "跌破後第幾根",
     "breakout_window_valid": "突破回測窗有效",
@@ -178,12 +189,17 @@ DISPLAY_COLUMN_LABELS = {
     "p2_new_line_hold": "P2新線守住",
     "p3_break_down_reject": "P3跌破壓回",
     "p4_new_line_reject": "P4新線壓回",
+    "p1_broken_after": "P1訊號後破線",
+    "p2_broken_after": "P2訊號後破線",
+    "p3_broken_after": "P3訊號後破線",
+    "p4_broken_after": "P4訊號後破線",
     "p1_final": "P1符合",
     "p2_final": "P2符合",
     "p3_final": "P3符合",
     "p4_final": "P4符合",
     "direction": "方向",
-    "signal_type": "訊號路徑",
+    "path": "路徑",
+    "signal_type": "訊號類型",
     "retest_line_type": "回測線類型",
     "retest_line_price": "回測線價格",
     "foreign_buy_streak_ok": "外資連買條件",
@@ -194,7 +210,8 @@ DISPLAY_COLUMN_LABELS = {
     "lookback_rank": "最近K棒序",
     "final_signal": "最終符合",
     "Direction": "方向",
-    "SignalType": "訊號路徑",
+    "Path": "路徑",
+    "SignalType": "訊號類型",
     "LatestSignalDate": "最新訊號日期",
     "RetestLineType": "回測線類型",
     "RetestLinePrice": "回測線價格",
@@ -228,6 +245,7 @@ EXCEL_PARAMETER_LABELS = {
     "lookback_bars": "回看 K 棒數",
     "new_line_window": "新線回測窗格（K 棒數）",
     "retest_window": "突破回測窗格（K 棒數）",
+    "open_cross_tolerance_pct": "開盤穿線容許度（%）",
     "investor_consecutive_days": "法人連續買賣超天數",
     "foreign_buy_streak": "外資連續買超條件（做多）",
     "trust_buy_streak": "投信連續買超條件（做多）",

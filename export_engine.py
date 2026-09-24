@@ -7,6 +7,7 @@ import io
 import pandas as pd
 
 from config import (
+    DEFAULT_PARAMETERS,
     DISPLAY_COLUMN_LABELS,
     EXCEL_PARAMETER_LABELS,
     EXCEL_SHEET_LABELS,
@@ -62,7 +63,11 @@ def create_excel_bytes(
     params: dict,
     download_notes: list[str] | None = None,
 ) -> bytes:
-    """Create an in-memory Excel workbook with the v2 long/short sheets (§4.3)."""
+    """Create an in-memory Excel workbook with the long/short sheets (§4.3).
+
+    The signal and summary sheets are exported unfiltered and carry the 路徑
+    column, so the path filter can be re-applied offline.
+    """
     parameter_sheet = pd.DataFrame(
         {
             "參數": [
@@ -76,6 +81,7 @@ def create_excel_bytes(
                     "lookback_bars",
                     "new_line_window",
                     "retest_window",
+                    "open_cross_tolerance_pct",
                     "investor_consecutive_days",
                     "foreign_buy_streak",
                     "trust_buy_streak",
@@ -92,6 +98,7 @@ def create_excel_bytes(
                 params["lookback_bars"],
                 params.get("new_line_window", 5),
                 params.get("retest_window", 5),
+                params.get("open_cross_tolerance_pct", DEFAULT_PARAMETERS["open_cross_tolerance_pct"]),
                 params.get("investor_consecutive_days", 3),
                 "是" if params.get("foreign_buy_streak", False) else "否",
                 "是" if params.get("trust_buy_streak", False) else "否",

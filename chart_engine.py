@@ -33,6 +33,19 @@ _FROZEN_BASELINES = [
     ("active_breakdown_line_price", "breakdown_window_valid", "做空回測基準線（凍結 L）", "#0891b2"),
 ]
 
+# 新線路徑 markers (v4, §3.5c). A new red line only ever yields P2 and a new
+# black line only P4, so the marker colour names the line and the hover shows
+# its level — the same level as the dashed red/black line at that bar, since a
+# line only moves when a newer same-colour line replaces it. Staggered three
+# offsets from the bar, past both breakout/breakdown triangles (stagger 1 and 2):
+# a P2 can share its bar with a black-line breakdown when the red line sits
+# below the black one, and a P4 with a red-line breakout.
+# (column, line column, line name, label, color, y_col, y_sign)
+_NEW_LINE_SIGNAL_MARKERS = [
+    ("p2_new_line_hold", "red_line", "新紅線", "新紅線守住（新線路徑）", _RED_LINE_COLOR, "Low", -1),
+    ("p4_new_line_reject", "black_line", "新黑線", "新黑線壓回（新線路徑）", _BLACK_LINE_COLOR, "High", 1),
+]
+
 # (column, label, color, symbol, y_col, y_sign, stagger). ``stagger`` multiplies
 # the vertical offset so that when both lines break on the same bar the two
 # markers no longer sit on top of each other (the black one used to hide behind
@@ -227,6 +240,26 @@ def create_stock_chart(
                 col=1,
             )
 
+    for col_name, line_col, line_name, label, color, y_col, y_sign in _NEW_LINE_SIGNAL_MARKERS:
+        if col_name not in chart_df.columns or line_col not in chart_df.columns:
+            continue
+        rows = chart_df[chart_df[col_name].fillna(False)]
+        if rows.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=rows["Date"],
+                y=rows[y_col] + y_sign * y_offset * 3,
+                mode="markers",
+                name=label,
+                marker={"color": color, "size": 13, "symbol": "star"},
+                hovertemplate="%{x|%Y-%m-%d}<br>" + label + "<br>" + line_name + "：%{customdata:.2f}<extra></extra>",
+                customdata=rows[line_col].values,
+            ),
+            row=1,
+            col=1,
+        )
+
     fig.add_trace(
         go.Bar(
             x=chart_df["Date"],
@@ -243,8 +276,14 @@ def create_stock_chart(
     fig.update_layout(
         title=f"{name_prefix} 突破／跌破與回測（{timeframe_label}{direction_suffix}）",
         xaxis_rangeslider_visible=False,
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
-        margin={"l": 20, "r": 20, "t": 70, "b": 20},
+        # Legend BELOW the plots: it wraps to several rows (one entry per line
+        # and marker type), and above the plots those rows grew up into the title.
+        # Plotly auto-expands the bottom margin to fit however many rows it needs.
+        # y is a fraction of the plot height, and the volume axis's two-line date
+        # ticks sit in that gap: -0.06 touched them; -0.12 measured a 20-29px gap
+        # at 360-1000px widths with all 16 legend entries.
+        legend={"orientation": "h", "yanchor": "top", "y": -0.12, "x": 0},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
         height=720,
         # Force a light background so the near-black 黑線 and its markers stay
         # visible regardless of the viewer's (possibly dark) Streamlit theme.
