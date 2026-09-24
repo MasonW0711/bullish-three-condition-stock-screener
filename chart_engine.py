@@ -279,7 +279,10 @@ def create_stock_chart(
         # Legend BELOW the plots: it wraps to several rows (one entry per line
         # and marker type), and above the plots those rows grew up into the title.
         # Plotly auto-expands the bottom margin to fit however many rows it needs.
-        legend={"orientation": "h", "yanchor": "top", "y": -0.06, "x": 0},
+        # y is a fraction of the plot height, and the volume axis's two-line date
+        # ticks sit in that gap: -0.06 touched them; -0.12 measured a 20-29px gap
+        # at 360-1000px widths with all 16 legend entries.
+        legend={"orientation": "h", "yanchor": "top", "y": -0.12, "x": 0},
         margin={"l": 20, "r": 20, "t": 60, "b": 20},
         height=720,
         # Force a light background so the near-black 黑線 and its markers stay

@@ -389,7 +389,7 @@ def _windowed_retest(
 def add_retest_hold_signals(
     df: pd.DataFrame,
     retest_window: int,
-    open_cross_tolerance: float = 0.0,
+    open_cross_tolerance: float,
 ) -> pd.DataFrame:
     """Directional, windowed retest of the broken / broken-down line (§3.5a/b).
 
@@ -473,7 +473,7 @@ def _new_line_window(
 def add_new_line_window_signals(
     df: pd.DataFrame,
     new_line_window: int,
-    open_cross_tolerance: float = 0.0,
+    open_cross_tolerance: float,
 ) -> pd.DataFrame:
     """Flag P2 on the newest red line and P4 on the newest black line (§3.5c).
 
